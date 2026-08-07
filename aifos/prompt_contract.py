@@ -5659,25 +5659,48 @@ def _without_obsolete_camera_rules(value):
         value = value.get("rules") or value.get("constraints") or []
     if isinstance(value, (list, tuple, set)):
         value = "；".join(_text(item) for item in value if _text(item))
-    camera_terms = ("摄影机", "镜头", "机位", "camera")
-    movement_terms = (
-        "固定", "跟", "推", "拉", "摇", "移", "升降", "环绕",
-        "变焦", "运动",
-    )
+    # Do not infer a camera rule merely because one sentence contains words
+    # such as ``镜头`` and ``移动``.  They also occur in indispensable object
+    # physics ("人物在镜头内移动", "手机移到右手").  An obsolete rule must
+    # explicitly make the camera the subject and then state an executable
+    # camera movement/no-movement operation.
+    camera_motion = re.compile(
+        r"^摄影机[^，,、]*(?:"
+        r"固定(?:在|于|机位)|保持[^，,、]*固定|"
+        r"跟拍|跟随|短跟|紧跟|"
+        r"推近|缓推|推进镜头|拉远|后拉|拉开镜头|"
+        r"摇摄|摇镜|平移|横移|纵移|侧移|移镜|升降|"
+        r"环绕|变焦|镜头运动|"
+        r"执行(?:一次|单一)?(?:跟|推|拉|摇|移|升降|环绕|变焦)|"
+        r"不(?:跟拍?|推|拉|摇|移|升降|环绕|变焦)"
+        r")")
     bare_camera_motion = re.compile(
         r"^(?:不|仅|只)?(?:跟拍?|推近?|拉远?|摇|移|升降|环绕|变焦|运动)$")
     kept = []
     for sentence in re.split(r"[。；;\n]+", _text(value)):
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        # A synchronized moving-camera rule is one logical sentence even
+        # though it contains a comma-separated forbidden-movement list.
+        if "除该单一运镜外" in sentence:
+            continue
         parts = [part.strip() for part in re.split(r"[，,、]+", sentence)
                  if part.strip()]
-        stable = [
-            part for part in parts
-            if not (
-                any(token in part.lower() for token in camera_terms)
-                and any(token in part for token in movement_terms)
-            )
-            and not bare_camera_motion.fullmatch(part)
-        ]
+        stable = []
+        removing_camera_rule = False
+        for part in parts:
+            if camera_motion.search(part):
+                removing_camera_rule = True
+                continue
+            # The fixed-camera rule is commonly serialized as
+            # "摄影机全程固定...,不跟拍、不推,...".  Once its explicit camera
+            # head was removed, discard only its bare continuation fragments;
+            # retain full actor/prop clauses and spatial facts such as
+            # "不跨越对视轴".
+            if removing_camera_rule and bare_camera_motion.fullmatch(part):
+                continue
+            stable.append(part)
         if stable:
             kept.append("，".join(stable))
     return kept

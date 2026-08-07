@@ -1,3 +1,5 @@
+import copy
+
 from aifos.prompt_contract import (
     PROMPT_CONTRACT_SCHEMA,
     REFERENCE_SCOPE_DEFAULTS,
@@ -2932,6 +2934,57 @@ def test_synchronized_camera_refreshes_current_capacity_note():
     assert "容量修正" in executed
     assert design["capacity_note"] == executed["容量修正"]
     assert "旧2人备注" not in design["capacity_note"]
+
+
+def test_moving_camera_synchronization_is_idempotent():
+    shot = {
+        "characters": ["甲"],
+        "visible_figure_count": 1,
+        "description": "甲沿走廊向前走两步后停下。",
+        "camera": "35mm平视中景，摄影机从后方只跟拍一次，三分法",
+        "shot_contract": {},
+        "five_dimensions": {"camera_design": {}},
+        "physical_logic": "人物双脚交替落地并保持重心稳定。",
+    }
+
+    synchronize_shot_execution_contract(shot, location="走廊")
+    first = copy.deepcopy(shot)
+    synchronize_shot_execution_contract(shot, location="走廊")
+
+    assert shot == first
+    assert shot["physical_logic"].count("除该单一运镜外") == 1
+
+
+def test_camera_cleanup_preserves_actor_and_prop_motion_inside_frame():
+    shot = {
+        "characters": ["甲"],
+        "visible_figure_count": 1,
+        "description": "甲走到床边，把手机从左手交到右手。",
+        "camera": "35mm平视中景，固定机位，三分法",
+        "shot_contract": {},
+        "five_dimensions": {"camera_design": {}},
+        "physical_logic": (
+            "人物在镜头内从门口移动到床边；"
+            "手机在镜头内从左手移到右手；"
+            "摄影机只在轴线东侧短跟人物，不跨越对视轴；"
+            "摄影机位于床尾，人物继续向床边移动；"
+            "摄影机全程只执行一次跟拍，除该单一运镜外不叠加推、"
+            "拉、摇、移、升降、环绕或变焦。"
+        ),
+    }
+
+    synchronize_shot_execution_contract(shot, location="卧室")
+    first = copy.deepcopy(shot)
+    synchronize_shot_execution_contract(shot, location="卧室")
+
+    assert shot == first
+    physical = shot["physical_logic"]
+    assert "人物在镜头内从门口移动到床边" in physical
+    assert "手机在镜头内从左手移到右手" in physical
+    assert "不跨越对视轴" in physical
+    assert "摄影机位于床尾，人物继续向床边移动" in physical
+    assert "短跟人物" not in physical
+    assert "除该单一运镜外" not in physical
 
 
 def test_static_image_repair_preserves_the_original_video_action():

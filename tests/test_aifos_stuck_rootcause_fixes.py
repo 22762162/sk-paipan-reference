@@ -247,6 +247,23 @@ def test_complete_shot_contract_keeps_rule_stack_audit_out_of_provider_prompt(
     # Governance remains complete and auditable outside the provider string.
     assert len(payload["effective_rule_lines"]) == 2
 
+
+def test_generation_rule_block_is_replaced_when_runtime_rules_change(app):
+    payload = {
+        "prompt": "【镜头合同v2.2】同一卧室内严格共1人",
+        "prompt_compact": "【镜头合同v2.2】同一卧室内严格共1人",
+        "prompt_contract_complete": True,
+    }
+
+    app.director._append_generation_rules(payload, ["旧规则A"])
+    app.director._append_generation_rules(payload, ["新规则B"])
+
+    assert payload["generation_quality_rules"] == ["新规则B"]
+    assert "旧规则A" not in payload["prompt"]
+    assert "旧规则A" not in payload["prompt_compact"]
+    assert payload["prompt"].count("新规则B") == 1
+    assert payload["prompt_compact"].count("新规则B") == 1
+
 def test_inherently_modern_location_filters_ancient_furnishings_without_label():
     style = "写实3D；古室中以书案、香炉和纱幕构图"
     for location in ("直播间·夜", "高档套房·夜", "私人病房", "城市摄影棚"):

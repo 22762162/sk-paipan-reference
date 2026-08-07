@@ -776,6 +776,19 @@ def build_instruction(capability, payload, out_dir):
              else "仅作辅助检查；")
             + (physical_rules or "人物、镜头、道具关系按当前镜头实际构图核对")
             + (f"；对象关系：{physical_objects}" if physical_objects else ""))
+        topology_context = payload.get("video_cross_shot_context") or {}
+        topology_line = ""
+        if payload.get("scene_topology_required"):
+            topology_line = (
+                "- 视频场景拓扑硬检查:实际打开 reference_manifest 中标注为"
+                "「统一场景母图」的图片，将五点视频抽帧的固定门窗、墙体、"
+                "床和大型家具的款式、方位、距离、朝向、材质与动线逐项对照；"
+                "所有抽帧必须属于同一个物理空间。若还提供「同场上一镜视频"
+                "尾帧」，继续核对跨镜固定陈设连续，人物动作和机位可按本镜"
+                "变化。普通观众可见的换房、床/门窗/墙体改位、固定家具换款"
+                "必须失败；只因景别裁切未看见某物不得失败。必须返回"
+                "scene_topology_checked 与 scene_topology_match 两个 JSON 布尔"
+                f"字段。上下文={json.dumps(topology_context, ensure_ascii=False)}\n")
         fidelity = payload.get("fidelity_policy")
         if (isinstance(fidelity, dict)
                 and fidelity.get("schema") == "aifos.fidelity-tiers/v1"):
@@ -1005,7 +1018,8 @@ def build_instruction(capability, payload, out_dir):
             f"动作:{qc_action};"
             f"镜头景别:{qc_camera}\n"
             f"- 物理/空间逻辑硬检查:{physical_line}\n"
-            "必须核对人物、镜头、道具的前后左右关系、朝向、视线、接触点、重力支撑和动作可达性；"
+            + topology_line
+            + "必须核对人物、镜头、道具的前后左右关系、朝向、视线、接触点、重力支撑和动作可达性；"
             "电脑/手机/屏幕等设备必须按真实使用方向成立，屏幕正面、键盘/手部和使用者关系不能反向。"
             "凡物理合同中出现“时代物件锁定—”的对象，必须逐件核对结构、"
             "材质和时代形态；例如明代开放式浅盏油灯若被画成带玻璃灯罩、"
@@ -1040,6 +1054,7 @@ def build_instruction(capability, payload, out_dir):
             '"detected_overlay_count": 画面实际内心Q版叠层数整数, '
             '"physical_logic_checked": true或false, "physical_logic_match": true或false, '
             '"spatial_logic_checked": true或false, "spatial_logic_match": true或false, '
+            '"scene_topology_checked": true或false, "scene_topology_match": true或false, '
             '"detected_count": 画面实际人数整数, '
             '"technical_quality_pass": true或false, '
             '"critical_failures": ["只列必须重抽的硬一致/技术质量错误"], '

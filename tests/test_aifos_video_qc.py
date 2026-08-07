@@ -4,6 +4,8 @@ import json
 
 import pytest
 
+import aifos.director as director_module
+import aifos.video_temporal_qc as temporal_qc_module
 from aifos.app import App
 from aifos.errors import AifosError
 from aifos.production.base import ProviderResult
@@ -416,26 +418,171 @@ def test_finish_video_accepts_technical_fallback_inheriting_frozen_frames(
         app.close()
 
 
-def test_checkpoint_refreshes_missing_canonical_scene_without_manual_version(
+def _checkpoint_frame_record(row, shot_no=1):
+    return {
+        "asset_id": row["id"], "shot_no": shot_no,
+        "kind": row["kind"], "name": row["name"],
+        "version": row["version"], "uri": row["uri"],
+    }
+
+
+def test_image_scene_ref_keeps_canonical_master_and_demotes_camera_slice(
         tmp_path):
-    """旧快照即使选择版本未变，也要补入当前统一场景母图。"""
+    """机位切片只能辅助构图，不能成为首尾帧的场景身份。"""
     app = App(tmp_path / "ws")
     try:
         ctx = _ctx(app, tmp_path / "artifacts")
-        scene = app.assets.latest(
+        canonical = app.assets.latest(
             ctx["project"]["id"], "scene_art", "测试室内")
+        camera_slice = tmp_path / "artifacts" / "reverse-slice.png"
+        camera_slice.write_bytes(b"\x89PNG\r\n\x1a\n" + b"slice" * 8)
+        app.director._scene_slice_for_shot = (
+            lambda *_args, **_kwargs: str(camera_slice))
+
+        refs = app.director._art_refs(
+            ctx, [], "测试室内", shot_no=1, camera={})
+
+        assert refs["scene_ref"] == canonical["uri"]
+        assert refs["canonical_scene_asset_id"] == canonical["id"]
+        assert refs["canonical_scene_asset_version"] == canonical["version"]
+        assert refs["canonical_scene_reference_uri"] == canonical["uri"]
+        assert refs["canonical_scene_file_sha256"] == (
+            app.director._file_sha256(canonical["uri"]))
+        assert str(camera_slice) in refs.get("reference_images", [])
+        assert any(
+            item.get("uri") == str(camera_slice)
+            and item.get("reference_role") == "scene_view"
+            for item in refs["asset_matches"])
+    finally:
+        app.close()
+
+
+def _checkpoint_with_scene_proof(app, ctx, *, snapshot=None):
+    first = app.assets.register(
+        ctx["project"]["id"], "first_frame", "e001_shot001",
+        uri=ctx["frames"][0]["first"],
+        meta={"input_snapshot": snapshot} if snapshot is not None else {})
+    last = app.assets.register(
+        ctx["project"]["id"], "last_frame", "e001_shot001",
+        uri=ctx["frames"][0]["last"],
+        meta={"input_snapshot": snapshot} if snapshot is not None else {})
+    scene = app.assets.latest(
+        ctx["project"]["id"], "scene_art", "测试室内")
+    return {
+        "schema": "aifos.preflight-checkpoint/v1",
+        "document_versions": {},
+        "assets": {
+            "first_frames": [_checkpoint_frame_record(first)],
+            "last_frames": [_checkpoint_frame_record(last)],
+        },
+        "video_reference_asset_ids": {"1": [scene["id"]]},
+    }
+
+
+def test_checkpoint_rejects_missing_canonical_scene_instead_of_hot_swap(
+        tmp_path):
+    """旧快照缺母场景时不能只更新视频参考并继续使用旧帧。"""
+    app = App(tmp_path / "ws")
+    try:
+        ctx = _ctx(app, tmp_path / "artifacts")
         legacy = {
             "schema": "aifos.preflight-checkpoint/v1",
             "document_versions": {},
             "video_reference_asset_ids": {"1": []},
         }
 
-        refreshed, version = app.director._refresh_checkpoint_video_references(
-            ctx, legacy, 0)
+        with pytest.raises(
+                AifosError, match="禁止只热换视频场景参考"):
+            app.director._refresh_checkpoint_video_references(
+                ctx, legacy, 0)
 
-        assert version == 1
-        assert refreshed["source"] == "canonical_scene_reference_refresh"
-        assert scene["id"] in refreshed["video_reference_asset_ids"]["1"]
+        assert app.projects.latest_document(
+            ctx["episode"]["id"], "preflight_checkpoint") == (None, 0)
+    finally:
+        app.close()
+
+
+def test_checkpoint_rejects_frames_without_canonical_scene_snapshot(tmp_path):
+    """即使参考链已有当前母场景，旧首尾帧没有来源证明也不可复用。"""
+    app = App(tmp_path / "ws")
+    try:
+        ctx = _ctx(app, tmp_path / "artifacts")
+        checkpoint = _checkpoint_with_scene_proof(app, ctx)
+
+        with pytest.raises(AifosError, match="缺少场景输入快照"):
+            app.director._refresh_checkpoint_video_references(
+                ctx, checkpoint, 1)
+    finally:
+        app.close()
+
+
+def test_checkpoint_rejects_frames_after_canonical_scene_bytes_change(
+        tmp_path):
+    """母图稳定 URI 被覆写也必须重建首尾帧，不能仅按 asset id 放行。"""
+    app = App(tmp_path / "ws")
+    try:
+        ctx = _ctx(app, tmp_path / "artifacts")
+        scene = app.assets.latest(
+            ctx["project"]["id"], "scene_art", "测试室内")
+        snapshot = {
+            "canonical_scene_asset_id": scene["id"],
+            "canonical_scene_file_sha256": app.director._file_sha256(
+                scene["uri"]),
+        }
+        checkpoint = _checkpoint_with_scene_proof(
+            app, ctx, snapshot=snapshot)
+        (tmp_path / "artifacts" / "scene.png").write_bytes(
+            b"\x89PNG\r\n\x1a\n" + b"changed-room" * 2)
+
+        with pytest.raises(AifosError, match="场景文件摘要已变化"):
+            app.director._refresh_checkpoint_video_references(
+                ctx, checkpoint, 1)
+    finally:
+        app.close()
+
+
+def test_checkpoint_rejects_frames_bound_to_another_canonical_scene_asset(
+        tmp_path):
+    app = App(tmp_path / "ws")
+    try:
+        ctx = _ctx(app, tmp_path / "artifacts")
+        scene = app.assets.latest(
+            ctx["project"]["id"], "scene_art", "测试室内")
+        snapshot = {
+            "canonical_scene_asset_id": scene["id"] + 999,
+            "canonical_scene_file_sha256": app.director._file_sha256(
+                scene["uri"]),
+        }
+        checkpoint = _checkpoint_with_scene_proof(
+            app, ctx, snapshot=snapshot)
+
+        with pytest.raises(AifosError, match="场景资产.*≠"):
+            app.director._refresh_checkpoint_video_references(
+                ctx, checkpoint, 1)
+    finally:
+        app.close()
+
+
+def test_checkpoint_accepts_frames_proven_against_current_canonical_scene(
+        tmp_path):
+    app = App(tmp_path / "ws")
+    try:
+        ctx = _ctx(app, tmp_path / "artifacts")
+        scene = app.assets.latest(
+            ctx["project"]["id"], "scene_art", "测试室内")
+        snapshot = {
+            "canonical_scene_asset_id": scene["id"],
+            "canonical_scene_file_sha256": app.director._file_sha256(
+                scene["uri"]),
+        }
+        checkpoint = _checkpoint_with_scene_proof(
+            app, ctx, snapshot=snapshot)
+
+        current, version = app.director._refresh_checkpoint_video_references(
+            ctx, checkpoint, 7)
+
+        assert current is checkpoint
+        assert version == 7
     finally:
         app.close()
 
@@ -508,5 +655,124 @@ def test_video_qc_accepts_shared_generation_diagnostics_contract(tmp_path):
         assert "全过程保持甲" in json.dumps(
             shot["decision"]["prompt_patch"], ensure_ascii=False)
         assert app.director._video_retry_candidates(video_qc) == [1]
+    finally:
+        app.close()
+
+
+def test_video_media_qc_compares_canonical_scene_and_previous_same_scene(
+        tmp_path, monkeypatch):
+    """每条视频不能只自洽；还要对照母场景和上一条同场视频。"""
+    app = App(tmp_path / "ws")
+    try:
+        ctx = _ctx(app, tmp_path / "artifacts")
+        second_video = ctx["out_root"] / "shot-002.mp4"
+        second_video.write_bytes(b"video-2")
+        ctx["storyboard"]["shots"].append({
+            "shot_no": 2, "scene_no": 1, "unit_id": "U02",
+            "duration": 2.5, "characters": [],
+            "script_reference": "继续动作", "shot_function": "动作",
+        })
+        ctx["videos"] = [
+            {"shot_no": 1, "uri": str(ctx["videos"][0]["uri"])},
+            {"shot_no": 2, "uri": str(second_video)},
+        ]
+
+        monkeypatch.setattr(
+            director_module, "probe_video", lambda *_args, **_kwargs: {})
+        monkeypatch.setattr(
+            director_module, "evaluate_video_technical",
+            lambda *_args, **_kwargs: {"passed": True, "issues": []})
+
+        def fake_samples(uri, cache_root, **_kwargs):
+            shot_no = 2 if "002" in str(uri) else 1
+            samples = []
+            for index, label in enumerate(("0%", "25%", "50%", "75%", "100%")):
+                path = cache_root / f"shot-{shot_no}-{index}.png"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"frame")
+                samples.append({
+                    "label": label, "timestamp": float(index),
+                    "uri": str(path),
+                })
+            return {"passed": True, "issues": [], "samples": samples}
+
+        monkeypatch.setattr(
+            director_module, "extract_video_qc_frames", fake_samples)
+        monkeypatch.setattr(
+            temporal_qc_module, "analyze_temporal_samples",
+            lambda *_args, **_kwargs: {"warnings": []})
+        calls = []
+
+        def pass_scene_qc(capability, payload, *_args, **_kwargs):
+            assert capability == "image_qc"
+            calls.append(payload)
+            return ProviderResult(
+                provider="mock", model="mock-qc", cost=0.0, data={
+                    "pass": True, "visual_pass": True,
+                    "input_contract_pass": True,
+                    "count_checked": True, "count_match": True,
+                    "detected_count": 0,
+                    "overlay_count_checked": True,
+                    "overlay_count_match": True,
+                    "detected_overlay_count": 0,
+                    "physical_logic_checked": True,
+                    "physical_logic_match": True,
+                    "spatial_logic_checked": True,
+                    "spatial_logic_match": True,
+                    "scene_topology_checked": True,
+                    "scene_topology_match": True,
+                    "technical_quality_pass": True,
+                    "critical_failures": [], "advisory_issues": [],
+                    "issues": [],
+                    "prompt_diagnosis": {"status": "correct"},
+                    "reference_diagnosis": {"status": "correct"},
+                })
+
+        monkeypatch.setattr(app.router, "call", pass_scene_qc)
+
+        report = app.director._run_video_media_qc(ctx, True)
+
+        assert report["passed"] is True
+        assert len(calls) == 2
+        for payload in calls:
+            refs = payload["reference_manifest"]
+            assert sum(
+                row.get("label") == "统一场景母图" for row in refs) == 1
+            assert payload["scene_topology_required"] is True
+            assert payload["video_cross_shot_context"][
+                "canonical_scene"]["uri"].endswith("scene.png")
+        second_refs = calls[1]["reference_manifest"]
+        assert sum(
+            row.get("label") == "同场上一镜视频尾帧"
+            for row in second_refs) == 1
+        assert calls[1]["video_cross_shot_context"][
+            "previous_same_scene_shot"]["shot_no"] == 1
+        assert report["shots"][1]["visual_verdicts"][0][
+            "scene_topology_match"] is True
+    finally:
+        app.close()
+
+
+def test_video_topology_qc_cannot_pass_without_explicit_topology_verdict(
+        tmp_path):
+    app = App(tmp_path / "ws")
+    try:
+        ctx = _ctx(app, tmp_path / "artifacts")
+        spec = app.director._video_sample_qc_spec(
+            ctx, ctx["storyboard"]["shots"][0])
+        verdict = {
+            "pass": True, "visual_pass": True,
+            "count_checked": True, "count_match": True,
+            "overlay_count_checked": True, "overlay_count_match": True,
+            "physical_logic_checked": True, "physical_logic_match": True,
+            "spatial_logic_checked": True, "spatial_logic_match": True,
+            "technical_quality_pass": True,
+        }
+
+        assessed = app.director._assess_image_qc(spec, verdict, 1)
+
+        assert assessed["passed"] is False
+        assert assessed["scene_topology_checked"] is False
+        assert "统一场景母图" in "；".join(assessed["issues"])
     finally:
         app.close()

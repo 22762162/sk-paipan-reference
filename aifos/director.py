@@ -249,7 +249,8 @@ STAGES = [
 CONFIRM_AFTER = "preflight"
 PREFLIGHT_CHECKPOINT_SCHEMA = "aifos.preflight-checkpoint/v1"
 PREFLIGHT_CHECKPOINT_DOCUMENTS = (
-    "script", "continuity", "storyboard", "blocking", "text_assets",
+    "script", "story_analysis", "continuity", "storyboard", "blocking",
+    "text_assets",
     "preflight", "production_standard", "resolved_rule_snapshot",
     "scene_plan", "character_asset_policy", "video_references",
 )
@@ -1878,9 +1879,35 @@ class Director:
         for key in ("_codex_profile", "_prompt_review_profile"):
             if task["payload"].get(key):
                 payload[key] = task["payload"][key]
+        # The repair above is persisted into the storyboard before the real
+        # image call.  Freeze that repaired semantic contract as the new reuse
+        # identity and update the already-seeded plan row immediately.  The
+        # old flow generated from this payload but left the pre-repair hash in
+        # render_plan; the next identical run then treated one random repaired
+        # shot as changed and unnecessarily regenerated its image, frames and
+        # video.  This hash deliberately excludes derived continuity/keyframe
+        # references, while byte-level scene/frame safety remains enforced by
+        # their dedicated input snapshots.
+        repaired_content_hash = self._shot_content_hash(shot, payload)
+        payload["_base_shot_content_hash"] = repaired_content_hash
         task["payload"] = payload
         if task.get("qc_spec"):
             task["qc_spec"] = self._shot_qc_spec(ctx, payload)
+        # Formal production owns a durable render_plan under out_root.  Pure
+        # contract callers/tests intentionally omit it; the repair must still
+        # complete and let the caller compare before/after generation hashes
+        # instead of failing inside plan I/O and returning an empty summary.
+        if ctx.get("out_root"):
+            item_id = str(task.get("item_id") or f"shot:{shot_no}")
+            self._plan_mark(
+                ctx, item_id, self._plan_read_status(ctx, item_id),
+                extra={
+                    "content_hash": repaired_content_hash,
+                    "prompt": str(
+                        payload.get("prompt_compact")
+                        or payload.get("prompt") or ""),
+                    "contract_repaired_in_run": True,
+                })
         return summary
 
     def _plan_read_status(self, ctx, item_id):
@@ -1920,6 +1947,91 @@ class Director:
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                 digest.update(chunk)
         return digest.hexdigest()
+
+    @staticmethod
+    def _frame_input_snapshot(payload):
+        """Freeze every visual dependency used to make a frame pair.
+
+        Providers deliberately write human-readable stable filenames.  A URI
+        comparison alone therefore cannot tell an old frame pair from one
+        made before its keyframe, predecessor tail or canonical scene was
+        replaced.  Content digests make those in-place changes ordinary cache
+        misses instead of silently carrying an obsolete room into Seedance.
+        """
+        manifest = []
+        for item in payload.get("reference_manifest") or []:
+            if not isinstance(item, dict):
+                continue
+            uri = str(item.get("uri") or "")
+            manifest.append({
+                **{
+                    key: item.get(key) for key in (
+                        "index", "asset_id", "kind", "name", "version",
+                        "uri", "binding")
+                },
+                "file_sha256": Director._file_sha256(uri),
+            })
+        references = list(dict.fromkeys(
+            str(uri) for uri in (payload.get("reference_images") or [])
+            if str(uri)))
+        reference_digests = [
+            {"uri": uri, "file_sha256": Director._file_sha256(uri)}
+            for uri in references
+        ]
+        keyframe = str(payload.get("keyframe_reference_uri") or "")
+        predecessor = str(payload.get("chain_first_uri") or "")
+        canonical_scene = str(
+            payload.get("canonical_scene_reference_uri")
+            or payload.get("scene_ref") or "")
+        snapshot = {
+            "schema": "aifos.frame-input-snapshot/v1",
+            "shot_no": payload.get("shot_no"),
+            # Prompt review may serialize the same frozen contract with
+            # newlines collapsed to spaces.  Whitespace formatting is not a
+            # visual dependency and must not make an unchanged frame pair
+            # regenerate on every resume; substantive wording still hashes.
+            "prompt": re.sub(
+                r"\s+", " ", str(
+                    payload.get("prompt_compact")
+                    or payload.get("prompt") or "")).strip(),
+            "keyframe_reference_uri": keyframe,
+            "keyframe_file_sha256": Director._file_sha256(keyframe),
+            "chain_first_uri": predecessor,
+            "chain_first_file_sha256": Director._file_sha256(predecessor),
+            "continuity_predecessor_shot": payload.get(
+                "continuity_predecessor_shot"),
+            "continuity_group_id": str(
+                payload.get("continuity_group_id") or ""),
+            "physical_scene_id": str(
+                payload.get("physical_scene_id") or ""),
+            "canonical_scene_asset_id": payload.get(
+                "canonical_scene_asset_id"),
+            "canonical_scene_asset_version": payload.get(
+                "canonical_scene_asset_version"),
+            "canonical_scene_reference_uri": canonical_scene,
+            "canonical_scene_file_sha256": Director._file_sha256(
+                canonical_scene),
+            "reference_manifest": manifest,
+            "reference_images": reference_digests,
+            "quality": copy.deepcopy(
+                payload.get("quality_decision") or {}),
+            "frame_targets": copy.deepcopy(
+                payload.get("frame_targets") or payload.get(
+                    "frame_target") or {}),
+            "aspect": payload.get("aspect"),
+            "width": payload.get("width"),
+            "height": payload.get("height"),
+            "standard_fingerprint": payload.get(
+                "standard_fingerprint", ""),
+        }
+        signature_source = {
+            key: snapshot[key] for key in snapshot
+            if key not in {"schema", "shot_no"}
+        }
+        snapshot["input_signature"] = hashlib.sha256(json.dumps(
+            signature_source, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":")).encode("utf-8")).hexdigest()
+        return snapshot
 
     @classmethod
     def _character_sheet_matches_locked_identity(cls, sheet_row,
@@ -4797,6 +4909,22 @@ class Director:
         by_id = {item.get("id"): item for item in plan.get("items", [])}
         records = []
         for task in tasks:
+            # Frame reuse is keyed by the exact prompt/reference bundle that
+            # reaches generation.  ``_stage_frames_impl`` takes an early
+            # snapshot so it can decide whether an existing pair is reusable,
+            # but Codex prompt review and spatial-contract repair both run
+            # after that decision and may replace the provider-facing prompt
+            # or references.  Freeze the dispatch input again here, after all
+            # of those mutations and immediately before the immutable
+            # acceleration contract is built.  Persisting the early snapshot
+            # made a newly generated frame pair advertise an obsolete input
+            # signature and allowed the wrong room to survive a later resume.
+            if (task.get("capability") == "frames"
+                    and isinstance(task.get("payload"), dict)):
+                frame_snapshot = self._frame_input_snapshot(task["payload"])
+                task["payload"]["input_snapshot"] = frame_snapshot
+                task["payload"]["input_signature"] = frame_snapshot[
+                    "input_signature"]
             item = by_id.get(task.get("item_id"))
             if item is None or item.get("category") \
                     not in self.ACCELERATABLE_IMAGE_CATEGORIES:
@@ -6445,6 +6573,14 @@ class Director:
         spatial_match = (
             not physical_required
             or checked_true(verdict.get("spatial_logic_match")))
+        scene_topology_required = bool(
+            qc_spec.get("scene_topology_required"))
+        scene_topology_checked = (
+            not scene_topology_required
+            or checked_true(verdict.get("scene_topology_checked")))
+        scene_topology_match = (
+            not scene_topology_required
+            or checked_true(verdict.get("scene_topology_match")))
         issues = [str(item) for item in (verdict.get("issues") or [])]
         critical_failures = [
             str(item) for item in (verdict.get("critical_failures") or [])
@@ -6491,6 +6627,10 @@ class Director:
             issues.append("质检未核对人物、道具、镜头的空间关系")
         elif not spatial_match:
             issues.append("人物、道具与镜头的相对位置/朝向不成立")
+        if not scene_topology_checked:
+            issues.append("质检未对照统一场景母图和相邻同场镜头核对空间拓扑")
+        elif not scene_topology_match:
+            issues.append("视频场景结构与统一母场景或相邻同场镜头不一致")
         issues = list(dict.fromkeys(issues))
         # 是否触发硬失败只认结构化核验字段，不能因为 issues 中出现
         # “人物形象轻微偏差”“提示词身份说明重复”等字样就误判重画。
@@ -6501,7 +6641,8 @@ class Director:
             or not count_checked or not count_match
             or not overlay_checked or not overlay_match
             or not physical_checked or not physical_match
-            or not spatial_checked or not spatial_match)
+            or not spatial_checked or not spatial_match
+            or not scene_topology_checked or not scene_topology_match)
         fidelity_policy = qc_spec.get("fidelity_policy")
         tiered_fidelity = bool(
             isinstance(fidelity_policy, dict)
@@ -6550,7 +6691,8 @@ class Director:
             and count_checked and count_match
             and overlay_checked and overlay_match
             and physical_checked and physical_match
-            and spatial_checked and spatial_match)
+            and spatial_checked and spatial_match
+            and scene_topology_checked and scene_topology_match)
         if tiered_fidelity:
             # The judge can dislike an allowed crop/overlap/detail variance
             # and still set its legacy visual_pass=false.  In the tiered
@@ -6612,6 +6754,9 @@ class Director:
             "physical_logic_match": physical_match,
             "spatial_logic_checked": spatial_checked,
             "spatial_logic_match": spatial_match,
+            "scene_topology_checked": scene_topology_checked,
+            "scene_topology_match": scene_topology_match,
+            "scene_topology_required": scene_topology_required,
             "detected_count": detected_count,
             "detected_overlay_count": detected_overlay_count,
             "expected_overlay_count": qc_spec.get(
@@ -10650,12 +10795,20 @@ class Director:
             "continuity_group_id",
         )
         refreshed_tasks = []
+        semantic_hash_by_shot = {}
         for shot_no in sorted(affected, key=position.get):
             shot = shot_by_no[shot_no]
             task = task_by_shot.get(shot_no)
             old_payload = copy.deepcopy(
                 (task or {}).get("payload") or {})
             payload = self._shot_payload(ctx, shot)
+            # Hash the reproducible storyboard-derived contract before
+            # carrying any in-flight repair/transport state forward.  A
+            # replacement prompt used only to rescue the current provider
+            # call is not reconstructible on the next ordinary run and must
+            # not redefine the persisted keyframe's semantic identity.
+            semantic_content_hash = self._shot_content_hash(shot, payload)
+            semantic_hash_by_shot[shot_no] = semantic_content_hash
             for key in runtime_keys:
                 if key in old_payload:
                     payload[key] = copy.deepcopy(old_payload[key])
@@ -10698,6 +10851,7 @@ class Director:
                 # legitimate blocking refresh for an unaudited prompt.
                 self._mark_prompt_review_not_applicable(payload)
             self._attach_reference_manifest(payload)
+            payload["_base_shot_content_hash"] = semantic_content_hash
 
             if task is None:
                 task = {
@@ -10718,10 +10872,10 @@ class Director:
                 lambda result, current_shot=shot,
                 current_quality=copy.deepcopy(
                     payload["quality_decision"]),
-                current_payload=payload:
+                current_task=task:
                 self._register_completed_shot_result(
                     ctx, current_shot, current_quality, result,
-                    payload=current_payload))
+                    payload=current_task["payload"]))
             refreshed_tasks.append(task)
 
         # A reused image in the affected chain is no longer current; remove it
@@ -10744,8 +10898,7 @@ class Director:
                 item["prompt"] = str(
                     payload.get("prompt_compact")
                     or payload.get("prompt") or "")
-                item["content_hash"] = self._shot_content_hash(
-                    shot, payload)
+                item["content_hash"] = semantic_hash_by_shot[shot_no]
                 item["status"] = "pending"
                 item["error"] = ""
                 item["spatial_contract_refreshed"] = True
@@ -11542,9 +11695,15 @@ class Director:
         return [s for s in scenes
                 if int(s.get("scene_no") or 0) not in skipped]
 
-    def _plan_seed_shots(self, ctx):
+    def _plan_seed_shots(self, ctx, *, categories=None):
         """分镜确定后,把每个镜头的关键帧与首尾帧登记进清单。
         清单展示实际发送的当前镜头短合同，所见即所得。"""
+        selected_categories = set(
+            categories or ("shot_image", "frames"))
+        unknown = selected_categories.difference({"shot_image", "frames"})
+        if unknown:
+            raise ValueError(
+                "未知镜头清单分类: " + "、".join(sorted(unknown)))
         shots = self._active_shots(ctx)
         scene_counts = {}
         for shot in shots:
@@ -11587,15 +11746,19 @@ class Director:
                     shot, shot_payload),
                 **self._quality_meta(frame_quality),
             })
-        self._plan_seed(ctx, "shot_image", image_items)
-        self._plan_seed(ctx, "frames", frame_items)
+        if "shot_image" in selected_categories:
+            self._plan_seed(ctx, "shot_image", image_items)
+        if "frames" in selected_categories:
+            self._plan_seed(ctx, "frames", frame_items)
         episode_id = ctx["episode"]["id"]
-        self.image_acceleration.prune(
-            episode_id, "shot_image",
-            [item["id"] for item in image_items])
-        self.image_acceleration.prune(
-            episode_id, "frames",
-            [item["id"] for item in frame_items])
+        if "shot_image" in selected_categories:
+            self.image_acceleration.prune(
+                episode_id, "shot_image",
+                [item["id"] for item in image_items])
+        if "frames" in selected_categories:
+            self.image_acceleration.prune(
+                episode_id, "frames",
+                [item["id"] for item in frame_items])
 
     # ---- 各阶段实现 ----
     @staticmethod
@@ -13450,6 +13613,10 @@ class Director:
         if not formal_reference_allowed(self._asset_quality(row)):
             return "低质量试错图不能作为 Seedance 正式参考"
         meta = self._asset_meta(row)
+        stored_digest = str(meta.get("file_sha256") or "")
+        if (stored_digest and row["uri"]
+                and stored_digest != self._file_sha256(row["uri"])):
+            return "资产文件内容已在登记后改变，必须重新登记后才能引用"
         if meta.get("reference_eligible") is False:
             return "资产已标记为不可进入 Seedance 正式参考链"
         if meta.get("physical_invalid") is True:
@@ -13527,7 +13694,14 @@ class Director:
             }
         value = {
             **self._quality_meta(decision),
-            "shot_content_hash": self._shot_content_hash(shot, payload),
+            # Continuity is a separate byte-level dependency.  Runtime
+            # binding may add the previous keyframe and, under the provider
+            # reference cap, displace an optional detail sheet.  That must
+            # not rewrite the semantic shot hash and make unchanged pixels
+            # appear to be a new keyframe on resume.
+            "shot_content_hash": str(
+                (payload or {}).get("_base_shot_content_hash")
+                or self._shot_content_hash(shot, payload)),
             "episode_number": ctx["episode"]["number"],
             "shot_no": shot.get("shot_no"),
             "scene_no": shot.get("scene_no"),
@@ -13569,9 +13743,10 @@ class Director:
                 and not Path(selected_uri).is_file()):
             return {}
         row_meta = self._asset_meta(row) if row is not None else {}
-        digest = str(row_meta.get("file_sha256") or "")
-        if not digest:
-            digest = self._file_sha256(selected_uri)
+        # Always read the current bytes.  Stable filenames may be overwritten
+        # by an interrupted provider before asset metadata is updated; trusting
+        # the stored digest would bless those new pixels with the old token.
+        digest = self._file_sha256(selected_uri)
         facts = {
             "previous_shot_no": previous_shot_no,
             "asset_id": row["id"] if row is not None else None,
@@ -15411,6 +15586,13 @@ class Director:
             if isinstance(scene, dict) and scene.get("scene_no") is not None
         }
 
+    def _continuity_scene_locations(self, ctx):
+        """Map editorial scenes to the same canonical sets used by framing."""
+        return {
+            scene_no: self._physical_scene_location(ctx, location)
+            for scene_no, location in self._scene_locations(ctx).items()
+        }
+
     @staticmethod
     def _physical_scene_location(ctx, location):
         """Resolve a visible shot zone to the single reusable physical set."""
@@ -16003,18 +16185,54 @@ class Director:
         # references cannot crowd them out at the provider's five-image
         # ceiling.  Losing either anchor is what previously let one bedroom
         # turn into a different room from shot to shot.
-        if location:
+        camera_scene_reference = None
+        if location and ctx.get("out_root"):
+            # The canonical root/panorama is the immutable set identity.  A
+            # reverse view or panorama crop only explains this shot's camera
+            # direction; using it as ``scene_ref`` made adjacent frames bind
+            # to different apparent rooms and later gave the video checkpoint
+            # no stable scene asset id/SHA to verify.
+            canonical_scene = self._required_video_scene_reference(
+                ctx, {"shot_no": shot_no, "location": location})
+            canonical_uri = str(canonical_scene["uri"] or "")
+            if not remember(canonical_uri):
+                raise AifosError(
+                    f"镜头{shot_no or 0}的统一物理母场景无法进入参考图"
+                    "硬槽位；请拆分群像镜头，禁止用机位图代替母场景")
+            refs.update({
+                "scene_ref": canonical_uri,
+                "canonical_scene_asset_id": int(canonical_scene["id"]),
+                "canonical_scene_asset_version": int(
+                    canonical_scene["version"]),
+                "canonical_scene_reference_uri": canonical_uri,
+                "canonical_scene_file_sha256": self._file_sha256(
+                    canonical_uri),
+            })
+            refs["asset_matches"].append({
+                "asset_id": canonical_scene["id"],
+                "version": canonical_scene["version"],
+                "kind": canonical_scene["kind"],
+                "name": canonical_scene["name"],
+                "label": f"场景:{location}(统一物理母场景)",
+                "uri": canonical_uri,
+                "reference_role": "scene",
+                "attach_to": location,
+            })
+
+            # Keep a camera-specific crop/view only as a lowest-priority
+            # additional reference.  It must never replace or displace the
+            # canonical root above.
             slice_uri = self._scene_slice_for_shot(ctx, location, shot_no)
-            if slice_uri and remember(slice_uri):
-                refs["scene_ref"] = slice_uri
-                refs["asset_matches"].append({
-                    "asset_id": None, "kind": "scene_slice",
+            if slice_uri and str(slice_uri) != canonical_uri:
+                camera_scene_reference = {
+                    "asset_id": None,
+                    "kind": "scene_slice",
                     "name": f"{location}::view:slice",
-                    "label": f"场景:{location}(本镜机位全景切片)",
-                    "uri": slice_uri,
-                    "reference_role": "scene",
+                    "label": f"场景:{location}(本镜机位全景切片，仅限机位)",
+                    "uri": str(slice_uri),
+                    "reference_role": "scene_view",
                     "attach_to": location,
-                })
+                }
             else:
                 row, scene_label = self._scene_view_reference(
                     project_id, location, camera,
@@ -16025,15 +16243,17 @@ class Director:
                 if (row and formal_reference_allowed(
                         self._asset_quality(row))
                         and row["uri"] and Path(row["uri"]).exists()
-                        and remember(row["uri"])):
-                    refs["scene_ref"] = row["uri"]
-                    refs["asset_matches"].append({
-                        "asset_id": row["id"], "kind": row["kind"],
-                        "name": row["name"], "label": scene_label,
-                        "uri": row["uri"],
-                        "reference_role": "scene",
+                        and str(row["uri"]) != canonical_uri):
+                    camera_scene_reference = {
+                        "asset_id": row["id"],
+                        "version": row["version"],
+                        "kind": row["kind"],
+                        "name": row["name"],
+                        "label": scene_label + "，仅限机位",
+                        "uri": str(row["uri"]),
+                        "reference_role": "scene_view",
                         "attach_to": location,
-                    })
+                    }
             # Pure contract/unit callers may intentionally omit the artifact
             # root while checking wording or phase projection.  A real
             # production payload always has ``out_root`` and must fail closed
@@ -16042,6 +16262,61 @@ class Director:
                 raise AifosError(
                     f"镜头{shot_no or 0}缺少可用场景母图「{location}」；"
                     "禁止在没有空间基准的情况下生成关键帧")
+        elif location:
+            # Pure contract/unit callers may omit a production artifact root.
+            # Prefer a registered canonical database row when one exists;
+            # otherwise preserve their historical camera-slice fallback.
+            # Real paid production always takes the fail-closed branch above.
+            physical_location = self._physical_scene_location(ctx, location)
+            canonical = None
+            for candidate in (
+                    self.assets.latest(
+                        project_id, "scene_art",
+                        self._scene_view_asset_name(
+                            physical_location, self.SCENE_PANORAMA_KEY)),
+                    self.assets.latest(
+                        project_id, "scene_art", physical_location)):
+                uri = str(candidate["uri"] if candidate is not None else "")
+                if (candidate is not None and uri
+                        and (uri.startswith(("http://", "https://"))
+                             or Path(uri).exists())
+                        and formal_reference_allowed(
+                            self._asset_quality(candidate))):
+                    canonical = candidate
+                    break
+            if canonical is not None and remember(canonical["uri"]):
+                refs.update({
+                    "scene_ref": str(canonical["uri"]),
+                    "canonical_scene_asset_id": int(canonical["id"]),
+                    "canonical_scene_asset_version": int(
+                        canonical["version"]),
+                    "canonical_scene_reference_uri": str(canonical["uri"]),
+                    "canonical_scene_file_sha256": self._file_sha256(
+                        canonical["uri"]),
+                })
+                refs["asset_matches"].append({
+                    "asset_id": canonical["id"],
+                    "version": canonical["version"],
+                    "kind": canonical["kind"],
+                    "name": canonical["name"],
+                    "label": f"场景:{location}(统一物理母场景)",
+                    "uri": str(canonical["uri"]),
+                    "reference_role": "scene",
+                    "attach_to": location,
+                })
+            slice_uri = self._scene_slice_for_shot(ctx, location, shot_no)
+            if (not refs.get("scene_ref") and slice_uri
+                    and remember(slice_uri)):
+                refs["scene_ref"] = str(slice_uri)
+                refs["asset_matches"].append({
+                    "asset_id": None,
+                    "kind": "scene_slice",
+                    "name": f"{location}::view:slice",
+                    "label": f"场景:{location}(本镜机位切片)",
+                    "uri": str(slice_uri),
+                    "reference_role": "scene",
+                    "attach_to": location,
+                })
         spatial_uri = str(spatial_ref or "").strip()
         if (spatial_uri
                 and (spatial_uri.startswith(("http://", "https://"))
@@ -16348,16 +16623,6 @@ class Director:
                 if int((self._asset_meta(row).get("shot_no") or -1))
                 in passed_shots]
         matched_rows = matched_rows[:1]
-        matched = []
-        for row in matched_rows:
-            if not remember(row["uri"]):
-                continue
-            matched.append(row["uri"])
-            refs["asset_matches"].append({
-                "asset_id": row["id"], "kind": row["kind"],
-                "name": row["name"], "label": "同人物/同场景已生产图",
-                "uri": row["uri"],
-            })
         attach_names = list(characters or []) + ([location] if location else [])
         user_rows = (
             [] if ctx.get("fresh_assets")
@@ -16365,7 +16630,7 @@ class Director:
                 project_id, attach_names,
                 allowed_roles={
                     "identity", "wardrobe", "scene", "composition"}))
-        reference = list(matched)
+        reference = []
         for row in user_rows:
             if not remember(row["uri"]):
                 continue
@@ -16386,6 +16651,27 @@ class Director:
             if style_row is not None:
                 refs["asset_matches"].append(
                     self._reference_asset_match(style_row))
+        if (camera_scene_reference
+                and remember(camera_scene_reference.get("uri"))):
+            refs.setdefault("reference_images", []).append(
+                camera_scene_reference["uri"])
+            refs["asset_matches"].append(camera_scene_reference)
+        # Already-generated shot images are derived continuity aids.  Add
+        # them only after every reproducible master/reference has claimed its
+        # slot.  Previously this loop ran before user/style/camera anchors, so
+        # a newly available image on the second identical run could evict a
+        # stable reference.  Filtering the continuity entry from the content
+        # hash was then too late—the evicted master was already absent and one
+        # keyframe falsely invalidated itself.
+        for row in matched_rows:
+            if not remember(row["uri"]):
+                continue
+            refs.setdefault("reference_images", []).append(row["uri"])
+            refs["asset_matches"].append({
+                "asset_id": row["id"], "kind": row["kind"],
+                "name": row["name"], "label": "同人物/同场景已生产图",
+                "uri": row["uri"],
+            })
         # 只要本次已经有任何锚点，就必须路由到能真实接收图片的产线；
         # 空镜同样不能把场景/风格/用户参考静默丢掉。
         refs["require_reference_images"] = bool(
@@ -17354,7 +17640,11 @@ class Director:
         # Defensive repair for saved legacy boards: the current-shot action is
         # narrower than a global character design and must win before identity
         # facts, references, prompt text or QC expectations are compiled.
-        shot = reconcile_shot_semantics(shot)
+        # This compiler is called repeatedly by keyframes, frames, QC and
+        # resume.  Never let a derived repair mutate the versioned storyboard
+        # object in ``ctx``; otherwise call count changes the next prompt and
+        # makes an unchanged video look stale.
+        shot = reconcile_shot_semantics(copy.deepcopy(shot))
         # A Codex repair persists a new camera sentence into the versioned
         # storyboard.  Older runs may have saved that sentence while derived
         # copies (shot_contract/five_dimensions/physical rules) were compiled
@@ -18407,7 +18697,12 @@ class Director:
 
     @staticmethod
     def _append_generation_rules(payload, rules):
-        """Append one idempotent concise block to actual provider prompts."""
+        """Replace the concise rule blocks in actual provider prompts.
+
+        Runtime continuity/retry preparation can call this more than once.
+        Metadata and visible prompt text must therefore be updated together;
+        merely noticing an old marker leaves stale rules in the real request.
+        """
         rules = [str(rule).strip() for rule in rules if str(rule).strip()][:5]
         payload["generation_quality_rules"] = rules
         blocks = []
@@ -18432,13 +18727,16 @@ class Director:
             blocks.append(effective_marker + "\n" + "\n".join(
                 f"{index}. {rule}"
                 for index, rule in enumerate(effective, 1)))
-        if not blocks:
-            return payload
-        block = "\n".join(blocks)
         for key in ("prompt", "prompt_compact"):
             value = str(payload.get(key) or "").strip()
-            if marker not in value and effective_marker not in value:
-                payload[key] = (value + "\n" + block).strip()
+            for current_marker in (marker, effective_marker):
+                value = re.sub(
+                    rf"(?:^|\n){re.escape(current_marker)}"
+                    r"(?:\n\d+\.\s*[^\n]*)*",
+                    "", value, flags=re.MULTILINE).strip()
+            if blocks:
+                value = (value + "\n" + "\n".join(blocks)).strip()
+            payload[key] = value
         return payload
 
     @staticmethod
@@ -18913,6 +19211,19 @@ class Director:
                 "director",
                 f"断点对账:清扫 {stale_reset} 条上轮中断遗留的生成中"
                 "认领(重置回待生成)")
+        # Lightweight migration/unit callers may intentionally provide only
+        # a storyboard and no Projects repository.  Formal production still
+        # honours skipped-scene policy; legacy reconciliation falls back to
+        # the explicit storyboard rather than crashing before it can migrate.
+        continuity_shots = (
+            list(self._active_shots(ctx))
+            if hasattr(self, "projects") and ctx.get("episode")
+            else list((ctx.get("storyboard") or {}).get("shots", [])))
+        continuity_plan = build_keyframe_continuity_plan(
+            continuity_shots, self._continuity_scene_locations(ctx))
+        predecessor_by_shot = continuity_plan.get(
+            "predecessor_by_shot", {})
+        group_by_shot = continuity_plan.get("group_by_shot", {})
         for shot in (ctx.get("storyboard") or {}).get("shots", []):
             shot_no = int(shot["shot_no"])
             item = by_id.get(f"shot:{shot_no}")
@@ -18991,25 +19302,6 @@ class Director:
             if (item.get("status") not in ("done", "reused")
                     or not acceptable):
                 continue
-            asset_name = self._shot_name(ctx, shot_no)
-            existing_row = self.assets.latest(
-                ctx["project"]["id"], "image", asset_name)
-            if existing_row is not None:
-                existing_uri = str(existing_row["uri"] or "")
-                existing_file_ok = bool(
-                    existing_uri
-                    and (existing_uri.startswith(("http://", "https://"))
-                         or Path(existing_uri).exists()))
-                # 同名资产可能来自该 project_id 之前的另一份剧本，或是
-                # 批次中途失败前遗留的旧元数据。仅凭“同名文件存在”跳过
-                # 会让当前已通过的新图永远无法进入资产中心，恢复时反复
-                # 重画。内容哈希一致才算已经登记的是本镜当前合同。
-                if (existing_file_ok
-                        and self._asset_meta(existing_row).get(
-                            "shot_content_hash")
-                        == (item.get("content_hash")
-                            or self._shot_content_hash(shot))):
-                    continue
             decision = {
                 "level": item.get("image_quality") or "medium",
                 "recommended": item.get("recommended_quality")
@@ -19025,6 +19317,14 @@ class Director:
                     item.get("content_hash")
                     or self._shot_content_hash(shot)),
             }
+            predecessor_no = predecessor_by_shot.get(shot_no)
+            if predecessor_no is not None:
+                dependency = self._keyframe_continuity_dependency(
+                    ctx, predecessor_no)
+                if dependency:
+                    recovered_meta["continuity_dependency"] = dependency
+                    recovered_meta["continuity_group_id"] = str(
+                        group_by_shot.get(shot_no) or "")
             for key in (
                     "provider", "model", "real", "fallbacks",
                     "image_task_class", "unit_cost", "qc",
@@ -19033,11 +19333,12 @@ class Director:
                     "started_at", "finished_at", "duration"):
                 if key in item:
                     recovered_meta[key] = item[key]
-            self._register_shot_asset(
-                ctx, "image", shot_no, uri,
-                meta=self._shot_image_meta(
-                    ctx, shot, decision, recovered_meta))
-            recovered += 1
+            _row, registered = self._register_or_replace_keyframe(
+                ctx, shot, uri,
+                self._shot_image_meta(
+                    ctx, shot, decision, recovered_meta),
+                source_kind="automatic_keyframe_replacement")
+            recovered += int(registered)
         if changed:
             plan["updated_at"] = now()
             self._plan_write(ctx, plan)
@@ -19247,12 +19548,7 @@ class Director:
         quality_by_shot = {}
         payload_by_shot = {}
         active_shots = list(self._active_shots(ctx))
-        scene_locations = {
-            scene.get("scene_no"): self._physical_scene_location(
-                ctx, scene.get("location", ""))
-            for scene in (ctx.get("script") or {}).get("scenes", [])
-            if isinstance(scene, dict)
-        }
+        scene_locations = self._continuity_scene_locations(ctx)
         continuity_plan = build_keyframe_continuity_plan(
             active_shots, scene_locations)
         predecessor_by_shot = continuity_plan["predecessor_by_shot"]
@@ -19326,6 +19622,7 @@ class Director:
                     f"已交AI导演就地修正一次，首轮仍固定四抽；"
                     f"不停止其他镜头：{reason[:500]}")
             current_content_hash = self._shot_content_hash(shot, payload)
+            payload["_base_shot_content_hash"] = current_content_hash
             stored_content_hash = str(
                 stored_prior.get("content_hash") or "").strip()
             candidate_contract_current = bool(
@@ -19348,9 +19645,19 @@ class Director:
             prior_group = (
                 stored_prior.get("candidate_group") or {}
                 if candidate_contract_current else {})
+            # A completed/selected four-image set is history, not an active
+            # resume checkpoint.  Rehydrating its worker payload can revive a
+            # transport-time reference-cap decision (for example continuity
+            # displaced an optional detail sheet) and make an unchanged image
+            # look semantically stale.  Only incomplete work may resume from
+            # candidate_progress.
+            resume_progress_needed = bool(
+                stored_prior.get("status") not in ("done", "reused")
+                or not self._shot_candidate_group_valid(stored_prior))
             live_group = (
                 stored_prior.get("candidate_progress") or {}
-                if candidate_contract_current else {})
+                if candidate_contract_current and resume_progress_needed
+                else {})
             resumable_live_group = bool(
                 isinstance(live_group, dict)
                 and live_group.get("schema")
@@ -19495,18 +19802,18 @@ class Director:
                     stored_prior.get("output_uri") or existing
                     or (canonical if canonical.exists() else ""))
                 if selected and Path(selected).exists():
-                    row = self.assets.latest(
-                        ctx["project"]["id"], "image",
-                        self._shot_name(ctx, shot["shot_no"]))
-                    if row is None or str(row["uri"] or "") != selected:
-                        self._register_shot_asset(
-                            ctx, "image", int(shot["shot_no"]), selected,
-                            meta=self._shot_image_meta(
+                    row, _registered = \
+                        self._register_or_replace_keyframe(
+                            ctx, shot, selected,
+                            self._shot_image_meta(
                                 ctx, shot, payload["quality_decision"], {
                                     "inspection_waived": True,
                                     "selection_basis":
                                         "persisted_director_selection",
-                                }, payload=payload))
+                                }, payload=payload),
+                            source_kind=
+                                "automatic_keyframe_replacement")
+                    selected = str(row["uri"] or selected)
                     ctx["images"].append({
                         "shot_no": shot["shot_no"], "uri": selected,
                         "image_quality": required_quality,
@@ -19555,10 +19862,10 @@ class Director:
                 lambda result, current_shot=shot,
                 current_quality=copy.deepcopy(
                     payload["quality_decision"]),
-                current_payload=payload:
+                current_task=task:
                 self._register_completed_shot_result(
                     ctx, current_shot, current_quality, result,
-                    payload=current_payload))
+                    payload=current_task["payload"]))
             # 预览片不承接旧 QC 失败轮次、四抽修复或 Codex 升级指令；
             # 直接按当前已编译镜头合同生成一次，避免“已关闭质检”仍被
             # 历史质检状态拉回编剧修复/候选选优链。
@@ -19899,7 +20206,13 @@ class Director:
         两段视频拼接处画面连贯;不同场之间是剪辑硬切,各自独立,
         因此按轮推进——每轮并行处理各场的第 N 镜,场内保持串行。"""
         self._require_scene_views(ctx)
-        self._plan_seed_shots(ctx)
+        # 关键图已经在上一阶段生成并锁定。此时资产中心新增了本镜图、
+        # 相邻镜尾帧等派生参考；若再次刷新 shot_image 清单，五张参考图
+        # 预算会令这些派生图挤掉一个可选母参考，造成语义未变却把已完成
+        # 关键图误判为合同变化（done -> pending）。首尾帧确实依赖这些
+        # 新参考，所以这里只刷新 frames；关键图的真正失效仍由 blocking /
+        # images 阶段在生成前按最新人物、场景、空间和镜头合同执行。
+        self._plan_seed_shots(ctx, categories=("frames",))
         return self._stage_frames_impl(ctx)
 
     def _require_scene_views(self, ctx):
@@ -20009,6 +20322,27 @@ class Director:
                     item_id=f"frames:{shot['shot_no']}",
                     frame_kind="frames")
                 required_quality = payload["quality_decision"]["level"]
+                image = images[shot["shot_no"]]
+                image_row = self.assets.latest(
+                    ctx["project"]["id"], "image", name)
+                self._bind_keyframe_for_frames(payload, shot, image_row)
+                chain_first = last_by_chain.get(group_id)
+                if (round_no > 0 and chain_first
+                        and formal_reference_allowed(
+                            chain_first.get("image_quality", "medium"))
+                        and Path(chain_first["uri"]).exists()):
+                    payload["chain_first_uri"] = chain_first["uri"]
+                    payload["continuity_predecessor_shot"] = expected_prev
+                    payload["continuity_group_id"] = group_id
+                # Both the formal keyframe and the exact predecessor are
+                # discovered after _shot_payload.  Freeze the final manifest
+                # and its byte-level dependency signature before considering
+                # any existing frame pair for reuse.
+                self._attach_reference_manifest(payload)
+                frame_snapshot = self._frame_input_snapshot(payload)
+                payload["input_snapshot"] = frame_snapshot
+                payload["input_signature"] = frame_snapshot[
+                    "input_signature"]
                 first = self._existing_asset_uri(ctx, "first_frame", name)
                 last = self._existing_asset_uri(ctx, "last_frame", name)
                 if first and last:
@@ -20024,6 +20358,26 @@ class Director:
                         frame_plan.get(
                             f"frames:{shot['shot_no']}", {}).get("qc")
                         or {})
+                    stored_signatures = (
+                        str(self._asset_meta(first_row).get(
+                            "input_signature") or ""),
+                        str(self._asset_meta(last_row).get(
+                            "input_signature") or ""),
+                    )
+                    exact_input_match = bool(
+                        all(stored_signatures)
+                        and stored_signatures[0] == stored_signatures[1]
+                        and stored_signatures[0]
+                        == frame_snapshot["input_signature"])
+                    exact_output_match = bool(
+                        str(self._asset_meta(first_row).get(
+                            "file_sha256") or "")
+                        and str(self._asset_meta(last_row).get(
+                            "file_sha256") or "")
+                        and self._asset_meta(first_row).get("file_sha256")
+                        == self._file_sha256(first)
+                        and self._asset_meta(last_row).get("file_sha256")
+                        == self._file_sha256(last))
                     exact_chain_match = bool(
                         round_no == 0
                         or (anchor
@@ -20032,6 +20386,8 @@ class Director:
                             == self._file_sha256(anchor.get("uri"))))
                     if (self._quality_meets(
                             frame_quality, required_quality)
+                            and exact_input_match
+                            and exact_output_match
                             and exact_chain_match
                             and (not self._image_qc_enabled()
                                  or saved_qc.get("passed") is True)):
@@ -20055,22 +20411,6 @@ class Director:
                             "uri": last, "image_quality": frame_quality,
                             "shot_no": shot["shot_no"]}
                         continue
-                image = images[shot["shot_no"]]
-                image_row = self.assets.latest(
-                    ctx["project"]["id"], "image", name)
-                self._bind_keyframe_for_frames(payload, shot, image_row)
-                chain_first = last_by_chain.get(group_id)
-                if (round_no > 0 and chain_first
-                        and formal_reference_allowed(
-                            chain_first.get("image_quality", "medium"))
-                        and Path(chain_first["uri"]).exists()):
-                    payload["chain_first_uri"] = chain_first["uri"]
-                    payload["continuity_predecessor_shot"] = expected_prev
-                    payload["continuity_group_id"] = group_id
-                # chain_first_uri is discovered after the keyframe was bound;
-                # rebuild the frozen five-slot manifest so the predecessor is
-                # truly attached and the optional spatial/prop aid yields.
-                self._attach_reference_manifest(payload)
                 round_tasks.append({
                     "item_id": f"frames:{shot['shot_no']}",
                     "capability": "frames",
@@ -20126,17 +20466,30 @@ class Director:
                 meta["continuity_group_id"] = task["payload"].get(
                     "continuity_group_id", "")
                 meta["first_source"] = result.data.get("first_source", "")
+                frame_snapshot = task["payload"].get("input_snapshot") or \
+                    self._frame_input_snapshot(task["payload"])
+                meta["input_snapshot"] = frame_snapshot
+                meta["input_signature"] = frame_snapshot[
+                    "input_signature"]
                 content_qc_waived = not self._image_qc_enabled()
                 meta["qc_passed"] = bool(
                     (getattr(result, "qc", None) or {}).get("passed"))
                 meta["content_qc_enabled"] = not content_qc_waived
                 meta["content_qc_waived"] = content_qc_waived
+                first_meta = {
+                    **meta,
+                    "file_sha256": self._file_sha256(result.data["first"]),
+                }
+                last_meta = {
+                    **meta,
+                    "file_sha256": self._file_sha256(result.data["last"]),
+                }
                 self._register_shot_asset(
                     ctx, "first_frame", shot_no, result.data["first"],
-                    meta=meta)
+                    meta=first_meta)
                 self._register_shot_asset(
                     ctx, "last_frame", shot_no, result.data["last"],
-                    meta=meta)
+                    meta=last_meta)
                 ctx["frames"].append({
                     "shot_no": shot_no,
                     "first": result.data["first"],
@@ -20466,6 +20819,72 @@ class Director:
                 f"{record.get('kind')} / {record.get('name')}")
         return row
 
+    def _checkpoint_frame_scene_mismatches(
+            self, checkpoint, canonical_by_shot):
+        """Return frozen frame proofs that do not match today's scene master.
+
+        Updating only ``video_reference_asset_ids`` is unsafe when the frozen
+        first/last frames were rendered from another room image.  Seedance
+        treats those boundary frames as the strongest visual facts, so adding
+        a newer scene reference beside them cannot repair the contradiction.
+        Every boundary frame must instead prove, through its immutable input
+        snapshot, that it was rendered from the exact canonical asset *and*
+        the exact current bytes of that asset.
+        """
+        groups = (checkpoint.get("assets") or {})
+        records_by_kind = {}
+        for kind in ("first_frames", "last_frames"):
+            records_by_kind[kind] = {
+                int(record.get("shot_no") or 0): record
+                for record in groups.get(kind) or []
+                if isinstance(record, dict)
+            }
+        mismatches = []
+        for shot_no, canonical in canonical_by_shot.items():
+            canonical_id = int(canonical["id"])
+            canonical_sha = self._file_sha256(canonical["uri"])
+            if not canonical_sha:
+                mismatches.append(
+                    f"镜头{shot_no}:当前场景母图无法计算文件摘要")
+                continue
+            for kind, label in (
+                    ("first_frames", "首帧"),
+                    ("last_frames", "尾帧")):
+                record = records_by_kind[kind].get(int(shot_no))
+                if record is None:
+                    mismatches.append(
+                        f"镜头{shot_no}:{label}缺少冻结资产记录")
+                    continue
+                row = self.assets.get(int(record.get("asset_id") or 0))
+                if (row is None or self.assets.is_deleted(row)
+                        or not self._checkpoint_uri_ready(row["uri"])):
+                    mismatches.append(
+                        f"镜头{shot_no}:{label}冻结资产不可用")
+                    continue
+                snapshot = self._asset_meta(row).get("input_snapshot")
+                if not isinstance(snapshot, dict):
+                    mismatches.append(
+                        f"镜头{shot_no}:{label}缺少场景输入快照")
+                    continue
+                try:
+                    frozen_id = int(
+                        snapshot.get("canonical_scene_asset_id") or 0)
+                except (TypeError, ValueError):
+                    frozen_id = 0
+                frozen_sha = str(
+                    snapshot.get("canonical_scene_file_sha256") or "")
+                if frozen_id != canonical_id:
+                    mismatches.append(
+                        f"镜头{shot_no}:{label}场景资产"
+                        f"{frozen_id or '缺失'}≠{canonical_id}")
+                if not frozen_sha:
+                    mismatches.append(
+                        f"镜头{shot_no}:{label}缺少场景文件摘要")
+                elif frozen_sha != canonical_sha:
+                    mismatches.append(
+                        f"镜头{shot_no}:{label}场景文件摘要已变化")
+        return mismatches
+
     def _refresh_checkpoint_video_references(
             self, ctx, checkpoint, checkpoint_version):
         """Apply only explicit post-preflight reference selections.
@@ -20482,13 +20901,29 @@ class Director:
             (checkpoint.get("document_versions") or {}).get(
                 "video_references") or 0)
         frozen_ids = checkpoint.get("video_reference_asset_ids") or {}
+        canonical_by_shot = {}
         canonical_drift = []
         for shot in self._active_shots(ctx):
             shot_no = int(shot["shot_no"])
             canonical = self._required_video_scene_reference(ctx, shot)
+            canonical_by_shot[shot_no] = canonical
             if int(canonical["id"]) not in {
                     int(value) for value in frozen_ids.get(str(shot_no), [])}:
                 canonical_drift.append(shot_no)
+        if canonical_drift:
+            raise AifosError(
+                "冻结快照的统一物理母场景已变化或缺失：镜头"
+                + "、".join(map(str, canonical_drift[:24]))
+                + "；禁止只热换视频场景参考并继续沿用旧首尾帧。"
+                  "请从首尾帧阶段重建，并重新通过生产门禁生成新快照")
+        frame_scene_mismatches = self._checkpoint_frame_scene_mismatches(
+            checkpoint, canonical_by_shot)
+        if frame_scene_mismatches:
+            raise AifosError(
+                "冻结首尾帧不属于当前统一物理母场景："
+                + "；".join(frame_scene_mismatches[:24])
+                + "；禁止沿用旧帧进入视频。请重建首尾帧并重新生成"
+                  "预生产快照")
         if (int(current_version or 0) == bound_version
                 and not canonical_drift):
             return checkpoint, int(checkpoint_version)
@@ -20520,10 +20955,7 @@ class Director:
         # a non-existent document binding that the strict loader would reject.
         if not current_version:
             updated["document_versions"].pop("video_references", None)
-        updated["source"] = (
-            "canonical_scene_reference_refresh"
-            if canonical_drift
-            else "post_preflight_reference_selection")
+        updated["source"] = "post_preflight_reference_selection"
         updated.pop("created_at", None)
         updated.pop("fingerprint", None)
         updated["fingerprint"] = "sha256:" + hashlib.sha256(
@@ -20551,9 +20983,22 @@ class Director:
             raise AifosError("冻结快照中的生产门禁未通过，禁止进入视频")
         for key in ("script", "continuity", "storyboard", "blocking",
                     "text_assets", "preflight", "production_standard",
-                    "resolved_rule_snapshot", "scene_plan"):
+                    "resolved_rule_snapshot", "scene_plan",
+                    "story_analysis"):
             if key in documents:
                 ctx[key] = copy.deepcopy(documents[key])
+        story_analysis = ctx.get("story_analysis")
+        if isinstance(story_analysis, dict):
+            apply_story_analysis(ctx["script"], story_analysis)
+            inferred_style = str(
+                ((story_analysis.get("visual") or {}).get(
+                    "user_style_constraint")
+                 or story_analysis.get("project_style") or "")).strip()
+            if inferred_style and not str(
+                    ctx["project"].get("style") or "").strip():
+                project = dict(ctx["project"])
+                project["style"] = inferred_style
+                ctx["project"] = project
         ctx["production_profile"] = production_profile(
             self.config, ctx["production_standard"])
         ctx["voice_mode"] = ctx["production_profile"].get(
@@ -20635,10 +21080,19 @@ class Director:
         preparation_failures = []
         for shot in self._active_shots(ctx):
             name = self._shot_name(ctx, shot["shot_no"])
-            existing = self._existing_asset_uri(ctx, "video", name)
-            if existing:
-                row = self.assets.latest(
-                    ctx["project"]["id"], "video", name)
+            try:
+                task = self._prepare_video_call(ctx, shot, frames)
+            except AifosError as exc:
+                preparation_failures.append((int(shot["shot_no"]), exc))
+                self.log.warn(
+                    "director",
+                    f"镜头{shot['shot_no']}视频生成前合同已隔离；"
+                    f"其余镜头继续并行：{str(exc)[:500]}")
+                continue
+            row = self.assets.latest(
+                ctx["project"]["id"], "video", name)
+            if self._video_asset_matches_current_input(ctx, row, task):
+                existing = str(row["uri"])
                 meta = json.loads(row["meta"]) if row else {}
                 ctx["videos"].append({
                     "shot_no": shot["shot_no"], "uri": existing,
@@ -20650,14 +21104,7 @@ class Director:
                         "video_resolution", "720p")})
                 reused += 1
                 continue
-            try:
-                pending.append(self._prepare_video_call(ctx, shot, frames))
-            except AifosError as exc:
-                preparation_failures.append((int(shot["shot_no"]), exc))
-                self.log.warn(
-                    "director",
-                    f"镜头{shot['shot_no']}视频生成前合同已隔离；"
-                    f"其余镜头继续并行：{str(exc)[:500]}")
+            pending.append(task)
         generated = self._run_videos_parallel(ctx, pending)
         ctx["videos"].extend(generated.values())
         ctx["videos"].sort(key=lambda item: int(item["shot_no"]))
@@ -20681,6 +21128,29 @@ class Director:
             "parallel_workers": min(
                 self._video_parallel_workers(), max(1, len(pending))),
         }
+
+    def _video_asset_matches_current_input(self, ctx, row, task):
+        """Reuse a video only when its fully prepared inputs match exactly."""
+        if ctx.get("force"):
+            return False
+        if row is None or not row["uri"]:
+            return False
+        uri = str(row["uri"])
+        if (not uri.startswith(("http://", "https://"))
+                and not Path(uri).is_file()):
+            return False
+        payload = task.get("payload") or {}
+        current = str(payload.get("input_signature") or "")
+        if not current:
+            current = str(
+                self._video_input_snapshot(payload).get(
+                    "input_signature") or "")
+        stored = str(self._asset_meta(row).get("input_signature") or "")
+        stored_output = str(
+            self._asset_meta(row).get("file_sha256") or "")
+        return bool(
+            current and stored and current == stored
+            and stored_output and stored_output == self._file_sha256(uri))
 
     def _ensure_spatial_reference_assets(self, ctx):
         """补齐并登记本集 Seedance 必传的逐镜空间 PNG（兼容旧项目）。"""
@@ -21072,13 +21542,11 @@ class Director:
                 f"镜头{shot_no}的空间图与人物最终立绘已占{len(rows)}张，"
                 f"超过 Seedance 2 资产参考上限"
                 f"{SEEDANCE_ASSET_REFERENCE_LIMIT}张；请拆分群像镜头")
-        # The shot-facing view is optional composition help.  The canonical
-        # root above remains first and wins the asset budget; unsafe panorama
-        # derivatives are already rejected by _scene_view_reference.
-        if len(rows) < SEEDANCE_ASSET_REFERENCE_LIMIT:
-            view_row, _view_label = self._scene_view_reference(
-                project_id, location, shot.get("camera") or {}, script=script)
-            add(view_row)
+        # Video generation gets exactly one scene image: the canonical master
+        # already added above.  Supplying a second angle/render of the same
+        # room makes Seedance reconcile two slightly different furniture
+        # layouts and is the direct cause of per-shot set drift.  Camera and
+        # actor placement come from the spatial-blocking asset instead.
         # 本镜分镜示例图承载构图事实，但只有中/高质量且没有已知质检
         # 风险的正式版本才能作为视频参考。问题图仍留在画布供复盘，
         # 不得把错误安全带、反向手机或错误车内结构继续传给 Seedance。
@@ -21796,6 +22264,14 @@ class Director:
             or payload.get("prompt_compact")
             or payload.get("prompt")
             or "")
+        digest_cache = {}
+
+        def digest(uri):
+            uri = str(uri or "")
+            if uri not in digest_cache:
+                digest_cache[uri] = Director._file_sha256(uri)
+            return digest_cache[uri]
+
         manifest = []
         for item in payload.get("reference_manifest") or []:
             if not isinstance(item, dict):
@@ -21805,6 +22281,7 @@ class Director:
                     "index", "asset_id", "kind", "name", "version", "uri",
                     "binding")
             })
+            manifest[-1]["file_sha256"] = digest(manifest[-1].get("uri"))
         requested_references = list(dict.fromkeys(
             str(uri) for uri in (payload.get("reference_images") or [])))
         if "reference_images_used" in result_data:
@@ -21813,6 +22290,16 @@ class Director:
                     result_data.get("reference_images_used") or [])))
         else:
             used_references = list(requested_references)
+        reference_digests = [
+            {"uri": uri, "file_sha256": digest(uri)}
+            for uri in requested_references
+        ]
+        reference_videos = list(dict.fromkeys(
+            str(uri) for uri in (payload.get("reference_videos") or [])))
+        reference_video_digests = [
+            {"uri": uri, "file_sha256": digest(uri)}
+            for uri in reference_videos
+        ]
         boundary_count = int(bool(payload.get("first"))) + int(
             bool(payload.get("last")))
         model_tier = str(
@@ -21837,10 +22324,17 @@ class Director:
             "prompt_contract": copy.deepcopy(
                 payload.get("prompt_contract") or {}),
             "keyframe": str(payload.get("keyframe") or ""),
+            "keyframe_sha256": digest(
+                payload.get("keyframe")),
             "first_frame": str(payload.get("first") or ""),
+            "first_frame_sha256": digest(
+                payload.get("first")),
             "last_frame": str(payload.get("last") or ""),
+            "last_frame_sha256": digest(
+                payload.get("last")),
             "reference_manifest": manifest,
             "reference_images": requested_references,
+            "reference_image_digests": reference_digests,
             "reference_images_used": used_references,
             "physical_scene_id": str(
                 payload.get("physical_scene_id") or ""),
@@ -21850,11 +22344,13 @@ class Director:
                 "canonical_scene_asset_version"),
             "canonical_scene_reference_uri": str(
                 payload.get("canonical_scene_reference_uri") or ""),
+            "canonical_scene_file_sha256": digest(
+                payload.get("canonical_scene_reference_uri")),
             "canonical_scene_fingerprint": str(
                 payload.get("canonical_scene_fingerprint") or ""),
             # 运动参考视频(2.0 即支持):进签名——挂/摘参考都算输入变化
-            "reference_videos": list(dict.fromkeys(
-                str(uri) for uri in (payload.get("reference_videos") or []))),
+            "reference_videos": reference_videos,
+            "reference_video_digests": reference_video_digests,
             "material_reference_count_requested": len(requested_references),
             "material_reference_count_used": len(used_references),
             "total_reference_count_requested": (
@@ -21874,13 +22370,17 @@ class Director:
         }
         signature_source = {
             key: snapshot[key] for key in (
-                "prompt_sent", "keyframe", "first_frame", "last_frame",
-                "reference_manifest", "reference_images",
+                "prompt_sent", "keyframe", "keyframe_sha256",
+                "first_frame", "first_frame_sha256", "last_frame",
+                "last_frame_sha256", "reference_manifest",
+                "reference_images", "reference_image_digests",
                 "physical_scene_id", "canonical_scene_asset_id",
                 "canonical_scene_asset_version",
                 "canonical_scene_reference_uri",
+                "canonical_scene_file_sha256",
                 "canonical_scene_fingerprint",
                 "reference_videos",
+                "reference_video_digests",
                 "material_reference_count_requested",
                 "total_reference_count_requested", "duration",
                 "video_model_tier", "video_model_reason",
@@ -21961,6 +22461,10 @@ class Director:
 
     def _prepare_video_call(self, ctx, shot, frames):
         """在主线程锁定单镜首尾帧、人物/场景资产和空间图映射。"""
+        # Prompt compilation and reference selection are repeated by resume,
+        # diagnostics and cache checks.  Never allow a downstream helper to
+        # mutate the versioned storyboard object shared through ``ctx``.
+        shot = copy.deepcopy(shot)
         shot_no = int(shot["shot_no"])
         self._require_valid_storyboard_prop_contract(ctx)
         prop_contract = self._shot_prop_contract(ctx, shot)
@@ -22021,6 +22525,35 @@ class Director:
             self._video_reference_rows(ctx, shot["shot_no"])
             if reference_mode == "all_around" else [])
         canonical_scene_row = self._required_video_scene_reference(ctx, shot)
+        # Historical manual selections and frozen checkpoints may contain a
+        # root scene plus an older angle/view.  Both can belong to the same
+        # physical_scene_id yet disagree in furniture topology.  Normalize
+        # all three entry paths here, immediately before the real request, so
+        # only the one canonical scene master can reach Seedance.
+        dropped_scene_rows = []
+        normalized_reference_rows = []
+        for row in reference_rows:
+            is_scene_truth = str(row["kind"] or "") == "scene_art"
+            if (str(row["kind"] or "") == "reference"
+                    and self._reference_role(row) == "scene"):
+                is_scene_truth = True
+            if is_scene_truth:
+                if int(row["id"]) != int(canonical_scene_row["id"]):
+                    dropped_scene_rows.append(row)
+                continue
+            normalized_reference_rows.append(row)
+        insert_at = 1 if (
+            normalized_reference_rows
+            and str(normalized_reference_rows[0]["kind"] or "")
+            == "spatial_blocking") else 0
+        normalized_reference_rows.insert(insert_at, canonical_scene_row)
+        reference_rows = normalized_reference_rows
+        if dropped_scene_rows:
+            self.log.warn(
+                "director",
+                f"镜头{shot_no}已剔除 {len(dropped_scene_rows)} 张历史/"
+                "重复场景参考，只保留唯一物理母场景 asset_id="
+                f"{canonical_scene_row['id']}")
         physical_scene_id = self._physical_scene_location(
             ctx, self._shot_location(ctx.get("script") or {}, shot))
         if (reference_mode == "all_around"
@@ -22262,7 +22795,11 @@ class Director:
                 and result.data.get("voice") == "jimeng_builtin"
                 and result.data.get("lip_sync")):
             audio_in_video = True
-        input_snapshot = self._video_input_snapshot(task["payload"], result)
+        request_snapshot = copy.deepcopy(
+            task["payload"].get("input_snapshot") or
+            self._video_input_snapshot(task["payload"]))
+        execution_snapshot = self._video_input_snapshot(
+            task["payload"], result)
         previous_meta = self._latest_video_input_meta(
             ctx, int(shot["shot_no"]))
         attempt_history = list(previous_meta.get("attempt_history") or [])
@@ -22271,11 +22808,12 @@ class Director:
             "generated_at": now(),
             "provider": result.provider,
             "model": getattr(result, "model", "") or "",
-            "input_signature": input_snapshot["input_signature"],
-            "prompt_sent_hash": input_snapshot["prompt_sent_hash"],
+            "input_signature": request_snapshot["input_signature"],
+            "execution_signature": execution_snapshot["input_signature"],
+            "prompt_sent_hash": execution_snapshot["prompt_sent_hash"],
             "reference_assets": copy.deepcopy(reference_assets),
-            "first_frame": input_snapshot["first_frame"],
-            "last_frame": input_snapshot["last_frame"],
+            "first_frame": request_snapshot["first_frame"],
+            "last_frame": request_snapshot["last_frame"],
         })
         attempt_history = attempt_history[-20:]
         self._register_shot_asset(ctx, "video", shot["shot_no"], result.uri,
@@ -22288,9 +22826,19 @@ class Director:
                                         "reference_assets": reference_assets,
                                         "reference_manifest":
                                             reference_manifest,
-                                        "input_snapshot": input_snapshot,
+                                        "input_snapshot": request_snapshot,
                                         "input_signature":
-                                            input_snapshot["input_signature"],
+                                            request_snapshot["input_signature"],
+                                        "request_signature":
+                                            request_snapshot[
+                                                "input_signature"],
+                                        "execution_snapshot":
+                                            execution_snapshot,
+                                        "execution_signature":
+                                            execution_snapshot[
+                                                "input_signature"],
+                                        "file_sha256":
+                                            self._file_sha256(result.uri),
                                         "attempt_history": attempt_history})
         return {"shot_no": shot["shot_no"], "uri": result.uri,
                 "duration": shot["duration"], "provider": result.provider,
@@ -22299,8 +22847,13 @@ class Director:
                 "video_resolution": quality["resolution"],
                 "reference_assets": reference_assets,
                 "reference_manifest": reference_manifest,
-                "input_snapshot": input_snapshot,
-                "input_signature": input_snapshot["input_signature"],
+                "input_snapshot": request_snapshot,
+                "input_signature": request_snapshot["input_signature"],
+                "request_signature": request_snapshot[
+                    "input_signature"],
+                "execution_snapshot": execution_snapshot,
+                "execution_signature": execution_snapshot[
+                    "input_signature"],
                 "attempt_history": attempt_history}
 
     def _run_videos_parallel(self, ctx, tasks):
@@ -22972,7 +23525,9 @@ class Director:
                 spatial_staging = copy.deepcopy(
                     fallback_contract.get("spatial_staging") or {})
         expected_characters = shot.get("characters") or []
-        return self._qc_spec(
+        physical_scene_id = self._physical_scene_location(
+            ctx, self._shot_location(ctx.get("script"), shot))
+        spec = self._qc_spec(
             ctx["project"]["id"],
             self._video_identity_names(ctx, shot),
             location=self._shot_location(ctx.get("script"), shot),
@@ -22992,6 +23547,29 @@ class Director:
                 ctx, shot, modality="video"),
             narrative_overlays=shot.get("narrative_overlays"),
             functional_figures=shot.get("functional_figures"))
+        # Contract-only tests and legacy diagnostics can contain no scene
+        # table at all.  They may still validate the frozen physical/spatial
+        # contract, but they are not a formal rendered clip and therefore
+        # have no canonical visual topology to compare.  Every real scripted
+        # scene continues to fail closed if its mother asset is missing.
+        if not (ctx.get("script") or {}).get("scenes"):
+            return spec
+        canonical_scene = self._required_video_scene_reference(ctx, shot)
+        spec.update({
+            # Video content QC must compare the rendered clip with the same
+            # physical room master used by Seedance.  Per-clip stability is
+            # insufficient: every clip can be internally stable yet depict a
+            # different room.
+            "scene_topology_required": True,
+            "physical_scene_id": physical_scene_id,
+            "canonical_scene_asset_id": int(canonical_scene["id"]),
+            "canonical_scene_asset_version": int(
+                canonical_scene["version"]),
+            "canonical_scene_reference_uri": str(canonical_scene["uri"]),
+            "canonical_scene_file_sha256": self._file_sha256(
+                canonical_scene["uri"]),
+        })
+        return spec
 
     def _run_video_media_qc(self, ctx, content_enabled):
         """Probe every produced clip; optionally inspect five real video frames.
@@ -23097,7 +23675,9 @@ class Director:
 
         visual_tasks = []
         if content_enabled:
-            for shot_no, item in per_shot.items():
+            previous_scene_sample = {}
+            for shot_no in sorted(per_shot):
+                item = per_shot[shot_no]
                 evidence = item.get("frame_evidence") or {}
                 if not evidence.get("passed"):
                     continue
@@ -23114,9 +23694,18 @@ class Director:
                     }
                     for sample in evidence.get("samples") or []
                 ]
+                source_manifest = copy.deepcopy(
+                    snapshot.get("reference_manifest") or [])
+                source_indices = [
+                    int(row.get("index") or 0)
+                    for row in source_manifest
+                    if isinstance(row, dict)
+                    and str(row.get("index") or "").isdigit()
+                ]
+                evidence_index_base = max(source_indices or [0])
                 sequence_manifest = [
                     {
-                        "index": index + 1,
+                        "index": evidence_index_base + index + 1,
                         "uri": sample["uri"],
                         "label": f"视频{sample['label']}抽帧",
                         "role": "video_qc_sequence",
@@ -23126,6 +23715,41 @@ class Director:
                     }
                     for index, sample in enumerate(sequence_samples)
                 ]
+                physical_scene_id = str(
+                    spec.get("physical_scene_id") or "")
+                canonical_uri = str(
+                    spec.get("canonical_scene_reference_uri") or "")
+                predecessor = previous_scene_sample.get(physical_scene_id)
+                continuity_manifest = [{
+                    "index": evidence_index_base + len(
+                        sequence_manifest) + 1,
+                    "asset_id": spec.get("canonical_scene_asset_id"),
+                    "kind": "scene_art",
+                    "name": f"统一场景母图:{physical_scene_id}",
+                    "version": spec.get("canonical_scene_asset_version"),
+                    "uri": canonical_uri,
+                    "label": "统一场景母图",
+                    "role": "continuity",
+                    "binding": (
+                        "场景空间拓扑唯一事实；逐项核对固定门窗、墙体、"
+                        "床和大型家具的款式、方位、距离、朝向与动线"),
+                    "reference_chain_eligible": False,
+                }]
+                if predecessor:
+                    continuity_manifest.append({
+                        "index": evidence_index_base + len(
+                            sequence_manifest) + 2,
+                        "kind": "video_qc_previous_shot",
+                        "name": (
+                            f"同场上一镜视频尾帧:{predecessor['shot_no']}"),
+                        "uri": predecessor["uri"],
+                        "label": "同场上一镜视频尾帧",
+                        "role": "continuity",
+                        "binding": (
+                            "只核对跨镜场景结构、固定陈设、材质与光线方向"
+                            "连续；人物动作和机位允许按本镜合同变化"),
+                        "reference_chain_eligible": False,
+                    })
                 generation_input = {
                     "schema": "aifos.video-frame-review-input/v1",
                     "scope": {"shot_no": shot_no,
@@ -23134,9 +23758,8 @@ class Director:
                     "prompt_contract": copy.deepcopy(
                         snapshot.get("prompt_contract") or {}),
                     "reference_manifest": (
-                        copy.deepcopy(
-                            snapshot.get("reference_manifest") or [])
-                        + sequence_manifest),
+                        source_manifest + sequence_manifest
+                        + continuity_manifest),
                     "input_signature": signature,
                     "reference_chain_eligible": False,
                 }
@@ -23151,9 +23774,26 @@ class Director:
                         "video_sequence_samples": sequence_samples,
                         "video_temporal_evidence": copy.deepcopy(
                             item.get("temporal_evidence") or {}),
+                        "video_cross_shot_context": {
+                            "physical_scene_id": physical_scene_id,
+                            "canonical_scene": {
+                                "asset_id": spec.get(
+                                    "canonical_scene_asset_id"),
+                                "version": spec.get(
+                                    "canonical_scene_asset_version"),
+                                "uri": canonical_uri,
+                                "file_sha256": spec.get(
+                                    "canonical_scene_file_sha256"),
+                            },
+                            "previous_same_scene_shot": (
+                                copy.deepcopy(predecessor) if predecessor
+                                else None),
+                        },
                         "video_qc_focus": (
                             "联合检查五点抽帧中明显影响剧情的身份漂移、"
                             "道具瞬移、物理支撑、空间朝向和动作阶段；"
+                            "所有抽帧必须继承统一场景母图的固定空间拓扑；"
+                            "若有同场上一镜尾帧，还必须核对跨镜固定陈设连续；"
                             "结合确定性时序证据重点复核近乎冻结或全画面"
                             "突变，但不要把正常运镜/动作误判为漂移；"
                             "不要因微小美术差异失败。"),
@@ -23166,6 +23806,13 @@ class Director:
                             for sample in sequence_samples],
                     }
                     visual_tasks.append((shot_no, sequence, spec, payload))
+                if sequence_samples:
+                    previous_scene_sample[physical_scene_id] = {
+                        "shot_no": shot_no,
+                        "uri": sequence_samples[-1]["uri"],
+                        "label": sequence_samples[-1]["label"],
+                        "timestamp": sequence_samples[-1]["timestamp"],
+                    }
 
         def inspect_sample(task):
             shot_no, sample, spec, payload = task
@@ -23217,6 +23864,10 @@ class Director:
                             "spatial_logic_checked"),
                         "spatial_logic_match": verdict.get(
                             "spatial_logic_match"),
+                        "scene_topology_checked": verdict.get(
+                            "scene_topology_checked"),
+                        "scene_topology_match": verdict.get(
+                            "scene_topology_match"),
                         "provider": result.provider,
                         "unavailable": verdict.get("unavailable", ""),
                     })
@@ -24433,10 +25084,116 @@ class Director:
         return {"label": label}
 
     def _register_shot_asset(self, ctx, kind, shot_no, uri, meta=None):
-        self.assets.register(
+        return self.assets.register(
             ctx["project"]["id"], kind,
             f"e{ctx['episode']['number']:03d}_shot{shot_no:03d}", uri=uri,
             meta=meta)
+
+    def _register_or_replace_keyframe(
+            self, ctx, shot, uri, meta, *, source_kind):
+        """Register one keyframe without ever overwriting a changed version.
+
+        Stable filenames and interrupted workers mean URI/name equality is
+        not evidence of pixel equality.  Only byte digest + semantic contract
+        + predecessor dependency may reuse the active row.  Every other case
+        creates an auditable version and retires the exact downstream frame/
+        video suffix before it can carry stale set geometry forward.
+        """
+        shot_no = int(shot["shot_no"])
+        name = self._shot_name(ctx, shot_no)
+        normalized_meta = copy.deepcopy(meta or {})
+        normalized_meta["file_sha256"] = self._file_sha256(uri)
+        old_row = self.assets.latest(ctx["project"]["id"], "image", name)
+        if old_row is None:
+            row = self._register_shot_asset(
+                ctx, "image", shot_no, uri, meta=normalized_meta)
+            return row, True
+        old_meta = self._asset_meta(old_row)
+        same_registered_input = bool(
+            normalized_meta.get("file_sha256")
+            and old_meta.get("file_sha256")
+            == normalized_meta.get("file_sha256")
+            and old_meta.get("shot_content_hash")
+            == normalized_meta.get("shot_content_hash")
+            and (old_meta.get("continuity_dependency") or {})
+            == (normalized_meta.get("continuity_dependency") or {}))
+        if same_registered_input:
+            return old_row, False
+        new_row = self.assets.register(
+            ctx["project"]["id"], "image", name,
+            uri=uri, meta=normalized_meta, new_version=True)
+        self._invalidate_keyframe_dependents(
+            ctx, shot, old_row, new_row, source_kind=source_kind)
+        return new_row, True
+
+    def _keyframe_continuity_suffix(self, ctx, shot_no):
+        """Return the exact downstream frame chain affected by one keyframe."""
+        shot_no = int(shot_no)
+        plan = build_keyframe_continuity_plan(
+            list(self._active_shots(ctx)),
+            self._continuity_scene_locations(ctx))
+        group_id = plan.get("group_by_shot", {}).get(shot_no)
+        for group in plan.get("groups") or []:
+            if group.get("group_id") != group_id:
+                continue
+            members = [int(value) for value in group.get("shot_nos") or []]
+            try:
+                return members[members.index(shot_no):]
+            except ValueError:
+                break
+        return [shot_no]
+
+    def _invalidate_keyframe_dependents(
+            self, ctx, shot, old_row, new_row, *, source_kind):
+        """Retire only the continuity suffix that depends on a replaced image.
+
+        Editorial ``scene_no`` is not a physical continuity boundary.  The
+        shared continuity graph is authoritative, so a split scene in the same
+        room stays linked while an explicit time/realm break is left alone.
+        Tombstones preserve every old file and version for audit/recovery.
+        """
+        if old_row is None or new_row is None:
+            return {"affected_shots": [], "invalidated_assets": []}
+        project_id = ctx["project"]["id"]
+        episode_id = ctx["episode"]["id"]
+        shot_no = int(shot["shot_no"])
+        suffix = self._keyframe_continuity_suffix(ctx, shot_no)
+        reference_shots = self._sync_revised_video_references(
+            episode_id, project_id, old_row["id"], new_row, usable=True)
+        self.assets.mark_superseded(
+            old_row["id"], new_row["id"], reason="keyframe_replacement")
+        invalidated = []
+        for affected_no in sorted(set(suffix) | set(reference_shots)):
+            name = self._shot_name(ctx, affected_no)
+            for kind, reason in (
+                    ("first_frame", "keyframe_continuity_suffix"),
+                    ("last_frame", "keyframe_continuity_suffix"),
+                    ("video", "keyframe_or_reference_replacement")):
+                if kind != "video" and affected_no not in suffix:
+                    continue
+                if self.assets.latest(project_id, kind, name) is None:
+                    continue
+                self.assets.soft_delete(
+                    project_id, kind, name, meta={
+                        "invalidated_by_keyframe_replacement": shot_no,
+                        "invalidation_reason": reason,
+                        "source_asset_id": old_row["id"],
+                        "replacement_asset_id": new_row["id"],
+                    })
+                invalidated.append({
+                    "shot_no": affected_no, "kind": kind, "name": name})
+        affected_shots = sorted(set(suffix) | set(reference_shots))
+        self._invalidate_revised_delivery(
+            ctx, shot, formal_ready=True,
+            affected_shots=affected_shots, source_kind=source_kind,
+            preserve_episode_status=(
+                source_kind == "automatic_keyframe_replacement"))
+        return {
+            "affected_shots": affected_shots,
+            "continuity_suffix": suffix,
+            "video_reference_shots": reference_shots,
+            "invalidated_assets": invalidated,
+        }
 
     def _register_completed_shot_result(
             self, ctx, shot, quality, result, payload=None):
@@ -24448,10 +25205,11 @@ class Director:
         if data.get("_shot_asset_registered"):
             return
         extra = self._plan_done_extra(result)
-        self._register_shot_asset(
-            ctx, "image", int(shot["shot_no"]), result.uri,
-            meta=self._shot_image_meta(
-                ctx, shot, quality, extra, payload=payload))
+        meta = self._shot_image_meta(
+            ctx, shot, quality, extra, payload=payload)
+        self._register_or_replace_keyframe(
+            ctx, shot, result.uri, meta,
+            source_kind="automatic_keyframe_replacement")
         data["_shot_asset_registered"] = True
 
     # ---- 剧本 AI 分析 / 制作圣经 ----
@@ -24739,14 +25497,28 @@ class Director:
                     frames_payload["feedback"]),
                 payload=frames_payload, revision_source=revision_source,
                 capability="frames")
-            meta = self._quality_meta(frames_payload["quality_decision"])
+            # Revision paths must freeze the same byte-level scene/input proof
+            # as the normal frame stage.  Otherwise a perfectly valid repaired
+            # frame looks like a legacy frame at preflight and is (correctly)
+            # rejected as unable to prove which room produced it.
+            self._attach_reference_manifest(frames_payload)
+            frame_snapshot = self._frame_input_snapshot(frames_payload)
+            meta = {
+                **self._quality_meta(frames_payload["quality_decision"]),
+                "input_snapshot": frame_snapshot,
+                "input_signature": frame_snapshot["input_signature"],
+            }
             new_first = self.assets.register(
                 ctx["project"]["id"], "first_frame", asset_name,
-                uri=frame_result.data["first"], meta=meta,
+                uri=frame_result.data["first"], meta={
+                    **meta, "file_sha256": self._file_sha256(
+                        frame_result.data["first"])},
                 new_version=True)
             new_last = self.assets.register(
                 ctx["project"]["id"], "last_frame", asset_name,
-                uri=frame_result.data["last"], meta=meta,
+                uri=frame_result.data["last"], meta={
+                    **meta, "file_sha256": self._file_sha256(
+                        frame_result.data["last"])},
                 new_version=True)
             if old_first is not None:
                 self.assets.mark_superseded(
@@ -24885,7 +25657,7 @@ class Director:
 
     def _invalidate_revised_delivery(
             self, ctx, shot, formal_ready=True, affected_shots=None,
-            source_kind="shot"):
+            source_kind="shot", preserve_episode_status=False):
         """镜头版本变化后隐藏旧成片/检查板，并登记待重拍状态。"""
         project_id = ctx["project"]["id"]
         episode_id = ctx["episode"]["id"]
@@ -24931,7 +25703,8 @@ class Director:
         }
         self.projects.save_document(
             episode_id, "shot_revision_state", revision)
-        self.projects.set_episode_status(episode_id, "awaiting_confirm")
+        if not preserve_episode_status:
+            self.projects.set_episode_status(episode_id, "awaiting_confirm")
         return {"invalidated_outputs": invalidated,
                 "formal_ready": bool(formal_ready)}
 
@@ -25956,6 +26729,7 @@ class Director:
             latest = self.assets.latest(
                 ctx["project"]["id"], "image", asset_name)
             latest_meta = self._asset_meta(latest)
+            replaced_asset = None
             if (latest is not None
                     and str(latest_meta.get("candidate_set_token") or "")
                     == actual_token
@@ -25963,10 +26737,8 @@ class Director:
                     == requested_candidate_id):
                 asset = latest
             else:
-                asset = self.assets.register(
-                    ctx["project"]["id"], "image", asset_name,
-                    uri=selected_uri,
-                    meta=self._shot_image_meta(ctx, shot, quality, {
+                selected_meta = self._shot_image_meta(
+                    ctx, shot, quality, {
                         "selected_from_candidate_group": True,
                         # The render-plan hash was compiled with the exact
                         # prompt/reference contract used by all four
@@ -25987,8 +26759,19 @@ class Director:
                         "candidate_seed": candidate.get("candidate_seed"),
                         "selection_source": source,
                         "selected_at": now(),
-                    }),
+                    })
+                selected_meta["file_sha256"] = self._file_sha256(
+                    selected_uri)
+                asset = self.assets.register(
+                    ctx["project"]["id"], "image", asset_name,
+                    uri=selected_uri,
+                    meta=selected_meta,
                     new_version=latest is not None)
+                replaced_asset = latest
+            if replaced_asset is not None:
+                self._invalidate_keyframe_dependents(
+                    ctx, shot, replaced_asset, asset,
+                    source_kind="candidate_selection_replacement")
             selection = {
                 "candidate_set_id": actual_id,
                 "candidate_set_token": actual_token,

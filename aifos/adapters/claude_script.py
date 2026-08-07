@@ -1586,6 +1586,7 @@ advisory_issues且通过。相邻景别内轻微取景差、焦段数字、精�
 "detected_overlay_count": 画面实际内心Q版叠层数整数,
 "physical_logic_checked": true或false, "physical_logic_match": true或false,
 "spatial_logic_checked": true或false, "spatial_logic_match": true或false,
+"scene_topology_checked": true或false, "scene_topology_match": true或false,
 "detected_count": 画面实际人数整数,
 "technical_quality_pass": true或false,
 "critical_failures": ["只列必须重抽的硬一致/技术质量错误"],
@@ -2161,6 +2162,20 @@ def build_qc_prompt(payload):
             "可见且影响剧情或可信度的问题才失败；轻微生成波动必须放行。"
             "这些图片仅是质检证据，严禁登记为资产或进入后续生成参考链。\n\n"
             + prompt)
+    if payload.get("scene_topology_required"):
+        topology_context = json.dumps(
+            payload.get("video_cross_shot_context") or {},
+            ensure_ascii=False, separators=(",", ":"))
+        prompt = (
+            "【视频跨镜场景拓扑硬门】\n"
+            "实际打开参考清单中标注为统一场景母图的图片，把视频五点抽帧"
+            "中的固定门窗、墙体、床和大型家具的款式、方位、距离、朝向、"
+            "材质及动线逐项对照；所有帧必须属于同一个物理空间。若有同场"
+            "上一镜尾帧，还要核对跨镜固定陈设连续；人物动作和机位允许按"
+            "本镜合同变化。明显换房、床/门窗/墙体改位、固定家具换款必须"
+            "失败；只因景别裁切未看见某物不得失败。输出必须包含严格布尔"
+            "scene_topology_checked 与 scene_topology_match。"
+            f"上下文={topology_context}\n\n" + prompt)
     return prompt
 
 
@@ -2183,6 +2198,7 @@ def validate_image_qc(data):
         "count_checked", "count_match",
         "physical_logic_checked", "physical_logic_match",
         "spatial_logic_checked", "spatial_logic_match",
+        "scene_topology_checked", "scene_topology_match",
         "overlay_count_checked", "overlay_count_match",
         "technical_quality_pass",
     )
