@@ -27,9 +27,9 @@ DEFAULTS = {
         # preview_qc_bypass 能显式关闭视觉检查。
         "director_autonomy_mode": False,
         # 创作选片模式:图片/视频内容质检保留，但只负责诊断和触发自动
-        # 返修，绝不成为生产闸门。每镜每轮固定并行生成4张，由AI选优；
-        # 若本轮仍不合格，Codex 根据质检原因优化提示词和参考图后进入
-        # 下一轮，最多10轮（首轮计入，总计最多40张）。人工改选仅是
+        # 返修，绝不成为生产闸门。每镜首轮只生成1张；若不合格，Codex
+        # 根据质检原因优化提示词和参考图，并以该失败图作为唯一修改基底
+        # 进入下一轮，每轮仍只生成1张，最多10轮（首轮计入）。人工改选仅是
         # 可选覆盖，手机端不承担生产门禁。生成前导演合同检查与文件/解码/
         # 尺寸/音轨技术完整性检查始终开启，不属于本开关范围。
         # 默认开启=升级后的新产线形态(用户定调"不再用阻断式");旧
@@ -39,14 +39,12 @@ DEFAULTS = {
         # 不再隐式关闭质检；用户显式关闭某类质检时才跳过该类诊断。
         "image_content_qc": True,
         "video_content_qc": True,
-        # 每镜关键帧首轮候选张数:当前版本固定 4。AI 会自动
-        # 做视觉排名并选最优张晋升；关闭图片质检只关闭通过/返工
-        # 门禁，不关闭这个候选排名。排名服务失败时回退第一张
-        # 技术可用图并记录风险。人工选择只是可选覆盖，不是生产门禁。
-        "shot_candidate_count": 4,
+        # 每镜关键帧首轮张数:当前版本固定 1。AI 判断合格即晋升；
+        # 不合格则以该图为 revision_base 进入下一轮精准编辑。
+        "shot_candidate_count": 1,
         # 问题镜头不阻断生产：Codex 汇总本轮质检原因，优化提示词并
-        # 重选最合适参考图，每个返修轮仍固定补抽4张再由AI选优。
-        "shot_repair_candidate_count": 4,
+        # 重选最合适参考图，并以失败图为唯一修改基底；每轮固定生成1张。
+        "shot_repair_candidate_count": 1,
         # 正式语义是“总抽卡轮数”，首轮算第1轮，上限10轮。
         "shot_max_candidate_rounds": 10,
         # 兼容旧消费方的“返修批次数”；10轮总数对应最多9个返修批次。
@@ -338,7 +336,10 @@ def _normalize_selection_policy_defaults(data, *, saved=None, overrides=None):
     except (TypeError, ValueError):
         rounds = 10
     rounds = max(1, min(rounds, 10))
-    defaults["shot_repair_candidate_count"] = 4
+    # 旧工作区的4张镜头候选只是历史生产策略，不是用户偏好；新一轮
+    # 一律迁移为单图连续精修。角色/道具母资产候选数量由独立流程管理。
+    defaults["shot_candidate_count"] = 1
+    defaults["shot_repair_candidate_count"] = 1
     defaults["shot_max_candidate_rounds"] = rounds
     defaults["shot_auto_repair_batches"] = rounds - 1
     return data

@@ -448,7 +448,7 @@ def test_auto_rerun_repairs_missing_video(tmp_path):
                 for s in storyboard["shots"]]
         ctx["images"] = [
             {"shot_no": s["shot_no"],
-             # 关键帧进入四候选自动选优后，正式 URI 来自资产中心，
+             # 关键帧进入单图质检返修后，正式 URI 来自资产中心，
              # 不再假定旧版固定 canonical 文件名。
              "uri": app.assets.latest(
                  project["id"], "image",
@@ -469,9 +469,10 @@ def test_auto_rerun_repairs_missing_video(tmp_path):
 
 
 def _candidate_result(tmp_path, *, expected, available, passed=False,
-                      revision=1, cost=0.0):
+                      revision=1, cost=0.0, shot_no=1):
     version = build_candidate_set_version(
-        episode_id="episode-test", shot_no=1, contract_revision=revision,
+        episode_id="episode-test", shot_no=shot_no,
+        contract_revision=revision,
         candidate_revision=revision, prompt=f"prompt-{revision}",
         reference_manifest=[])
     candidates = []
@@ -535,7 +536,7 @@ def test_partial_candidate_group_ai_selects_and_only_zero_is_incomplete(
         app.close()
 
 
-def test_all_four_explicit_failures_trigger_four_candidate_repair_until_pass(
+def test_single_failed_keyframe_is_revision_base_for_single_repair_until_pass(
         tmp_path, monkeypatch):
     app = App(tmp_path / "ws")
     try:
@@ -545,11 +546,11 @@ def test_all_four_explicit_failures_trigger_four_candidate_repair_until_pass(
             path.write_bytes(name.encode("utf-8"))
             ref_paths[name] = str(path)
         initial = _candidate_result(
-            tmp_path, expected=4, available=4, passed=False,
-            revision=1, cost=4.0)
+            tmp_path, expected=1, available=1, passed=False,
+            revision=1, cost=1.0)
         repaired = _candidate_result(
-            tmp_path, expected=4, available=4, passed=True,
-            revision=2, cost=4.0)
+            tmp_path, expected=1, available=1, passed=True,
+            revision=2, cost=1.0)
         queue = [initial, repaired]
         calls = []
 
@@ -610,11 +611,70 @@ def test_all_four_explicit_failures_trigger_four_candidate_repair_until_pass(
         assert result.uri.endswith("r2-candidate-1.svg")
         group = result.data["candidate_group"]
         assert group["repair_batch"] is True
-        assert group["expected_count"] == 4
+        assert group["expected_count"] == 1
         assert group["generation_round"] == 2
         assert group["max_candidate_rounds"] == 10
         assert len(group["candidate_round_history"]) == 2
-        assert result.cost == 8.5
+        assert result.cost == 2.5
+    finally:
+        app.close()
+
+
+def test_structural_count_failure_never_rebinds_bad_revision_base(
+        tmp_path, monkeypatch):
+    app = App(tmp_path / "ws")
+    try:
+        first = _candidate_result(
+            tmp_path, expected=1, available=1, passed=False, revision=1)
+        second = _candidate_result(
+            tmp_path, expected=1, available=1, passed=False, revision=2)
+        passed = _candidate_result(
+            tmp_path, expected=1, available=1, passed=True, revision=3)
+        for result in (first, second):
+            candidate = result.data["candidate_group"]["candidates"][0]
+            candidate["issues"] = ["画面多出一名人物"]
+            candidate["qc_report"] = {
+                "passed": False,
+                "count_checked": True,
+                "count_match": False,
+                "identity_checked": True,
+                "identity_match": True,
+                "scene_topology_match": True,
+                "camera_deviation": "none",
+                "issues": ["画面多出一名人物"],
+            }
+        queue = [first, second, passed]
+        calls = []
+
+        def generate(_capability, payload, _out_dir, _cancel, _qc_spec):
+            calls.append(copy.deepcopy(payload))
+            return queue.pop(0)
+
+        def escalate(report, *_args, **_kwargs):
+            report = dict(report)
+            report["codex_escalation"] = {
+                "instruction_to_aifos": "画面严格只保留甲、乙两人"}
+            return report, 0.0
+
+        monkeypatch.setattr(app.director, "_generate_image_gacha", generate)
+        monkeypatch.setattr(
+            app.director, "_escalate_failed_image_to_codex", escalate)
+
+        result = app.director._generate_shot_candidate_group(
+            "image", {
+                "_episode_id": "episode-test", "shot_no": 1,
+                "_candidate_revision": 1, "_contract_revision": 1,
+                "prompt": "甲乙两人对话",
+            }, tmp_path, None, {})
+
+        assert result.qc["passed"] is True
+        assert len(calls) == 3
+        for payload in calls[1:]:
+            assert payload["revision_mode"] == "regenerate_clean"
+            assert payload.get("source_qc_uri") in (None, "")
+            assert not any(
+                row.get("reference_role") == "revision_base"
+                for row in payload.get("asset_matches") or [])
     finally:
         app.close()
 
@@ -663,8 +723,8 @@ def test_candidate_repair_stops_immediately_when_round_seven_has_pass(
     try:
         queue = [
             _candidate_result(
-                tmp_path, expected=4, available=4,
-                passed=round_no == 7, revision=round_no, cost=4.0)
+                tmp_path, expected=1, available=1,
+                passed=round_no == 7, revision=round_no, cost=1.0)
             for round_no in range(1, 8)
         ]
         calls = []
@@ -713,7 +773,7 @@ def test_candidate_repair_stops_immediately_when_round_seven_has_pass(
         group = result.data["candidate_group"]
         assert group["generation_round"] == 7
         assert group["round_status"] == "qualified"
-        assert group["total_generated_candidates"] == 28
+        assert group["total_generated_candidates"] == 7
         assert len(group["candidate_round_history"]) == 7
         assert queue == []
     finally:
@@ -726,8 +786,8 @@ def test_candidate_repair_caps_at_ten_rounds_and_promotes_best_without_gate(
     try:
         queue = [
             _candidate_result(
-                tmp_path, expected=4, available=4, passed=False,
-                revision=round_no, cost=4.0)
+                tmp_path, expected=1, available=1, passed=False,
+                revision=round_no, cost=1.0, shot_no=10)
             for round_no in range(1, 11)
         ]
         calls = []
@@ -759,14 +819,14 @@ def test_candidate_repair_caps_at_ten_rounds_and_promotes_best_without_gate(
         assert queue == []
         assert [row["_candidate_generation_round"] for row in calls] == \
             list(range(1, 11))
-        assert all(row["_gacha_pulls_override"] == 4 for row in calls)
+        assert all(row["_gacha_pulls_override"] == 1 for row in calls)
         assert result.uri
         assert result.qc["best_effort_promoted"] is True
         group = result.data["candidate_group"]
         assert group["round_status"] == "exhausted"
         assert group["repair_exhausted"] is True
         assert group["max_candidate_rounds"] == 10
-        assert group["total_generated_candidates"] == 40
+        assert group["total_generated_candidates"] == 10
         assert len(group["candidate_round_history"]) == 10
     finally:
         app.close()
@@ -800,8 +860,8 @@ def test_candidate_repair_resume_keeps_round_cap_history_and_prior_best(
                 best_result, 250.0)
         queue = [
             _candidate_result(
-                tmp_path, expected=4, available=4, passed=False,
-                revision=round_no, cost=4.0)
+                tmp_path, expected=1, available=1, passed=False,
+                revision=round_no, cost=1.0)
             for round_no in range(7, 11)
         ]
         calls = []
@@ -844,21 +904,23 @@ def test_candidate_repair_resume_keeps_round_cap_history_and_prior_best(
         assert result.uri.endswith("r2-candidate-1.svg")
         group = result.data["candidate_group"]
         assert group["round_status"] == "exhausted"
-        assert group["total_generated_candidates"] == 40
+        # Six legacy four-image rounds remain factual history; after upgrade
+        # rounds 7-10 each add exactly one new image: 24 + 4 = 28.
+        assert group["total_generated_candidates"] == 28
         assert len(group["candidate_round_history"]) == 10
         assert queue == []
     finally:
         app.close()
 
 
-def test_four_draw_repair_replaces_conflicting_old_static_contract(
+def test_single_draw_repair_replaces_conflicting_old_static_contract(
         tmp_path, monkeypatch):
     """Regression: episode 29 shot 02 must not append to its five-person text."""
     app = App(tmp_path / "ws")
     try:
         initial = _candidate_result(
-            tmp_path, expected=4, available=4, passed=False,
-            revision=1, cost=4.0)
+            tmp_path, expected=1, available=1, passed=False,
+            revision=1, cost=1.0, shot_no=2)
         for row in initial.data["candidate_group"]["candidates"]:
             row["issues"] = [
                 "同一小吴的驾驶、加速、解安全带、递交四个时间状态被错误拆成四具真人",
@@ -866,8 +928,8 @@ def test_four_draw_repair_replaces_conflicting_old_static_contract(
                 "画面总人数同时规定严格5人和最新严格2人",
             ]
         repaired = _candidate_result(
-            tmp_path, expected=4, available=4, passed=True,
-            revision=2, cost=4.0)
+            tmp_path, expected=1, available=1, passed=True,
+            revision=2, cost=1.0, shot_no=2)
         queue = [initial, repaired]
         calls = []
 
@@ -972,7 +1034,7 @@ def test_four_draw_repair_replaces_conflicting_old_static_contract(
             "visible_figure_count"] == 2
         assert repair_qc["count"] == 2
         assert repair_qc["readable_text"] == {}
-        assert result.data["candidate_group"]["expected_count"] == 4
+        assert result.data["candidate_group"]["expected_count"] == 1
         assert result.data["candidate_group"]["selection"]["source"] == "ai"
         assert result.data["candidate_group"]["selection"][
             "best_effort_risk"] is False

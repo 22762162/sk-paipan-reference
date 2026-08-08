@@ -3525,9 +3525,9 @@ const PLAN_STATUS_CN = {
   pending: "排队中", generating: "生成中", done: "已完成",
   failed: "失败", reused: "复用已有", selected: "已选定",
   awaiting_human: "历史失败 · 系统自动接管",
-  awaiting_selection: "4张已齐 · AI选优中",
-  regenerating_candidates: "正在并行换4张",
-  technical_incomplete: "候选技术未补齐",
+  awaiting_selection: "单图已生成 · AI质检中",
+  regenerating_candidates: "正在编辑返修1张",
+  technical_incomplete: "返修图技术未补齐",
 };
 const PLAN_QC_CATS = new Set(["shot_image", "frames"]);
 const STORYBOARD_KEYFRAME_TRANSIENT_STATUSES = new Set([
@@ -3540,7 +3540,7 @@ function planVisibleQc(item) {
   return planQcEnabled(item) ? item.qc : null;
 }
 
-/* 内容阈值未全过但已有技术可用图时，AI 导演会在最多十轮四图候选中
+/* 内容阈值未全过但已有技术可用图时，AI 导演会在最多十轮单图返修中
    晋升相对最优稿。这个结果是可继续生产的非阻断风险，不得再被旧版
    image_failures / awaiting_human 文案覆盖成“失败待人工”。 */
 function shotBestEffortPromoted(item) {
@@ -3896,7 +3896,7 @@ function shotCandidateGroup(item) {
       && (Array.isArray(finalGroup.candidates)
         && finalGroup.candidates.length > 0)) return finalGroup;
   const progress = item.candidate_progress;
-  // 一张候选完成质检就立即展示，不再等本轮四张或十轮返工全部结束。
+  // 本轮单图完成就立即展示；旧项目的四张历史组仍照常展示。
   return progress && typeof progress === "object"
     && Array.isArray(progress.candidates) && progress.candidates.length > 0
     ? {...progress, live_progress: true} : null;
@@ -3944,9 +3944,14 @@ function shotCandidateState(item) {
   const group = shotCandidateGroup(item);
   if (!group) return null;
   const candidates = shotCandidates(item);
-  // 首轮和每个返修轮都固定4张。旧计划里的 expected_count=3 只作为
-  // 历史审计数据，不能再改变当前界面的候选槽位与策略说明。
-  const expected = 4;
+  // 新轮次由服务端回显 expected_count=1。为了兼容旧项目，
+  // 历史组已经存在的 2–4 张候选仍完整展示，不被新策略裁掉。
+  const explicitExpected = Number(
+    group.expected_count ?? item.candidate_expected_count ?? 0);
+  const historicalSpan = candidates.reduce((largest, candidate) =>
+    Math.max(largest, shotCandidateIndex(candidate)), 0);
+  const expected = Math.min(4, Math.max(1, candidates.length, historicalSpan,
+    Number.isFinite(explicitExpected) ? explicitExpected : 0));
   const missing = Math.max(0, expected - candidates.length);
   const liveProgress = group.live_progress === true;
   const technicalIncomplete = !liveProgress && (
@@ -3964,14 +3969,14 @@ function shotCandidateState(item) {
     ? Number(rawProgress.completed ?? rawProgress.generated ?? rawProgress.count)
     : (typeof rawProgress === "number" ? rawProgress
       : (Number.isFinite(stringProgress) ? stringProgress : candidates.length));
-  const currentRoundProgress = Math.min(4, Math.max(0,
+  const currentRoundProgress = Math.min(expected, Math.max(0,
     Number.isFinite(progressCount) ? progressCount : candidates.length));
   const hasRoundProgress = group.generation_round != null
     || group.max_candidate_rounds != null
     || group.current_round_progress != null;
   const roundLabel = hasRoundProgress
-    ? `第${generationRound}/${maxCandidateRounds}轮 · ${currentRoundProgress}/4张`
-    : `本镜第${generationRound}轮 · ${currentRoundProgress}/4张`;
+    ? `第${generationRound}/${maxCandidateRounds}轮 · ${currentRoundProgress}/${expected}张`
+    : `本镜第${generationRound}轮 · ${currentRoundProgress}/${expected}张`;
   return { group, candidates, expected, missing, technicalIncomplete,
     liveProgress,
     generationRound, maxCandidateRounds, currentRoundProgress, roundLabel };
@@ -4066,20 +4071,25 @@ function shotCandidateGridHtml(item, editable) {
     }));
   const headText = selected
     ? (selectionPending
-      ? `已人工选中候选 ${shotCandidateIndex(selected)}；当前4图波次结束后锁定，未选候选已隐藏`
+      ? `已人工选中候选 ${shotCandidateIndex(selected)}；当前轮次结束后锁定，其他历史候选已隐藏`
       : `候选 ${shotCandidateIndex(selected)} 已作为正式关键帧；未选候选已隐藏`)
     : (liveProgress
-      ? `已完成的候选立即显示（质检未通过也保留）；可随时人工选中，当前 ${candidates.length}/${expected} 张`
+      ? (expected === 1
+        ? `本轮单图已显示；质检未过将自动编辑返修，当前 ${candidates.length}/${expected} 张`
+        : `已完成的历史候选立即显示（质检未通过也保留）；可随时人工选中，当前 ${candidates.length}/${expected} 张`)
       : (technicalIncomplete ? `技术未补齐，当前 ${candidates.length}/${expected} 张`
-        : `${expected}张使用同一轮冻结提示词与最适参考图；AI正在自动选优复检`));
+        : (expected === 1
+          ? "本轮单图使用冻结提示词与最适参考图；AI正在质检"
+          : `${expected}张历史候选使用同一轮冻结提示词与最适参考图；AI正在选优复检`)));
   return `<section class="shot-candidate-panel" aria-label="${batchLabel}">
     <div class="shot-candidate-head"><div><b>${batchLabel}</b>
       <span>${bestEffort || headText}</span></div>
       <span class="plan-st st-${technicalIncomplete ? "technical_incomplete" : (selected ? "done" : "awaiting_selection")}">
         ${technicalIncomplete ? `缺 ${missing || Math.max(1, expected - candidates.length)} 张 · 系统自动补位`
           : (bestEffort || (selectionPending ? "人工已选 · 正在收尾"
-            : (selected ? (selectedByAi ? "AI已选优" : "正式图已选")
-              : (liveProgress ? "生产中可人工筛选" : "AI选优中"))))}</span></div>
+            : (selected ? (selectedByAi ? (expected === 1 ? "AI质检完成" : "AI已选优") : "正式图已选")
+              : (liveProgress ? (expected === 1 ? "单图质检中" : "生产中可人工筛选")
+                : (expected === 1 ? "AI质检中" : "AI选优中")))))}</span></div>
     ${errors.length ? `<div class="shot-candidate-technical-error">${esc(errors.join("；"))}</div>` : ""}
     <div class="shot-candidate-grid${selected ? " selected-only" : ""}">${slots.map(({ index, candidate }) => {
       if (!candidate) return `<article class="shot-candidate missing"
@@ -4091,7 +4101,7 @@ function shotCandidateGridHtml(item, editable) {
       const isSelected = shotCandidateSelected(group, candidate);
       const url = shotCandidateUrl(candidate);
       const qcLabel = candidate.passed === true ? "质检通过"
-        : (candidate.passed === false ? "质检未通过 · 可人工选" : "质检待判");
+        : (candidate.passed === false ? "质检未通过 · 系统将编辑返修" : "质检待判");
       const qcClass = candidate.passed === true ? "pass"
         : (candidate.passed === false ? "fail" : "pending");
       const issues = (candidate.issues || []).map(qcIssueText).filter(Boolean);
@@ -4114,15 +4124,15 @@ function shotCandidateGridHtml(item, editable) {
                 : (candidate.passed === false ? "仍选这张" : "选中这张"))}</button>
         </div></article>`;
     }).join("")}</div>
-    ${editable && selectedByAi ? `<button type="button" class="shot-candidate-review"
+    ${editable && selectedByAi && expected > 1 ? `<button type="button" class="shot-candidate-review"
       data-plan-id="${esc(item.id)}" data-candidate-index="${shotCandidateIndex(selected)}">人工筛选（显示隐藏候选）</button>` : ""}
     ${editable && !liveProgress ? `<div class="shot-candidate-controls">
-      <button type="button" class="shot-candidate-edit-toggle">✎ 修改提示词，整组换4张</button>
+      <button type="button" class="shot-candidate-edit-toggle">✎ 修改提示词，编辑当前图并再生成1张</button>
       <div class="shot-candidate-regenerate-form" hidden>
         <textarea class="shot-candidate-prompt" rows="3">${esc(item.prompt_used || item.prompt || "")}</textarea>
         <button type="button" class="primary shot-candidate-regenerate"
-          data-plan-id="${esc(item.id)}">整组并行换4张</button>
-        <small>会作废当前选择并生成新的候选组；其他镜头继续生产，不会暂停整集。</small>
+          data-plan-id="${esc(item.id)}">编辑返修1张</button>
+        <small>以当前图为基底，只按修改后提示词返修1张；其他镜头继续生产，不会暂停整集。</small>
       </div></div>` : ""}
   </section>`;
 }
@@ -4783,7 +4793,8 @@ function productionGuidanceModel(data) {
     ? reportedReason || `已生成 ${keyframes.generated}/${keyframes.total}，`
       + `可用于下游 ${keyframes.usable}/${keyframes.total}，`
       + `${pendingCount} 张待生产，${issueCount} 张已标注问题并由系统自动接管。`
-      + "Codex会自动归因、优化提示词与参考图，每轮并行生成4张并由AI选优复检；"
+      + "Codex会自动归因、优化提示词与参考图，"
+      + "每轮单图质检，失败后编辑当前图返修1张；"
       + "首轮计入、最多10轮，其他镜头与下游生产不被阻断。"
     : reportedReason || (phase === "frames"
       ? `关键帧已齐，首尾帧为 ${frames.usable}/${frames.total}；补齐后才会进入视频。`
@@ -5229,12 +5240,12 @@ function imageFailurePanelHtml(data) {
     <div class="image-failure-heading">
       <div><b>🤖 系统自动接管问题图 · ${failures.length} 张关键帧</b>
         <span>Codex 会联合分析原图、提示词和参考图，自动归因并选用最合适参考图；
-          每轮并行生成4张、AI选优后复检，合格即收口，最多10轮；
+          每轮单图质检，失败后编辑当前图返修1张，合格即收口，最多10轮；
           Codex 已完成 ${codexReviewed} 张诊断。无需手机逐张处理。</span></div>
       <div class="image-failure-actions">
         <button type="button" class="image-failure-batch"
           data-image-failure-batch>查看系统处理与可选干预</button>
-        <small>失败稿不会进入正式资产或 Seedance 参考链；系统会自动选择新候选。</small>
+        <small>失败稿不会进入正式资产或 Seedance 参考链；系统会自动质检编辑返修图。</small>
       </div>
     </div>
     <div class="image-failure-list">${failures.map((failure) => {
@@ -5302,7 +5313,7 @@ function productionIssueCenterHtml(data) {
           ? `${imageAction.count} 张已由系统接管修正`
           : "没有待处理的画面问题"}</b>
         <p>${imageAction.count
-          ? `Codex会自动归因并优化提示词与参考图，每轮生成4张、AI选优复检，最多10轮；${imageAction.reviewCount || 0} 张支持可选人工查看。`
+          ? `Codex会自动归因并优化提示词与参考图，每轮单图质检；局部问题编辑当前图，结构问题按锁定参考重生1张，最多10轮；${imageAction.reviewCount || 0} 张支持可选人工查看。`
           : "当前关键帧均无已标注视觉问题。"}</p>
         ${imageAction.count ? `<button type="button" class="guidance-issue-action"
           data-guidance-issues data-first-shot="${imageAction.shotNos[0] || ""}">
@@ -6418,13 +6429,13 @@ function bindShotCandidateControls(container, data, episodeId, onDone) {
     toggle.onclick = (event) => {
       event.stopPropagation();
       form.hidden = !form.hidden;
-      toggle.textContent = form.hidden ? "✎ 修改提示词，整组换4张" : "收起整组修改";
+      toggle.textContent = form.hidden ? "✎ 修改提示词，编辑当前图并再生成1张" : "收起返修修改";
       if (!form.hidden) form.querySelector("textarea").focus();
     };
     const button = controls.querySelector(".shot-candidate-regenerate");
     button.onclick = (event) => {
       event.stopPropagation();
-      armConfirm(button, "整组换4张", async () => {
+      armConfirm(button, "编辑返修1张", async () => {
         const item = byId.get(String(button.dataset.planId || ""));
         if (!item) return;
         const panel = button.closest(".plan-overlay-content");
@@ -6435,7 +6446,7 @@ function bindShotCandidateControls(container, data, episodeId, onDone) {
         }
         if (panel) panel.dataset.shotCandidateMutation = "1";
         button.disabled = true;
-        button.textContent = "正在提交4路并行生成…";
+        button.textContent = "正在提交单图编辑返修…";
         try {
           const reply = await api("/api/shot-candidates/regenerate", {
             method: "POST", headers: { "Content-Type": "application/json" },
@@ -6444,14 +6455,14 @@ function bindShotCandidateControls(container, data, episodeId, onDone) {
               prompt, confirm_regenerate: true,
             }),
           });
-          showToast(`镜头 ${item.shot_no} 已开始整组换4张；其他镜头继续生产`, "ok");
+          showToast(`镜头 ${item.shot_no} 已开始编辑返修1张；其他镜头继续生产`, "ok");
           if (panel) delete panel.dataset.shotCandidateMutation;
           await refreshShotCandidatePlan(episodeId, onDone, true);
           if (reply.job_id) pollJob(reply.job_id, async (job) => {
             if (job.status === "done")
-              showToast(`镜头 ${item.shot_no} 的新4张候选已生成完毕`, "ok");
+              showToast(`镜头 ${item.shot_no} 的新返修图已生成并复检`, "ok");
             else if (job.status === "failed")
-              showToast(job.error || "整组候选生成失败", "error");
+              showToast(job.error || "单图编辑返修失败", "error");
             await refreshShotCandidatePlan(episodeId, onDone, true);
           });
           pollCanvas(episodeId);
@@ -6464,7 +6475,7 @@ function bindShotCandidateControls(container, data, episodeId, onDone) {
           }
           showToast(error.message, "error");
           button.disabled = false;
-          button.textContent = "整组并行换4张";
+          button.textContent = "编辑返修1张";
         }
       });
     };
@@ -7316,7 +7327,7 @@ async function showPlanOverlay(episodeId, focusId = "", focusCategory = "") {
       </div>
       <div class="dim" style="margin:4px 0 10px">每张图的分类、状态与提示词都在这里;
         质检保留但不阻断；问题由 Codex 自动归因并优化提示词和参考图，
-        每轮并行生成4张、AI选优复检，合格即收口，首轮计入且最多10轮；
+        每轮单图质检，失败后编辑当前图返修1张，合格即收口，首轮计入且最多10轮；
         「批量优化修改」和「人工通过」仅作为可选覆盖，原问题会保留在审计记录。
         镜头画面重画后会自动重做首尾帧并作废旧视频。</div>
       <div class="batch-job-progress" hidden></div>
@@ -11322,7 +11333,7 @@ async function renderCanvasView(episodeId, forceView = "") {
         <b>${lastFailed ? `上次制作在「${esc(STAGE_CN[lastFailed.stage] || lastFailed.stage)}」失败 ⚠️`
           : (ep.status === "qc_failed" ? "成片质检未通过 ⚠️" : "上次制作失败 ⚠️")}</b>
         <span>${firstImageFailure
-          ? `${currentImageFailures.length} 张历史问题关键帧已由系统接管：Codex自动归因并优化提示词与参考图，每轮并行生成4张、AI选优复检，最多10轮；无需手机逐张处理，其他关键帧继续生产。`
+          ? `${currentImageFailures.length} 张历史问题关键帧已由系统接管：Codex自动归因并优化提示词与参考图，每轮单图质检；局部问题编辑当前图，结构问题按锁定参考重生1张，最多10轮；无需手机逐张处理，其他关键帧继续生产。`
           : `${lastFailed ? esc((lastFailed.error || "").slice(0, 200)) + ";" : ""}
         已完成的剧本/人物/图片/视频全部保留,点右侧按钮从断点接着做,只补缺失部分,不重复消耗额度。`}</span>
       </div>
@@ -11784,12 +11795,12 @@ function imageLineControlsHtml() {
   </div>`;
 }
 
-/* ---- 创作选片模式：保留内容质检，以非阻断四抽循环自动返修 ---- */
+/* ---- 创作选片模式：保留内容质检，以非阻断单图编辑循环自动返修 ---- */
 function selectionModeControlsHtml() {
   return `<div class="style-row selection-mode-row">
-    <label>自动质检选优</label>
+    <label>自动质检返修</label>
     <label class="il-label sm-toggle">
-      <input type="checkbox" id="sm-master" disabled> 自动选优返修
+      <input type="checkbox" id="sm-master" disabled> 非阻断自动返修
     </label>
     <label class="il-label sm-toggle">
       <input type="checkbox" id="sm-image-qc" disabled> 图片内容质检
@@ -11821,12 +11832,12 @@ async function bindSelectionModeControls() {
     const effectiveVideoQc = st.effective_video_content_qc
       ?? st.video_content_qc;
     hint.textContent = st.selection_mode
-      ? `自动质检选优已开启：图片质检${effectiveImageQc ? "开启" : "关闭"}、`
+      ? `自动质检返修已开启：图片质检${effectiveImageQc ? "开启" : "关闭"}、`
         + `视频质检${effectiveVideoQc ? "开启" : "关闭"}，但均不阻断。`
-        + `每轮固定 ${st.shot_repair_candidate_count || st.shot_candidate_count || 4} 张，`
-        + `AI选优复检；首轮计入、最多 ${st.max_candidate_rounds || 10} 轮。`
+        + `每轮固定 ${st.shot_repair_candidate_count || st.shot_candidate_count || 1} 张，`
+        + `单图质检失败后，局部问题编辑当前图、结构问题按锁定参考重生1张；首轮计入、最多 ${st.max_candidate_rounds || 10} 轮。`
         + "Codex自动归因、优化提示词并选用最合适参考图；到上限则留风险继续，无需手机逐张确认。"
-      : `选片模式关闭(每镜候选固定 ${st.shot_candidate_count} 张;`
+      : `自动返修模式关闭(每镜固定 ${st.shot_candidate_count} 张;`
         + "内容质检按左侧两个独立开关执行，可能恢复旧式门禁)";
   };
   const save = async (body, revert) => {
@@ -11838,7 +11849,7 @@ async function bindSelectionModeControls() {
       });
       render();
       showToast(st.selection_mode
-        ? "自动质检选优已开启：质检非阻断，四抽循环自动返修"
+        ? "自动质检已开启：质检非阻断，单图编辑循环自动返修"
         : "设置已保存", "ok");
     } catch (e) {
       revert();
@@ -12745,7 +12756,7 @@ function storyboardShotIssues(data) {
     (byShot[failure.shot_no] = byShot[failure.shot_no] || []).push({
       severity: "error",
       check: "关键帧二次质检",
-      message: messages.join("；") || "Codex将自动归因并优化提示词与参考图；每轮生成4张、AI选优复检，最多10轮",
+      message: messages.join("；") || "Codex将自动归因并优化提示词与参考图；每轮单图质检，局部问题编辑当前图，结构问题按锁定参考重生1张，最多10轮",
       shot_no: failure.shot_no,
       plan_id: failure.item_id,
       revision_feedback: failure.revision_feedback || "",
@@ -13736,7 +13747,7 @@ class StoryboardCanvas {
       ${keyframeUrl ? `<img class="preview" src="${esc(keyframeUrl)}" alt="${
         failedKeyframe ? "质检问题·自动返修中" : "关键图"}">` : ""}
       ${failedKeyframe ? `<div class="issue error">[关键帧质检问题 · 自动返修中]
-        ${esc((failedKeyframe.issues || []).join("；") || "Codex自动归因优化；本轮并行生成4张并选优复检")}</div>` : ""}
+        ${esc((failedKeyframe.issues || []).join("；") || "Codex自动归因优化；本轮编辑当前图返修1张并复检")}</div>` : ""}
       ${shotInlineRevisionHtml(shotNo, !!keyframeUrl, false, this.data)}
       <h4>首尾帧</h4>
       <div class="thumbs editable-frame-thumbs">

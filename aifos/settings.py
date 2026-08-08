@@ -215,7 +215,7 @@ def settings_payload(app):
                 "defaults", "parallel_images", default=3),
             "parallel_videos": app.config.get(
                 "defaults", "parallel_videos", default=4),
-            # 内容质检保留但不阻断；每轮四张、总轮数（含首轮）必须回显。
+            # 内容质检保留但不阻断；镜头每轮一张、总轮数（含首轮）回显。
             "selection_mode": _coerce_bool(
                 "selection_mode", app.config.get(
                     "defaults", "selection_mode", default=True)),
@@ -226,8 +226,8 @@ def settings_payload(app):
                 "video_content_qc", app.config.get(
                     "defaults", "video_content_qc", default=True)),
             "shot_candidate_count": int(app.config.get(
-                "defaults", "shot_candidate_count", default=4)),
-            "shot_repair_candidate_count": 4,
+                "defaults", "shot_candidate_count", default=1)),
+            "shot_repair_candidate_count": 1,
             "shot_max_candidate_rounds": candidate_rounds,
             # 兼容值由正式总轮数推导，绝不与它相加。
             "shot_auto_repair_batches": candidate_rounds - 1,
@@ -464,7 +464,7 @@ def _coerce_bool(key, value):
 
 
 def set_defaults(config_path, mapping):
-    """写入 defaults（并行度、非阻断质检、四抽与总轮数预算）。"""
+    """写入 defaults（并行度、非阻断质检、单图返修与总轮数预算）。"""
     int_keys = {"parallel_images", "parallel_videos"}
     bool_keys = {"selection_mode", "image_content_qc", "video_content_qc"}
     updates = {}
@@ -481,21 +481,21 @@ def set_defaults(config_path, mapping):
                 count = int(value)
             except (TypeError, ValueError):
                 raise AifosError("shot_candidate_count 需为整数")
-            if count != 4:
+            if isinstance(value, bool) or count != 1:
                 raise AifosError(
-                    "shot_candidate_count 当前版本固定为 4(每镜四张候选,"
-                    "不分档);其他取值暂不支持")
-            updates[key] = 4
+                    "shot_candidate_count 当前版本固定为 1"
+                    "(镜头关键帧首轮只生成1张)")
+            updates[key] = 1
         elif key == "shot_repair_candidate_count":
             try:
                 count = int(value)
             except (TypeError, ValueError):
                 raise AifosError("shot_repair_candidate_count 需为整数")
-            if isinstance(value, bool) or count != 4:
+            if isinstance(value, bool) or count != 1:
                 raise AifosError(
-                    "shot_repair_candidate_count 当前版本固定为 4"
-                    "(问题镜头每个返修轮生成4张)")
-            updates[key] = 4
+                    "shot_repair_candidate_count 当前版本固定为 1"
+                    "(问题镜头每个返修轮编辑后生成1张)")
+            updates[key] = 1
         elif key == "shot_max_candidate_rounds":
             try:
                 rounds = int(value)
@@ -504,7 +504,7 @@ def set_defaults(config_path, mapping):
             if isinstance(value, bool) or not 1 <= rounds <= 10:
                 raise AifosError(
                     "shot_max_candidate_rounds 需为 1-10"
-                    "（首轮计入，总计最多40张）")
+                    "（首轮计入，总计最多10张）")
             updates[key] = rounds
         elif key == "shot_auto_repair_batches":
             try:

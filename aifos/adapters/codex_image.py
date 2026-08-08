@@ -250,6 +250,55 @@ def _keyframe_uri(payload, phase=None):
                  if str(payload.get(key) or "").strip()), "")
 
 
+def _revision_base_uri(payload):
+    """Resolve the one failed keyframe that an image repair must edit."""
+    if (payload.get("_qc_fresh_redraw")
+            or str(payload.get("revision_mode") or "").lower()
+            in {"fresh_redraw", "regenerate_clean"}):
+        return ""
+    candidates = []
+    candidates.extend(payload.get("reference_manifest") or [])
+    candidates.extend(payload.get("asset_matches") or [])
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        role = str(
+            item.get("role") or item.get("reference_role") or ""
+        ).strip().lower()
+        label = str(item.get("label") or "")
+        if role == "revision_base" or "待修改基底" in label:
+            uri = str(item.get("uri") or "").strip()
+            if uri:
+                return uri
+    explicit = payload.get("candidate_revision_base")
+    if isinstance(explicit, dict):
+        uri = str(explicit.get("uri") or "").strip()
+        if uri:
+            return uri
+    if str(payload.get("revision_mode") or "").lower() in {
+            "targeted_qc_fix", "candidate_best_targeted_repair"}:
+        return str(payload.get("source_qc_uri") or "").strip()
+    return ""
+
+
+def _revision_edit_contract(payload):
+    """Return the strict single-image edit contract for a failed keyframe."""
+    base = _revision_base_uri(payload)
+    if not base:
+        return ""
+    return (
+        "【关键帧返修方式—图像编辑】这不是从零生成、重新设计或多候选抽卡。"
+        f"必须先真实打开当前失败图 {base}，把它作为唯一 revision_base 和整张"
+        "像素基底做 image edit；本轮只编辑并输出1张修订图。只修改本轮QC/"
+        "Codex修订指令明确指出的对象、区域和关系，禁止扩大修改范围。"
+        "未被指出的像素与正确内容必须保持不变：人物身份、脸和发型、人数、"
+        "服装、固定场景几何与家具位置、镜位、景别、构图、光线、色调及未提及"
+        "道具全部锁定；不得借修一个局部问题换脸、换房、换机位、挪家具或重做"
+        "整张图。若导演已因整图身份、人数、场景基底或全局构图错误明确移除"
+        "revision_base，本合同才不会出现，届时才允许干净重生1张。"
+    )
+
+
 def _ref_line(payload, prompt_text=""):
     # 导演中心前置生成的参考图对照表:编号绑定"谁参考哪张图",
     # CLI 侧原样照读,禁止自行重排或忽略
@@ -263,7 +312,9 @@ def _ref_line(payload, prompt_text=""):
     if manifest:
         numbered = ";".join(
             f"图{item.get('index')}={item.get('label', '参考图')}"
-            f" {item.get('uri', '')}({item.get('binding', '')}"
+            f" {item.get('uri', '')}(role="
+            f"{item.get('role') or item.get('reference_role') or 'reference'}；"
+            f"{item.get('binding', '')}"
             + (f"；inherits={','.join(item.get('inherits') or [])}"
                if item.get("inherits") else "")
             + (f"；excludes={','.join(item.get('excludes') or [])}"
@@ -527,6 +578,10 @@ def build_instruction(capability, payload, out_dir):
             return instruction, [target], {"name": payload.get("art_name")}
         shot_no = int(payload["shot_no"])
         target = out_dir / f"shot_{shot_no:03d}.keyframe.png"
+        revision_edit = _revision_edit_contract(payload)
+        one_image_rule = (
+            "【单图轮次】本轮只能生成1张独立关键帧，禁止输出多张候选、"
+            "拼图、四宫格、九宫格或附加版本。")
         # 返工静态合同是一次“替换”而不是给旧合同追加修订。它已经把
         # 当前相位、人数、文字、镜位和动作写成唯一可执行事实；这里若再
         # 从 payload 的历史 readable_text/camera/functional_figures 拼接
@@ -534,6 +589,7 @@ def build_instruction(capability, payload, out_dir):
         # 参考图职责与调用 imagegen 的传输指令仍保留。
         if repair_static:
             instruction = (
+                f"{revision_edit}{one_image_rule}"
                 f"为漫剧分镜生成一张关键图并保存到 {target}"
                 f"(PNG,{size})。画面内容:{prompt_text}。"
                 f"{_ref_line(payload, prompt_text)}{GEN_DIRECTIVE}"
@@ -566,6 +622,7 @@ def build_instruction(capability, payload, out_dir):
             text_rule += _screen_prop_rule(prompt_text, text_asset)
             camera_rule = f"镜头语言:{payload.get('camera', '')}。"
         instruction = (
+            f"{revision_edit}{one_image_rule}"
             f"为漫剧分镜生成一张关键图并保存到 {target}"
             f"(PNG,{size})。画面内容:{prompt_text}。"
             f"{population_rule}{text_rule}{camera_rule}"
@@ -895,8 +952,9 @@ def build_instruction(capability, payload, out_dir):
                 stage_line = (
                     "本次是正常质检,不预设结论。仅当你判定不通过时,"
                     "才需要附 codex_escalation:AIFOS 会立即按你给出的"
-                    "下一轮会用同一份新提示词并行生成4张候选、逐张质检后自动选优；"
-                    "总生成上限为10轮（首轮计入），所以 aifos_instructions 必须是"
+                    "下一轮以当前失败图为唯一 revision_base 做一次 image edit，"
+                    "只生成1张再复检；总生成上限为10轮（首轮计入），所以 "
+                    "aifos_instructions 必须是"
                     "可以直接拼进下一次生成提示词的完整、唯一、无歧义"
                     "表述,不要写「建议」「可考虑」这类不可执行的话。"
                     "只要重画能救回来就用 targeted_redraw;判定通过则"
@@ -904,14 +962,15 @@ def build_instruction(capability, payload, out_dir):
             elif failures < 2:
                 stage_line = (
                     "本镜此前已失败 1 次:AIFOS 会按你给出的新提示词"
-                    "每轮生成4张候选、全部质检后自动选最优，最多10轮，所以 "
+                    "以当前失败图为唯一 revision_base 做 image edit，下一轮只生成"
+                    "1张再复检，最多10轮，所以 "
                     "aifos_instructions 必须是可直接拼进下一次生成提示词的"
                     "完整、唯一、无歧义表述，不要写"
                     "「建议」「可考虑」这类不可执行的话。只要重画能救回来就用"
                     "targeted_redraw。\n")
             else:
                 stage_line = (
-                    "本镜的修订候选组仍未通过：请输出下一轮唯一可执行的"
+                    "本镜上一轮单张修订图仍未通过：请输出下一轮唯一可执行的"
                     "合同修复或定向重画指令；AIFOS 会自动应用，不会停在"
                     "人工确认点。\n")
             escalation_line = (
@@ -925,6 +984,13 @@ def build_instruction(capability, payload, out_dir):
                 "执行抱拳、拱手等占用动作时，也不能同时要求同一只手清楚展示"
                 "被遮挡道具。若合同要求在一张图里同时表现接取、检查、归还等"
                 "先后动作，应选择单一冻结瞬间或建议拆镜，不能继续盲目重画。"
+                "默认修复策略必须是 edit_revision_base：保留未被指出的像素、"
+                "人物身份、场景几何、固定陈设、镜位构图和光色，只编辑QC明确"
+                "指出的局部。只有整图错人/错物种、错人数、整个场景或时代错误、"
+                "场景拓扑整体错误、全局构图完全不可用，或失败图损坏时，才允许"
+                "在 reference_adjustments 中 drop_revision_base 并干净重生1张；"
+                "局部手部、道具方向、接触支撑、屏幕文字、配饰和光影问题不得"
+                "丢弃基底。"
                 "请用 codex_escalation.aifos_action 明确通知 AIFOS 下一步。\n")
             escalation_schema = (
                 ', "codex_escalation": {"aifos_action":'
@@ -962,6 +1028,14 @@ def build_instruction(capability, payload, out_dir):
             "缺少执行所需事实，input_contract_pass 必须为 false，pass 也必须"
             "为 false，并在 targeted_prompt_patch 中给出可直接用于第二次生成"
             "的唯一明确表述。\n"
+            "若判定失败，默认 repair_strategy=edit_revision_base：AIFOS 会把"
+            "当前失败图作为唯一 revision_base 做 image edit，只修QC指出的"
+            "局部并只生成1张再复检。targeted_prompt_patch 必须写局部编辑差量，"
+            "preserve 必须锁定未指出的像素、人物身份、场景几何、固定陈设、"
+            "镜位构图、光色和未提及道具。只有整图身份/物种、人数、整个场景/"
+            "时代、场景拓扑、全局构图错误或文件损坏，才可 drop_revision_base；"
+            "局部手部、道具方向、接触支撑、屏幕文字、配饰和光影问题不得丢弃"
+            "基底。每镜最多10轮（首轮计入），每轮只生成1张。\n"
             "同一请求的空间事实若冲突，按以下优先级裁决：带有“唯一屏幕"
             "方向锁定”“最新镜头局部合同”“Codex最终修复合同”或【空间裁决】"
             "的当前镜头左右表述，优先于更早生成的3D空间调度图、旧轴线字段"
@@ -1077,6 +1151,8 @@ def build_instruction(capability, payload, out_dir):
             '"image_error": {"summary":"画面错误摘要",'
             '"categories":["identity/count/camera等"],'
             '"evidence":["画面中可见证据"]}, '
+            '"repair_strategy":"edit_revision_base/replace_revision_base/'
+            'regenerate_clean", '
             '"prompt_diagnosis": {"status":'
             '"correct/needs_patch/conflicting/insufficient",'
             '"issues":["提示词问题"],'
@@ -1086,8 +1162,8 @@ def build_instruction(capability, payload, out_dir):
             '"issues":["参考图问题"],"missing_roles":'
             '[{"role":"用途","character":"角色名或空","reason":"原因"}]}, '
             '"targeted_prompt_patch": {"instructions":'
-            '["只针对当前镜头的短修正指令"],'
-            '"preserve":["必须保持不变的内容"],'
+            '["以当前失败图为revision_base做image edit，只写QC指出的局部修改"],'
+            '"preserve":["未指出的像素、身份、场景几何、构图、光色和道具"],'
             '"max_scope":"current_shot_only"}, '
             '"reference_adjustments": [{"action":'
             '"keep/remove/rebind/replace/add/drop_revision_base",'

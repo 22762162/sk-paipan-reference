@@ -29,14 +29,14 @@ def test_shot_candidate_statuses_and_ai_auto_selection_rendering_are_present():
     assert "function shotCandidateGridHtml(item, editable)" in JS
     assert 'class="shot-candidate-grid${selected ? " selected-only" : ""}"' in JS
     assert "const batchLabel = state.roundLabel" in JS
-    assert "const expected = 4;" in JS
+    assert "const expected = Math.min(4, Math.max(1" in JS
     assert "group.generation_round" in JS
     assert "group.max_candidate_rounds" in JS
     assert "group.current_round_progress" in JS
-    assert "第${generationRound}/${maxCandidateRounds}轮 · ${currentRoundProgress}/4张" in JS
+    assert "第${generationRound}/${maxCandidateRounds}轮 · ${currentRoundProgress}/${expected}张" in JS
     assert "✓ 正式关键帧" in JS
     assert "AI已选优" in JS
-    assert "已完成的候选立即显示（质检未通过也保留）" in JS
+    assert "已完成的历史候选立即显示（质检未通过也保留）" in JS
     assert "人工筛选（显示隐藏候选）" in JS
     assert "未选候选已隐藏" in JS
     assert "历史失败 · 系统自动接管" in JS
@@ -49,7 +49,7 @@ def test_shot_candidate_statuses_and_ai_auto_selection_rendering_are_present():
     assert "Array.isArray(finalGroup.candidates)" in JS
     assert "item.candidate_progress" in JS
     assert "live_progress: true" in JS
-    assert 'candidate.passed === false ? "质检未通过 · 可人工选"' in JS
+    assert 'candidate.passed === false ? "质检未通过 · 系统将编辑返修"' in JS
     assert "Number(group.expected_count) === 3 ? 3 : 4" not in JS
     assert 'item.status === "technical_incomplete");' in JS
 
@@ -63,7 +63,7 @@ def test_failed_stage_guidance_is_visible_and_has_checkpoint_recovery_action():
     assert "保留已完成资产，只重跑失败阶段及其下游" in JS
 
 
-def test_candidate_round_progress_is_four_per_round_and_legacy_three_is_ignored():
+def test_candidate_round_progress_preserves_legacy_three_image_history():
     helper = JS[
         JS.index("function shotCandidateGroup"):
         JS.index("function planItemThumbs")
@@ -91,12 +91,12 @@ def test_candidate_round_progress_is_four_per_round_and_legacy_three_is_ignored(
       }));
     ''')
     assert result == {
-        "expected": 4,
-        "missing": 2,
+        "expected": 3,
+        "missing": 1,
         "generationRound": 4,
         "maxCandidateRounds": 10,
         "progress": 2,
-        "label": "第4/10轮 · 2/4张",
+        "label": "第4/10轮 · 2/3张",
     }
 
 
@@ -416,7 +416,7 @@ def test_current_candidate_group_precedes_single_shot_artifact():
     )
     assert candidates < artifact
     assert "${canEdit && !candidateMode ?" in JS
-    assert "✎ 修改提示词，整组换4张" in JS
+    assert "✎ 修改提示词，编辑当前图并再生成1张" in JS
 
 
 def test_selection_posts_complete_optimistic_lock_identity_and_refreshes_409():
@@ -435,8 +435,8 @@ def test_selection_posts_complete_optimistic_lock_identity_and_refreshes_409():
     assert "refreshShotCandidatePlan(episodeId, onDone, true)" in JS
 
 
-def test_regeneration_is_confirmed_whole_group_and_never_pauses_episode():
-    assert 'armConfirm(button, "整组换4张"' in JS
+def test_regeneration_is_confirmed_single_edit_and_never_pauses_episode():
+    assert 'armConfirm(button, "编辑返修1张"' in JS
     assert 'api("/api/shot-candidates/regenerate"' in JS
     assert "confirm_regenerate: true" in JS
     assert "其他镜头继续生产，不会暂停整集" in JS

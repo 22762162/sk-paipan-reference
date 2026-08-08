@@ -488,6 +488,8 @@ def test_paused_plan_reconcile_resumes_newest_round_not_old_group(
     assert resumed is True
     assert restored["prompt"] == prompt
     assert restored["_candidate_generation_round"] == 7
+    assert restored["_legacy_multi_candidate_checkpoint"][
+        "expected_count"] == 4
 
 
 def test_regenerate_requires_confirmation_and_rejects_old_cas(app, tmp_path):
@@ -553,6 +555,11 @@ def test_regenerate_archives_group_keeps_files_and_invalidates_formal_chain(
     assert item["candidate_group"]["candidate_count"] == 0
     assert item["candidate_group"]["candidate_revision"] == 8
     assert item["candidate_group"]["contract_revision"] == 4
+    assert item["candidate_group"]["revision_base_uri"] == \
+        selected["selected_uri"]
+    assert item["candidate_group"][
+        "revision_base_source_candidate_set_id"] == \
+        old_group["candidate_set_id"]
     assert item["custom_prompt"] is True
     assert item["prompt"].startswith("镜头1新完整提示词")
     assert "selection" not in item
@@ -595,7 +602,7 @@ def test_new_group_after_regeneration_promotes_new_asset_version(app, tmp_path):
         candidate_revision=regenerated["candidate_revision"],
         prompt="重生后完整提示词", reference_manifest=[])
     candidates = []
-    for index in range(1, 5):
+    for index in range(1, 2):
         uri = tmp_path / f"new-candidate-{index}.png"
         uri.write_bytes(f"new-{index}".encode())
         candidates.append({
@@ -622,7 +629,8 @@ def test_new_group_after_regeneration_promotes_new_asset_version(app, tmp_path):
             "token": version.token,
         },
         "candidate_set_token": version.token,
-        "candidate_count": 4,
+        "candidate_count": 1,
+        "expected_count": 1,
         "complete": True,
         "technical_incomplete": False,
         "same_prompt": True,
@@ -634,11 +642,11 @@ def test_new_group_after_regeneration_promotes_new_asset_version(app, tmp_path):
     result = app.director.select_shot_candidate(
         "四图选片测试", 1, 1,
         regenerated["candidate_set_id"], version.token,
-        regenerated["candidate_revision"], candidates[1]["candidate_id"],
-        2, source="manual")
+        regenerated["candidate_revision"], candidates[0]["candidate_id"],
+        1, source="manual")
 
     assert result["asset_version"] == 3  # v1 old, v2 tombstone, v3 selected
-    assert result["selected_uri"] == candidates[1]["uri"]
+    assert result["selected_uri"] == candidates[0]["uri"]
     assert len(app.assets.history(
         project["id"], "image", "e001_shot001")) == 3
     final_plan = app.director._plan_read(ctx)
@@ -646,4 +654,4 @@ def test_new_group_after_regeneration_promotes_new_asset_version(app, tmp_path):
         row for row in final_plan["items"] if row["id"] == "shot:1")
     assert final_item["candidate_group_history"][0][
         "candidate_set_token"] == old_group["candidate_set_token"]
-    assert final_item["selection"]["candidate_seed"] == 2002
+    assert final_item["selection"]["candidate_seed"] == 2001

@@ -1,4 +1,4 @@
-"""四候选选片模式：冻结合同、真并行和非阻断内容质检。"""
+"""镜头单图连续精修：冻结合同、可恢复进度和非阻断内容质检。"""
 
 import copy
 import hashlib
@@ -214,7 +214,7 @@ def test_selection_mode_config_switches_are_independent_and_compatible():
     assert director._selection_mode_enabled() is True
     assert director._image_qc_enabled() is True
     assert director._video_content_qc_enabled() is True
-    assert director._shot_candidate_count() == 4
+    assert director._shot_candidate_count() == 1
     assert director.log.warnings
 
     # 新键存在时拥有优先权；只有缺失时才回退旧 image_qc。
@@ -230,12 +230,12 @@ def test_selection_mode_config_switches_are_independent_and_compatible():
     assert director._video_content_qc_enabled() is True
 
 
-def test_four_candidates_share_one_reviewed_contract_and_overlap(tmp_path):
+def test_single_candidate_uses_qc_directly_without_comparison(tmp_path):
     director = _director({
         "selection_mode": True,
-        "shot_candidate_count": 4,
+        "shot_candidate_count": 1,
     })
-    director.router = _ParallelRouter()
+    director.router = _ParallelRouter(first_wave_size=1)
     progress_updates = []
     payload = {
         "_episode_id": "episode-1",
@@ -257,14 +257,15 @@ def test_four_candidates_share_one_reviewed_contract_and_overlap(tmp_path):
         "image", payload, tmp_path, None, {"item_id": "shot:7"}, 4)
 
     assert director.router.review_calls == 1
-    assert director.router.image_calls == 4
-    assert director.router.qc_calls == 4
-    assert director.router.comparison_calls == 1
-    assert director.router.max_active >= 2
+    # 即使旧调用仍传 pulls=4，也必须强制收敛到本轮唯一图片。
+    assert director.router.image_calls == 1
+    assert director.router.qc_calls == 1
+    assert director.router.comparison_calls == 0
+    assert director.router.max_active == 1
     group = result.data["candidate_group"]
     candidates = group["candidates"]
-    assert group["candidate_count"] == group["expected_count"] == 4
-    assert group["parallelism"] == 4
+    assert group["candidate_count"] == group["expected_count"] == 1
+    assert group["parallelism"] == 1
     assert group["selection_required"] is True
     assert group["candidate_set_token"].startswith("cset-v1:")
     assert group["version"]["token"] == group["candidate_set_token"]
@@ -275,7 +276,7 @@ def test_four_candidates_share_one_reviewed_contract_and_overlap(tmp_path):
     assert len({row["reference_hash"] for row in candidates}) == 1
     assert len({row["input_hash"] for row in candidates}) == 1
     assert {row["candidate_seed"] for row in candidates} == {None}
-    assert len({row["candidate_variation_key"] for row in candidates}) == 4
+    assert len({row["candidate_variation_key"] for row in candidates}) == 1
     assert all(row["seed_consumed"] is False for row in candidates)
     assert all(row["reproducible"] is False for row in candidates)
     assert all(
@@ -284,9 +285,9 @@ def test_four_candidates_share_one_reviewed_contract_and_overlap(tmp_path):
         for row in candidates)
     assert {row["candidate_set_token"] for row in candidates} == {
         group["candidate_set_token"]}
-    assert len({row["candidate_id"] for row in candidates}) == 4
-    assert [row["candidate_index"] for row in candidates] == [1, 2, 3, 4]
-    assert len({str(Path(row["uri"]).parent) for row in candidates}) == 4
+    assert len({row["candidate_id"] for row in candidates}) == 1
+    assert [row["candidate_index"] for row in candidates] == [1]
+    assert len({str(Path(row["uri"]).parent) for row in candidates}) == 1
     assert all(Path(row["uri"]).exists() for row in candidates)
     assert {p["prompt_compact"] for p in director.router.payloads} == {
         "冻结后的精准镜头提示词"}
@@ -306,9 +307,7 @@ def test_four_candidates_share_one_reviewed_contract_and_overlap(tmp_path):
         update for update in progress_updates
         if update.get("candidates")]
     assert visible_updates
-    assert any(len(update["candidates"]) < 4
-               for update in visible_updates)
-    assert len(visible_updates[-1]["candidates"]) == 4
+    assert len(visible_updates[-1]["candidates"]) == 1
     assert visible_updates[-1]["status"] == "qc_complete"
     assert visible_updates[-1]["live_progress"] is True
     assert visible_updates[-1]["candidate_set_token"] == \
@@ -322,13 +321,14 @@ def test_four_candidates_share_one_reviewed_contract_and_overlap(tmp_path):
     assert not (tmp_path / "shot_007.keyframe.png").exists()
     assert Director._candidate_selection_pending(result) is True
     assert group["selection_required"] is True
-    assert round(result.cost, 2) == 4.75
+    assert round(result.cost, 2) == 1.35
 
 
-def test_comparison_uploads_only_eligible_candidates_and_rebases_refs(
+def test_failed_single_candidate_still_never_calls_comparison(
         tmp_path):
     director = _director({"selection_mode": True, "parallel_images": 4})
-    director.router = _ParallelRouter(qc_failures={1})
+    director.router = _ParallelRouter(
+        qc_failures={1}, first_wave_size=1)
     identity = tmp_path / "identity.png"
     identity.write_bytes(_png())
     payload = {
@@ -352,38 +352,20 @@ def test_comparison_uploads_only_eligible_candidates_and_rebases_refs(
         {"item_id": "shot:eligible"}, 4)
 
     group = result.data["candidate_group"]
-    by_index = {
-        row["candidate_index"]: row for row in group["candidates"]}
-    assert by_index[1]["passed"] is False
-    assert director.router.comparison_calls == 1
-    comparison = director.router.comparison_payloads[0]
-    requested_ids = [
-        row["candidate_id"]
-        for row in comparison["candidate_comparison"]["candidates"]]
-    assert requested_ids == [
-        by_index[index]["candidate_id"] for index in (2, 3, 4)]
-    uploaded_candidate_uris = [comparison["image_uri"], *[
-        row["uri"] for row in comparison["reference_manifest"]
-        if row.get("role") == "candidate_comparison"]]
-    assert uploaded_candidate_uris == [
-        by_index[index]["uri"] for index in (2, 3, 4)]
-    assert by_index[1]["uri"] not in uploaded_candidate_uris
-    assert [
-        row["index"] for row in comparison["reference_manifest"]
-    ] == [2, 3, 4]
-    reference_binding = comparison[
-        "candidate_comparison"]["reference_bindings"][0]
-    assert reference_binding["image_index"] == 4
-    assert reference_binding["uri"] == str(identity)
+    assert group["candidate_count"] == 1
+    assert group["candidates"][0]["passed"] is False
+    assert director.router.qc_calls == 1
+    assert director.router.comparison_calls == 0
+    assert director.router.comparison_payloads == []
 
 
-def test_four_candidate_slots_respect_provider_parallel_limit(tmp_path):
+def test_single_candidate_ignores_obsolete_four_slot_request(tmp_path):
     director = _director({
         "selection_mode": True,
-        "shot_candidate_count": 4,
+        "shot_candidate_count": 1,
         "parallel_images": 3,
     })
-    director.router = _ParallelRouter(first_wave_size=3)
+    director.router = _ParallelRouter(first_wave_size=1)
     payload = {
         "_episode_id": "episode-1",
         "_contract_revision": 1,
@@ -397,16 +379,16 @@ def test_four_candidate_slots_respect_provider_parallel_limit(tmp_path):
     result = director._generate_selection_candidates_parallel(
         "image", payload, tmp_path, None, {"item_id": "shot:9"}, 4)
 
-    assert director.router.image_calls == 4
-    assert director.router.max_active == 3
-    assert result.data["candidate_group"]["candidate_count"] == 4
-    assert result.data["candidate_group"]["parallelism"] == 3
+    assert director.router.image_calls == 1
+    assert director.router.max_active == 1
+    assert result.data["candidate_group"]["candidate_count"] == 1
+    assert result.data["candidate_group"]["parallelism"] == 1
     assert result.data["candidate_group"]["complete"] is True
 
 
-def test_interrupted_candidate_progress_reuses_finished_slots(tmp_path):
+def test_interrupted_single_candidate_progress_reuses_finished_file(tmp_path):
     director = _director({"selection_mode": True, "parallel_images": 4})
-    director.router = _ParallelRouter(first_wave_size=2)
+    director.router = _ParallelRouter(first_wave_size=1)
     payload = {
         "_episode_id": "episode-1",
         "_contract_revision": 1,
@@ -422,9 +404,9 @@ def test_interrupted_candidate_progress_reuses_finished_slots(tmp_path):
     interrupted["schema"] = "aifos.shot-candidate-progress/v1"
     interrupted["live_progress"] = True
     interrupted["complete"] = False
-    interrupted["candidates"] = interrupted["candidates"][:2]
+    interrupted["candidates"] = interrupted["candidates"][:1]
 
-    director.router = _ParallelRouter(first_wave_size=2)
+    director.router = _ParallelRouter(first_wave_size=1)
     resumed_payload = copy.deepcopy(payload)
     resumed_payload["_candidate_set_id"] = interrupted[
         "candidate_set_id"]
@@ -433,28 +415,20 @@ def test_interrupted_candidate_progress_reuses_finished_slots(tmp_path):
         "image", resumed_payload, tmp_path, None,
         {"item_id": "shot:10"}, 4)
 
-    # All four files had already reached the frozen candidate directory before
-    # the simulated progress write was interrupted, so restart recovers slots
-    # 3/4 from disk instead of paying to generate them again.
+    # 唯一文件已经落入冻结目录；恢复时不得再次付费生成。
     assert director.router.image_calls == 0
     group = resumed.data["candidate_group"]
-    assert group["candidate_count"] == 4
-    assert [row["candidate_index"] for row in group["candidates"]] == [
-        1, 2, 3, 4]
+    assert group["candidate_count"] == 1
+    assert [row["candidate_index"] for row in group["candidates"]] == [1]
     assert group["candidates"][0]["uri"] == \
         interrupted["candidates"][0]["uri"]
-    assert group["candidates"][1]["uri"] == \
-        interrupted["candidates"][1]["uri"]
-    assert all(
-        row["recovered_from_disk"] is True
-        for row in group["candidates"][2:])
 
 
 def test_review_normalization_starts_new_set_without_overwriting_old_dir(
         tmp_path):
     """旧断点提示词被统一审核改写后不得复用或覆盖旧候选目录。"""
     director = _director({"selection_mode": True, "parallel_images": 4})
-    director.router = _ParallelRouter()
+    director.router = _ParallelRouter(first_wave_size=1)
     old_set_id = "legacy-multiline-set"
     old_root = tmp_path / "candidate_sets" / old_set_id
     old_root.mkdir(parents=True)
@@ -483,7 +457,7 @@ def test_review_normalization_starts_new_set_without_overwriting_old_dir(
 
     group = result.data["candidate_group"]
     assert director.router.review_calls == 1
-    assert director.router.image_calls == 4
+    assert director.router.image_calls == 1
     assert group["candidate_set_id"] != old_set_id
     assert sentinel.read_text(encoding="utf-8") == \
         "historical pixels stay immutable"
@@ -495,7 +469,7 @@ def test_review_normalization_starts_new_set_without_overwriting_old_dir(
 
 def test_candidate_progress_persists_exact_round_resume_state(tmp_path):
     director = _director({"selection_mode": True, "parallel_images": 4})
-    director.router = _ParallelRouter()
+    director.router = _ParallelRouter(first_wave_size=1)
     updates = []
     resume_payload = {
         "_episode_id": "episode-1",
@@ -539,7 +513,7 @@ def test_candidate_progress_persists_exact_round_resume_state(tmp_path):
 
     assert updates
     # The old implementation first overwrote the plan with a schema-less
-    # 0/4 row.  Every new progress row is now immediately resumable.
+    # 0/1 row.  Every new progress row is now immediately resumable.
     assert updates[0]["schema"] == "aifos.shot-candidate-progress/v1"
     assert all(
         row["resume_state"]["generation_round"] == 3
@@ -553,9 +527,9 @@ def test_candidate_progress_persists_exact_round_resume_state(tmp_path):
     assert "seedance_prompt" not in frozen_resume
     assert updates[-1]["status"] == "qc_complete"
 
-    # Simulate a service restart after all four files landed but before the
-    # outer repair loop returned.  The frozen reviewed contract must make all
-    # four slots reusable with zero new image calls and zero re-review calls.
+    # Simulate a service restart after the one file landed but before the outer
+    # repair loop returned. The frozen reviewed contract must reuse it with
+    # zero new image calls and zero re-review calls.
     live_group = updates[-1]
     restored, resumed = director._candidate_payload_from_resume_progress(
         {"_episode_id": "episode-1", "shot_no": 11,
@@ -566,14 +540,14 @@ def test_candidate_progress_persists_exact_round_resume_state(tmp_path):
     restored["_candidate_revision"] = live_group["candidate_revision"]
     restored["_contract_revision"] = live_group["contract_revision"]
     restored["_resume_candidate_group"] = copy.deepcopy(live_group)
-    director.router = _ParallelRouter()
+    director.router = _ParallelRouter(first_wave_size=1)
 
     resumed_result = director._generate_selection_candidates_parallel(
         "image", restored, tmp_path, None, {"item_id": "shot:11"}, 4)
 
     assert director.router.review_calls == 0
     assert director.router.image_calls == 0
-    assert resumed_result.data["candidate_group"]["candidate_count"] == 4
+    assert resumed_result.data["candidate_group"]["candidate_count"] == 1
 
 
 def test_resume_progress_restores_repaired_contract_history_and_best():
@@ -664,7 +638,8 @@ def test_only_explicit_manual_or_ai_selection_unlocks_candidate_group():
 
 def test_one_candidate_technical_failure_is_retried_and_fills_slot(tmp_path):
     director = _director({"selection_mode": True})
-    director.router = _ParallelRouter(transient_failures={2})
+    director.router = _ParallelRouter(
+        transient_failures={1}, first_wave_size=1)
     result = director._generate_selection_candidates_parallel(
         "image", {
             "_episode_id": "episode-1",
@@ -675,20 +650,20 @@ def test_one_candidate_technical_failure_is_retried_and_fills_slot(tmp_path):
         }, tmp_path, None, {"item_id": "shot:8"}, 4)
 
     group = result.data["candidate_group"]
-    assert director.router.image_calls == 5
+    assert director.router.image_calls == 2
     assert group["complete"] is True
     assert group["technical_incomplete"] is False
     assert group["candidate_errors"] == []
-    assert group["candidate_count"] == 4
-    retried = next(
-        row for row in group["candidates"] if row["candidate_index"] == 2)
+    assert group["candidate_count"] == 1
+    retried = group["candidates"][0]
     assert retried["technical_attempts"] == 2
     assert Director._candidate_group_technical_incomplete(result) is False
 
 
-def test_unfilled_candidate_slot_promotes_best_usable_without_mobile_gate(tmp_path):
+def test_zero_usable_single_slot_is_only_technical_incomplete(tmp_path):
     director = _director({"selection_mode": True})
-    director.router = _ParallelRouter(persistent_failures={3})
+    director.router = _ParallelRouter(
+        persistent_failures={1}, first_wave_size=1)
     result = director._generate_selection_candidates_parallel(
         "image", {
             "_episode_id": "episode-1",
@@ -699,33 +674,23 @@ def test_unfilled_candidate_slot_promotes_best_usable_without_mobile_gate(tmp_pa
         }, tmp_path, None, {"item_id": "shot:9"}, 4)
 
     group = result.data["candidate_group"]
-    success_uris = [row["uri"] for row in group["candidates"]]
-    assert director.router.image_calls == 5
-    assert group["complete"] is True
+    assert director.router.image_calls == 2
+    assert group["complete"] is False
     assert group["slot_complete"] is False
     assert group["missing_slot_count"] == 1
-    assert group["technical_incomplete"] is False
-    assert group["candidate_count"] == 3
-    assert [row["candidate_index"] for row in group["candidate_errors"]] == [3]
-    assert len(success_uris) == 3
-    assert result.data["candidate_uris"] == success_uris
-    assert all(Path(uri).exists() for uri in success_uris)
-    assert Director._candidate_group_technical_incomplete(result) is False
-    assert Director._candidate_selection_pending(result) is True
-    assert group["selection_required"] is True
+    assert group["technical_incomplete"] is True
+    assert group["candidate_count"] == 0
+    assert [row["candidate_index"] for row in group["candidate_errors"]] == [1]
+    assert result.data["candidate_uris"] == []
+    assert Director._candidate_group_technical_incomplete(result) is True
+    assert group["selection_required"] is False
     assert result.uri == ""
-    promoted = director._ai_promote_generated_candidate_group(result)
-    promoted_group = promoted.data["candidate_group"]
-    assert promoted_group["selection_required"] is False
-    assert promoted_group["selection"]["source"] == "ai"
-    assert promoted.uri in success_uris
-    assert Director._candidate_selection_pending(promoted) is False
 
 
 def test_decoder_failure_resume_recovers_paid_files_without_regeneration(
         tmp_path, monkeypatch):
     director = _director({"selection_mode": True})
-    director.router = _ParallelRouter()
+    director.router = _ParallelRouter(first_wave_size=1)
     payload = {
         "_episode_id": "episode-1",
         "_contract_revision": 1,
@@ -748,7 +713,7 @@ def test_decoder_failure_resume_recovers_paid_files_without_regeneration(
     calls_after_failure = director.router.image_calls
     assert first_group["technical_incomplete"] is True
     assert first_group["candidate_count"] == 0
-    assert calls_after_failure == 8
+    assert calls_after_failure == 2
 
     monkeypatch.setattr("aifos.director.probe_image", real_probe)
     resumed_payload = {
@@ -762,7 +727,7 @@ def test_decoder_failure_resume_recovers_paid_files_without_regeneration(
     resumed_group = resumed.data["candidate_group"]
 
     assert director.router.image_calls == calls_after_failure
-    assert resumed_group["candidate_count"] == 4
+    assert resumed_group["candidate_count"] == 1
     assert resumed_group["technical_incomplete"] is False
     assert all(
         row["recovered_from_disk"] is True
@@ -810,15 +775,15 @@ def test_explicitly_disabled_image_content_qc_never_blocks_or_auto_repairs():
     assert "画面内容不符合设定" in director._critical_qc_error(failed)
 
 
-def test_disabled_image_qc_draws_one_four_candidate_round_without_qc_calls(
+def test_disabled_image_qc_draws_one_single_candidate_round_without_qc_calls(
         tmp_path):
     director = _director({
         "selection_mode": True,
         "image_content_qc": False,
-        "shot_candidate_count": 4,
+        "shot_candidate_count": 1,
         "shot_max_candidate_rounds": 10,
     })
-    director.router = _ParallelRouter()
+    director.router = _ParallelRouter(first_wave_size=1)
 
     result = director._generate_shot_candidate_group(
         "image", {
@@ -831,7 +796,7 @@ def test_disabled_image_qc_draws_one_four_candidate_round_without_qc_calls(
             "aspect": "9:16",
         }, tmp_path, None, {"count": 1, "location": "门内"})
 
-    assert director.router.image_calls == 4
+    assert director.router.image_calls == 1
     assert director.router.qc_calls == 0
     assert director.router.comparison_calls == 0
     assert result.uri

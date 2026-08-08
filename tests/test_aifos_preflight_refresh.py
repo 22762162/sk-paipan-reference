@@ -504,7 +504,7 @@ def test_parallel_runtime_repair_discards_late_old_spatial_result(
             return current_tasks, list(current_tasks)
 
         monkeypatch.setattr(app.director, "_total_image_workers", lambda: 8)
-        monkeypatch.setattr(app.director, "_shot_candidate_count", lambda: 4)
+        monkeypatch.setattr(app.director, "_shot_candidate_count", lambda: 1)
         monkeypatch.setattr(
             app.director, "_ensure_shot_contract_nonblocking",
             lambda _ctx, _task: None)
@@ -578,7 +578,7 @@ def test_parallel_runtime_repair_discards_late_old_spatial_result(
             "stale_spatial_result_discarded": True,
             "submitted_contract_revision": 1,
             "current_contract_revision": 2,
-            "candidate_count": 4,
+            "candidate_count": 1,
         }]
     finally:
         app.close()

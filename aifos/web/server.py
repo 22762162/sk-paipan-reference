@@ -399,7 +399,7 @@ def access_payload(bound_host, port, workspace=None):
 PRODUCTION_ACTIONS = frozenset({
     "produce", "force_rebuild", "script_import", "series_next",
     "confirm_script", "image_acceleration_resume", "image_selection_resume",
-    # 整组候选重生会作废当前正式关键帧及其下游链，必须与整集生产、
+    # 单图编辑返修会作废当前正式关键帧及其下游链，必须与整集生产、
     # 旧单图重画等入口互斥；同一集内仍由串行队列按提交顺序执行。
     "regenerate_shot_candidates",
 })
@@ -831,7 +831,7 @@ class JobRegistry:
                             "image_selection_resume": (
                                 "images", "关键帧选片完成后断点续产"),
                             "regenerate_shot_candidates": (
-                                "images", "关键帧候选整组重生成"),
+                                "images", "关键帧单图编辑返修"),
                             "redo_items": ("images", "图片批量重画"),
                             "redo_video": ("videos", "视频定向修改"),
                             "redo_placeholders": ("images", "占位图片补真"),
@@ -1215,7 +1215,7 @@ def _selection_mode_present_item(item):
 
     有当前选片或 best-effort 晋升凭证的技术可用稿视为完成；旧版只有
     ``qc=false``、却没有有效选片凭证的镜头交回系统：先由 Codex 汇总
-    问题、优化提示词与参考图，再进入下一轮四张候选。首轮计入总轮数，
+    问题、优化提示词与参考图，再以当前失败图为基底编辑返修一张。首轮计入总轮数，
     最多十轮。零张技术产物才显示 ``technical_incomplete``。磁盘上的历史
     计划不在这里改写，方便审计和后续 Director 续产接管。
     """
@@ -1259,9 +1259,9 @@ def _selection_mode_present_item(item):
             item["status"] = "done"
         item["nonblocking_risk"] = True
         if legacy_reused and not (has_selection or best_effort):
-            # 兼容四抽选优上线前已晋升进资产中心的正式图。旧清单没有
+            # 兼容旧候选选优上线前已晋升进资产中心的正式图。旧清单没有
             # candidate_group.selection，但 reused + 未失效技术产物仍是
-            # 明确的正式复用事实，不能把整集倒退成“待四抽”。最终是否真有
+            # 明确的正式复用事实，不能把整集倒退成“待返修”。最终是否真有
             # 正式资产仍由 _production_progress 的资产中心核验决定。
             item["legacy_formal_reuse"] = True
         item.pop("automatic_repair", None)
@@ -1270,7 +1270,7 @@ def _selection_mode_present_item(item):
     if technical_output:
         item["status"] = "pending"
         strategy = (
-            "codex_optimize_prompt_refs_then_generate_4"
+            "codex_optimize_prompt_refs_then_edit_1"
             if category == "shot_image" else "regenerate_frames")
         item["automatic_repair"] = {
             "owner": "system",
@@ -1283,8 +1283,9 @@ def _selection_mode_present_item(item):
             "first_round_included": category == "shot_image",
             "requires_human": False,
             "label": (
-                "Codex自动归因并优化提示词与参考图；每轮生成4张、"
-                "AI选优复检，最多10轮"
+                "Codex自动归因并优化提示词与参考图；"
+                "每轮单图质检，局部问题编辑当前图；结构问题按锁定参考"
+                "重生1张，最多10轮"
                 if category == "shot_image" else "系统自动重生成首尾帧"),
         }
     else:
@@ -2204,7 +2205,7 @@ def _promote_visible_candidate_progress(item):
         "candidate_completed_count": int(
             progress.get("completed_count") or 0),
         "candidate_expected_count": int(
-            progress.get("expected_count") or 4),
+            progress.get("expected_count") or CANDIDATES_PER_SHOT),
         "candidate_generation_status": str(
             progress.get("status") or "generating"),
         "technical_incomplete": bool(
@@ -3093,7 +3094,7 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
         keyframes["status"] = "ready"
         keyframes["reason"] = (
             f"{keyframe_count_text} "
-            + ("全部关键帧已由AI选优并登记；内容观察只记风险、不阻断。"
+            + ("全部关键帧已由AI质检或选优并登记；内容观察只记风险、不阻断。"
                if selection_mode else "全部关键帧均已通过当前合同。"))
     elif image_stage_active:
         keyframes["status"] = "active"
@@ -3105,8 +3106,9 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
         keyframes["reason"] = (
             f"{keyframe_count_text} 当前没有运行任务；还有 "
             f"{pending_total} 个镜头"
-            + ("由 Codex 自动归因、优化提示词与参考图；每轮并行生成"
-               "4张并由AI选优复检，最多10轮。"
+            + ("由 Codex 自动归因、优化提示词与参考图；"
+               "每轮单图质检，局部问题编辑当前图，结构问题按锁定参考"
+               "重生1张，最多10轮。"
                if selection_mode else "可继续生产。")
             + (f" 当前归因：{technical_reason_text}。"
                if technical_reason_text else ""))
@@ -3173,7 +3175,8 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
             "shot_nos": pending_shots,
             "message": (
                 f"还有 {pending_count} 个关键帧由 Codex 自动归因并优化"
-                "提示词与参考图；每轮并行生成4张并AI选优复检，最多10轮。"
+                "提示词与参考图；每轮单图质检，局部问题编辑当前图，"
+                "结构问题按锁定参考重生1张，最多10轮。"
                 if selection_mode
                 else f"还有 {pending_count} 个关键帧尚未生产。")
                 + (f" 当前归因：{technical_reason_text}。"
@@ -3236,7 +3239,7 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
             next_action = {
                 "action": "resume_keyframes",
                 "label": (
-                    f"自动四抽选优并复检（最多10轮 · {pending_count}镜）"
+                    f"自动单图质检并编辑返修（最多10轮 · {pending_count}镜）"
                     if selection_mode else
                     f"继续生产 {pending_count} 个非问题关键帧"),
                 "count": pending_count,
@@ -3267,7 +3270,7 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
         "item_ids": pending_item_ids,
         "enabled": bool(pending_count and not live_run),
         "label": (
-            f"自动四抽选优并复检（最多10轮 · {pending_count}镜）"
+            f"自动单图质检并编辑返修（最多10轮 · {pending_count}镜）"
             if selection_mode else
             f"继续生产 {pending_count} 个非问题关键帧"),
     }
@@ -3323,7 +3326,7 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
     }
     if latest_failure:
         # 最新运行事实优先级高于 render_plan。候选组可能来自更早的批次，
-        # 绝不能用“待四抽/待选片”盖住本次真正的门禁失败。
+        # 绝不能用“待返修/待选片”盖住本次真正的门禁失败。
         resume_pending_images["enabled"] = False
         resolve_image_issues["enabled"] = False
         blockers.insert(0, {
@@ -5872,7 +5875,7 @@ def make_handler(workspace, jobs):
                 body, "expected_contract_revision", "contract_revision")
             if require_contract and contract_revision in (None, ""):
                 raise AifosError(
-                    "整组重生成必须提供 contract_revision")
+                    "单图编辑返修必须提供 contract_revision")
             if contract_revision not in (None, ""):
                 try:
                     contract_revision = int(contract_revision)
@@ -5999,20 +6002,20 @@ def make_handler(workspace, jobs):
             return self._json(result)
 
         def _shot_candidates_regenerate(self):
-            """推翻当前候选组并排队重生成；不打断同集其他工作。"""
+            """以当前关键帧为基底排队编辑返修1张；不打断同集其他工作。"""
             body = self._read_body()
             if body is None:
                 return self._error(400, "请求体不是合法 JSON")
             if body.get("confirm_regenerate") is not True:
                 return self._error(
-                    400, "整组重新生成需要 confirm_regenerate=true 二次确认")
+                    400, "单图编辑返修需要 confirm_regenerate=true 二次确认")
             found = self._episode_ref(body)
             if found is None:
                 return self._error(404, "剧集不存在")
             prompt = str(
                 body.get("prompt") or body.get("feedback") or "").strip()
             if not prompt:
-                return self._error(400, "整组重生成必须提供完整 prompt")
+                return self._error(400, "单图编辑返修必须提供完整 prompt")
             try:
                 expected = self._shot_candidate_request(
                     body, require_contract=True)
@@ -6079,8 +6082,9 @@ def make_handler(workspace, jobs):
                     "请在本镜候选区修改完整提示词，并调用 "
                     "/api/shot-candidates/regenerate 携带当前候选组的 "
                     "candidate_set_id、candidate_set_token、"
-                    "candidate_revision 和 contract_revision，整组重新生成4张。"
-                    "只有 /api/shot-candidates/select 可把其中1张晋升为正式图")
+                    "candidate_revision 和 contract_revision，"
+                    "以当前图为基底编辑返修1张。"
+                    "只有 /api/shot-candidates/select 可把返修图晋升为正式图")
             # 整集生产时并行 worker 正在改整份 render_plan,改单张不安全,
             # 仍要求先暂停。但"另一张图正在重画"不该拦住这一张——排队即可,
             # 否则用户改完一张必须盯着等它跑完才能提交下一张。

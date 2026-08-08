@@ -406,37 +406,37 @@ def test_test_provider_reports_missing_bridge_binary(tmp_path, monkeypatch):
 
 
 def test_selection_mode_defaults_roundtrip(tmp_path):
-    """内容质检非阻断；每轮四张、总轮数和旧批次键保持同一预算。"""
+    """内容质检非阻断；每轮单图、总轮数和旧批次键保持同一预算。"""
     from aifos.settings import set_defaults
     config_path = tmp_path / "config.json"
     saved = set_defaults(config_path, {
         "selection_mode": True,
         "image_content_qc": False,
         "video_content_qc": "off",
-        "shot_candidate_count": 4,
-        "shot_repair_candidate_count": 4,
+        "shot_candidate_count": 1,
+        "shot_repair_candidate_count": 1,
         "shot_max_candidate_rounds": 10,
         "shot_auto_repair_batches": 9,
     })
     assert saved == {"selection_mode": True, "image_content_qc": False,
-                     "video_content_qc": False, "shot_candidate_count": 4,
-                     "shot_repair_candidate_count": 4,
+                     "video_content_qc": False, "shot_candidate_count": 1,
+                     "shot_repair_candidate_count": 1,
                      "shot_max_candidate_rounds": 10,
                      "shot_auto_repair_batches": 9}
     stored = json.loads(config_path.read_text(encoding="utf-8"))["defaults"]
     assert stored["selection_mode"] is True
     assert stored["video_content_qc"] is False
-    assert stored["shot_repair_candidate_count"] == 4
+    assert stored["shot_repair_candidate_count"] == 1
     assert stored["shot_max_candidate_rounds"] == 10
     assert stored["shot_auto_repair_batches"] == 9
 
-    with pytest.raises(AifosError, match="固定为 4"):
+    with pytest.raises(AifosError, match="固定为 1"):
         set_defaults(config_path, {"shot_candidate_count": 3})
     with pytest.raises(AifosError, match="布尔值"):
         set_defaults(config_path, {"selection_mode": "也许"})
     with pytest.raises(AifosError, match="不支持的默认项"):
         set_defaults(config_path, {"image_qc_retries": 2})
-    with pytest.raises(AifosError, match="固定为 4"):
+    with pytest.raises(AifosError, match="固定为 1"):
         set_defaults(config_path, {"shot_repair_candidate_count": 3})
     with pytest.raises(AifosError, match="1-10"):
         set_defaults(config_path, {"shot_max_candidate_rounds": 11})
@@ -467,7 +467,7 @@ def test_config_load_upgrades_old_fixed_repair_policy_without_round_eleven(
         },
     }), encoding="utf-8")
     upgraded = Config.load(config_path)
-    assert upgraded.get("defaults", "shot_repair_candidate_count") == 4
+    assert upgraded.get("defaults", "shot_repair_candidate_count") == 1
     assert upgraded.get("defaults", "shot_max_candidate_rounds") == 10
     assert upgraded.get("defaults", "shot_auto_repair_batches") == 9
 
@@ -509,8 +509,8 @@ def test_selection_mode_web_endpoints(tmp_path):
         assert view["effective_video_content_qc"] is True
         assert view["content_qc_blocking"] is False
         assert view["content_qc_auto_retry"] is True
-        assert view["shot_candidate_count"] == 4
-        assert view["shot_repair_candidate_count"] == 4
+        assert view["shot_candidate_count"] == 1
+        assert view["shot_repair_candidate_count"] == 1
         assert view["max_candidate_rounds"] == 10
         assert view["first_round_included"] is True
 
@@ -528,11 +528,11 @@ def test_selection_mode_web_endpoints(tmp_path):
         status, view = call("GET", "/api/selection-mode")
         assert status == 200
         assert view["selection_mode"] is False
-        assert view["shot_candidate_count"] == 4
+        assert view["shot_candidate_count"] == 1
         status, settings = call("GET", "/api/settings")
         assert status == 200
         assert settings["defaults"]["selection_mode"] is False
-        assert settings["defaults"]["shot_candidate_count"] == 4
+        assert settings["defaults"]["shot_candidate_count"] == 1
 
         status, view = call("POST", "/api/selection-mode", {"enabled": False})
         assert status == 200 and view["ok"] and view["selection_mode"] is False
@@ -550,8 +550,8 @@ def test_selection_mode_web_endpoints(tmp_path):
         defaults = view["defaults"]
         assert defaults["selection_mode"] is True
         assert defaults["video_content_qc"] is False
-        assert defaults["shot_candidate_count"] == 4
-        assert defaults["shot_repair_candidate_count"] == 4
+        assert defaults["shot_candidate_count"] == 1
+        assert defaults["shot_repair_candidate_count"] == 1
         assert defaults["shot_max_candidate_rounds"] == 10
         assert defaults["shot_auto_repair_batches"] == 9
         assert defaults["content_qc_blocking"] is False
@@ -559,7 +559,7 @@ def test_selection_mode_web_endpoints(tmp_path):
 
         status, err = call("POST", "/api/selection-mode",
                            {"shot_candidate_count": 2})
-        assert status == 400 and "固定为 4" in err["error"]
+        assert status == 400 and "固定为 1" in err["error"]
 
         status, err = call("POST", "/api/selection-mode", {})
         assert status == 400

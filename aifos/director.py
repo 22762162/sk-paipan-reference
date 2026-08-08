@@ -1369,7 +1369,7 @@ class Director:
             if (stage == "cast" and ctx.get("cast_selection_required")):
                 paused = "cast"
                 break
-            # 内容质检失败可以继续四抽返修，但“零张技术可用图”不是
+            # 内容质检失败可以继续单图返修，但“零张技术可用图”不是
             # 可被下游忽略的视觉意见。图片通道无额度、超时或落盘失败时，
             # 必须停留在关键帧技术补位，不能继续让首尾帧按不存在的
             # shot_no 索引并以 ``KeyError: 1`` 之类的无意义错误结束整集。
@@ -1719,9 +1719,9 @@ class Director:
                 except ProviderError as exc2:
                     reason = str(exc2)
             # 一次修正/复审仍被内容规则拒绝时，不再隔离、失败或等待手机。
-            # 这里只冻结修订后的合同；本镜第一次真实出图仍固定四张。
-            # 唯有本轮四张都经视觉质检明确失败后，才进入下一轮四张；
-            # 总计十轮（首轮计入），且始终只影响本镜。
+            # 这里只冻结修订后的合同；本镜第一次真实出图固定一张。
+            # 该图经视觉质检明确失败后，才进入下一轮单图返修；总计
+            # 十轮（首轮计入），且始终只影响本镜。
             for member in group:
                 payload = member["payload"]
                 payload["director_autonomy_mode"] = True
@@ -1742,13 +1742,13 @@ class Director:
                     "changes_made": ([repaired_note]
                                      if contract_repaired else []),
                     "blocking_reason": (
-                        "内容审核意见已转为非阻断风险，首轮仍生成四候选"),
+                        "内容审核意见已转为非阻断风险，首轮仍生成1张"),
                 }
             completed.append((group, None))
             self.log.warn(
                 "director",
                 f"镜头{task['tag']}提示词审核意见已转为非阻断风险，"
-                "修订合同后仍按首轮四候选生成，"
+                "修订合同后仍按首轮单图生成，"
                 f"不等待人工: {reason[:200]}")
         reviewed = 0
         for group, result in completed:
@@ -4466,7 +4466,7 @@ class Director:
                 item["error"] = error
                 # 计时:生成中记起点,完成/失败记单张耗时(供前端估算剩余时间)
                 if status == "generating":
-                    # 候选四抽会逐张回写进度；重复的 generating 更新不能
+                    # 镜头候选会逐张回写进度；重复的 generating 更新不能
                     # 把整轮起点不断后移，否则页面耗时永远接近0。
                     if (previous_status != "generating"
                             or not item.get("started_at")):
@@ -5133,7 +5133,7 @@ class Director:
 
         只有用户显式开启 ``preview_qc_bypass`` 才允许旁路。AI 导演
         自主模式只代表无需手机逐张确认，不能再被解释成“关闭质检”；
-        否则四候选会退化为机械选第一张，场景、人物和物理错误都无法
+        否则单图轮会机械晋升，场景、人物和物理错误都无法
         触发非阻断返修。
         """
         return self._setting_enabled(self.config.get(
@@ -5165,35 +5165,35 @@ class Director:
         return not self._preview_qc_bypass_enabled()
 
     def _shot_candidate_count(self):
-        """关键帧新产线固定四候选，配置值只用于审计兼容。"""
+        """镜头关键帧首轮固定一张；母资产候选不走这个设置。"""
         try:
             configured = int(self.config.get(
-                "defaults", "shot_candidate_count", default=4))
+                "defaults", "shot_candidate_count", default=1))
         except (TypeError, ValueError):
-            configured = 4
-        if configured != 4:
+            configured = 1
+        if configured != 1:
             self.log.warn(
                 "director",
                 f"shot_candidate_count={configured} 不在当前标准内，"
-                "已按每镜固定4张执行")
-        return 4
+                "已按每镜首轮固定1张执行")
+        return 1
 
     def _shot_repair_candidate_count(self):
-        """问题镜头每一轮也固定四张，与首轮保持同一抽卡合同。"""
+        """问题镜头每轮固定编辑一张，与首轮保持同一合同。"""
         try:
             configured = int(self.config.get(
-                "defaults", "shot_repair_candidate_count", default=4))
+                "defaults", "shot_repair_candidate_count", default=1))
         except (TypeError, ValueError):
-            configured = 4
-        if configured != 4:
+            configured = 1
+        if configured != 1:
             self.log.warn(
                 "director",
                 f"shot_repair_candidate_count={configured} 不在当前标准内，"
-                "已按问题镜头每轮固定4张执行")
-        return 4
+                "已按问题镜头每轮固定1张执行")
+        return 1
 
     def _shot_max_candidate_rounds(self):
-        """单镜总抽卡轮数上限；首轮计入，最多10轮/40张。"""
+        """单镜总生成轮数上限；首轮计入，最多10轮/10张。"""
         raw = self.config.get(
             "defaults", "shot_max_candidate_rounds", default=None)
         if raw is None:
@@ -5219,11 +5219,11 @@ class Director:
         return self._shot_max_candidate_rounds() - 1
 
     def _ensure_shot_contract_nonblocking(self, ctx, task):
-        """合同异常时由AI导演就地修一次，再执行首轮四候选。
+        """合同异常时由AI导演就地修一次，再执行首轮单图生成。
 
         该检查只处理镜头局部合同，不抛出“停止整集”的门禁异常。若
         一次修订后静态校验仍有意见，意见作为风险随候选保留；本阶段
-        不消耗候选返修轮数。只有四张真实结果全部明确失败后才进入下一轮。
+        不消耗候选返修轮数。只有本轮真实结果明确失败后才进入下一轮。
         """
         item_id = str(task.get("item_id") or "")
         if (task.get("capability") != "image"
@@ -5248,13 +5248,13 @@ class Director:
                     or payload.get("prompt") or ""),
                 "issues_found": [],
                 "changes_made": ["旧失败合同已由AI导演替换为唯一静态合同"],
-                "blocking_reason": "本返工轮4张共享同一替换合同",
+                "blocking_reason": "本返工轮1张使用唯一替换合同",
             }
             frozen = self._image_generation_input(payload)
             payload["_prompt_review_frozen_input_hash"] = frozen[
                 "input_hash"]
             task["payload"] = payload
-            return "旧失败合同已替换，直接进入本轮固定4张返工"
+            return "旧失败合同已替换，直接进入本轮固定1张返工"
         preflight_issues = [
             str(issue).strip() for issue in (
                 payload.get("_nonblocking_preflight_issues") or [])
@@ -5284,7 +5284,7 @@ class Director:
         except Exception as exc:
             self.log.warn(
                 "director",
-                f"{item_id} 合同自动修订未完成，仍按四候选非阻断生产:"
+                f"{item_id} 合同自动修订未完成，仍按单图非阻断生产:"
                 f"{str(exc)[:300]}")
         payload = task.get("payload") or payload
         payload.pop("_autonomous_repair_seeded", None)
@@ -5292,8 +5292,8 @@ class Director:
         refreshed = validate_shot_prompt_contract(
             payload.get("prompt_contract") or {})
         payload["prompt_contract_validation"] = refreshed
-        # 合同修订只改变首轮输入；后续四候选必须共享这份冻结输入，
-        # 不能再让随机提示词复审产生第二次阻断或四份不同稿。
+        # 合同修订只改变首轮输入；后续单图轮必须继承这份冻结输入，
+        # 不能再让随机提示词复审产生第二次阻断。
         payload["director_autonomy_mode"] = True
         payload["prompt_review"] = {
             "schema": self.router.PROMPT_REVIEW_SCHEMA,
@@ -5309,7 +5309,7 @@ class Director:
                 refreshed.get("issues") or issues)[:12]),
             "changes_made": [summary] if summary else [],
             "blocking_reason": (
-                "AI导演已修正本镜合同，冻结后进入首轮四候选选优"),
+                "AI导演已修正本镜合同，冻结后进入首轮单图判断"),
         }
         frozen = self._image_generation_input(payload)
         payload["_prompt_review_frozen_input_hash"] = frozen["input_hash"]
@@ -5318,13 +5318,13 @@ class Director:
                 refreshed.get("issues") or issues)[:12]
             self.log.warn(
                 "director",
-                f"{item_id} 合同修订后仍有风险，已转为四候选AI选优，"
+                f"{item_id} 合同修订后仍有风险，已转为单图AI判断，"
                 "不阻断其他镜头: "
                 + "；".join(payload["nonblocking_contract_risk"][:4]))
         task["payload"] = payload
         if task.get("qc_spec"):
             task["qc_spec"] = self._shot_qc_spec(ctx, payload)
-        return summary or "合同异常已转为非阻断首轮四候选"
+        return summary or "合同异常已转为非阻断首轮单图"
 
     def _dual_review_enabled(self, consecutive_failures=0):
         """双路会诊开关:默认只在首检失败后启用(诊断最值钱的地方)。
@@ -6455,8 +6455,19 @@ class Director:
         return {"applied": applied, "skipped": skipped}
 
     @staticmethod
-    def _use_failed_image_as_revision_base(diagnostics):
-        """Do not let a bad identity/count output poison the next attempt."""
+    def _use_failed_image_as_revision_base(diagnostics, verdict=None):
+        """Use failed pixels only when the defect is safe for local editing."""
+        verdict = verdict if isinstance(verdict, dict) else {}
+        # Assessed QC booleans are deterministic and take precedence over a
+        # model's free-form category labels.  Missing fields are not failures,
+        # but an explicit mismatch means the whole base is unsafe to preserve.
+        for match_key in (
+                "identity_match", "gender_match", "count_match",
+                "scene_topology_match"):
+            if verdict.get(match_key) is False:
+                return False
+        if str(verdict.get("camera_deviation") or "").lower() == "major":
+            return False
         reference_status = str(
             (diagnostics.get("reference_diagnosis") or {}).get(
                 "status") or "").lower()
@@ -6469,9 +6480,16 @@ class Director:
                 (diagnostics.get("image_error") or {}).get("categories")
                 or [])
         }
-        if categories & {
-                "identity", "gender", "count", "species", "identity_drift",
-                "person_count"}:
+        structural_categories = {
+            "identity", "gender", "count", "species", "identity_drift",
+            "person_count", "character_count", "wrong_identity",
+            "whole_scene", "scene", "scene_drift", "wrong_scene", "era",
+            "topology", "scene_topology", "global_composition",
+            "composition", "architecture", "environment",
+            "身份", "性别", "人数", "人物数量", "物种", "整场景",
+            "场景", "时代", "拓扑", "全局构图",
+        }
+        if categories & structural_categories:
             return False
         return not any(
             action.get("action") == "drop_revision_base"
@@ -7566,7 +7584,7 @@ class Director:
         item["candidate_completed_count"] = int(
             progress.get("completed_count") or 0)
         item["candidate_expected_count"] = int(
-            progress.get("expected_count") or 4)
+            progress.get("expected_count") or 1)
         item["candidate_generation_status"] = str(
             progress.get("status") or "generating")
         item["technical_incomplete"] = bool(
@@ -7626,6 +7644,28 @@ class Director:
                     "reference_role") or "") == "revision_base"
                 or "待修改基底" in str(
                     (matches.get(str(uri)) or {}).get("label") or ""))]
+
+    @classmethod
+    def _clear_candidate_revision_base(cls, payload):
+        """Remove every failed-image anchor before a clean regeneration."""
+        old_bases = set(cls._candidate_revision_base_uris(payload))
+        source_uri = str(payload.get("source_qc_uri") or "").strip()
+        if source_uri:
+            old_bases.add(source_uri)
+        payload["reference_images"] = [
+            value for value in (payload.get("reference_images") or [])
+            if str(value or "") not in old_bases]
+        payload["asset_matches"] = [
+            row for row in (payload.get("asset_matches") or [])
+            if not isinstance(row, dict)
+            or (str(row.get("uri") or "") not in old_bases
+                and str(row.get("reference_role") or "")
+                not in {"revision_base", "qc_revision_base"})]
+        payload.pop("candidate_revision_base", None)
+        payload.pop("candidate_revision_base_binding", None)
+        payload.pop("source_qc_uri", None)
+        payload["revision_mode"] = "regenerate_clean"
+        return sorted(old_bases)
 
     def _bind_candidate_revision_base(
             self, payload, selected, *, generation_round, replace=True):
@@ -7804,6 +7844,28 @@ class Director:
         restored["_candidate_generation_round"] = generation_round
         restored["_max_candidate_rounds"] = max_rounds
         restored["_candidate_round_history"] = history
+        try:
+            legacy_expected = int(
+                live_group.get("expected_count")
+                or state.get("resume_payload", {}).get(
+                    "_gacha_pulls_override") or 1)
+        except (TypeError, ValueError, AttributeError):
+            legacy_expected = 1
+        if legacy_expected > 1:
+            # Four-slot checkpoints remain immutable audit history, but the
+            # new single-image policy must not resume slot 2/3/4 or silently
+            # reuse a partial old set as the new repair result.  The caller
+            # starts a fresh one-slot candidate set with this exact contract.
+            restored["_legacy_multi_candidate_checkpoint"] = {
+                "candidate_set_id": str(
+                    live_group.get("candidate_set_id") or ""),
+                "candidate_set_token": str(
+                    live_group.get("candidate_set_token") or ""),
+                "expected_count": legacy_expected,
+                "candidate_count": len(
+                    live_group.get("candidates") or []),
+                "generation_round": generation_round,
+            }
         best = copy.deepcopy(state.get("best_provisional") or {})
         if best:
             restored["_candidate_best_provisional"] = best
@@ -7824,10 +7886,20 @@ class Director:
 
     def _generate_selection_candidates_parallel(
             self, capability, payload, out_dir, cancel, qc_spec, pulls):
-        """四路候选真并行：一次审核冻结合同，各自写独立目录。"""
+        """生成本轮唯一镜头图；旧四图调用也强制收敛到一个槽位。"""
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         working_payload = copy.deepcopy(payload or {})
+        try:
+            requested_pulls = int(pulls)
+        except (TypeError, ValueError):
+            requested_pulls = 1
+        if requested_pulls != 1:
+            self.log.warn(
+                "director",
+                f"旧镜头候选调用请求{requested_pulls}张，已按当前单图"
+                "连续精修规则强制为1张")
+        pulls = 1
         progress_callback = working_payload.pop(
             "_candidate_progress_callback", None)
         resume_state = working_payload.pop(
@@ -7880,15 +7952,15 @@ class Director:
 
         if not isinstance(working_payload.get("reference_manifest"), list):
             self._attach_reference_manifest(working_payload)
-        # Prompt review 与内容 QC 是两个闸门；选片模式仍先审核
-        # 并冻结一份精准提示词，不让4个worker各自改写。
+        # Prompt review 与内容 QC 是两个闸门；单图轮仍先审核并冻结一份
+        # 精准提示词，使断点恢复和下一轮 revision_base 可确定复用。
         review = None
         if self._prompt_review_enabled():
             # Always enter the single group-level review funnel once.  The
             # router is idempotent for an already canonical approved prompt,
             # while old checkpoints whose stored multiline prompt is not a
-            # sanitizer fixed point are normalized/reviewed here before the
-            # four workers are forked.
+            # sanitizer fixed point are normalized/reviewed here before
+            # generation.
             review = self.router.review_image_prompt(
                 capability, working_payload, out_dir, cancel=cancel)
         review_cost = float(review.cost or 0.0) if review is not None else 0.0
@@ -7998,8 +8070,8 @@ class Director:
                     == self._stable_hash(frozen_prompt)
                     and not str(candidate_payload.get(
                         "feedback") or "").strip()):
-                # 本轮已经在 fan-out 前完成一次真实统一审核。四个 worker
-                # 必须执行同一冻结稿，严禁各自随机复审、改词或分叉判定。
+                # 本轮已经在生成前完成一次真实统一审核。唯一 worker 必须
+                # 执行同一冻结稿；下一轮只有显式修订后才允许产生新合同。
                 # 旧兼容断点可能只有 approved/hash 而没有完整优化稿；
                 # 这种不完整审计仍走路由器幂等校验，不冒充冻结锁。
                 candidate_payload[
@@ -8038,6 +8110,7 @@ class Director:
                 "passed": bool(report.get("passed")),
                 "score": self._image_qc_selection_score(report),
                 "issues": list(report.get("issues") or [])[:8],
+                "qc_report": copy.deepcopy(report),
                 "ranking_unavailable": bool(
                     report.get("ranking_unavailable")),
                 "qc_disabled": bool(report.get("qc_disabled")),
@@ -8178,10 +8251,8 @@ class Director:
             if not indices:
                 return
             with ThreadPoolExecutor(
-                    # Four slots are mandatory, but the provider concurrency
-                    # ceiling is still authoritative.  With a configured
-                    # capacity below four, fill the four slots in waves
-                    # instead of bursting past the API/account limit.
+                    # 这里保留统一 worker 调度与技术补位机制；当前镜头轮
+                    # 固定只有一个槽位。
                     max_workers=min(
                         len(indices), self._total_image_workers()),
                     thread_name_prefix="aifos-shot-candidate") as pool:
@@ -8226,7 +8297,7 @@ class Director:
             index for index in range(1, pulls + 1)
             if index not in results]
         run_wave(missing, 1)
-        # API/文件落盘等技术错误只补该槽位一次，不牵连另外三张。
+        # API/文件落盘等技术错误只补当前唯一槽位一次。
         run_wave(sorted(failures), 2)
 
         ordered = [results[index] for index in sorted(results)]
@@ -8236,7 +8307,7 @@ class Director:
         same_references = all(
             row["reference_hash"] == frozen_reference_hash
             for row in candidates)
-        # 槽位完整度只用于审计，不能再成为镜头门禁。每轮四抽中只要
+        # 槽位完整度只用于审计，不能再成为镜头门禁。每轮单图只要
         # 至少有一张通过技术完整性检查，就由 AI 在现有可用图中选优并
         # 继续；只有零张可用才是 technical_incomplete。
         usable_count = len(candidates)
@@ -8294,8 +8365,8 @@ class Director:
                 # 必须是首个 eligible 候选并走 image_uri，剩余 eligible
                 # 候选作为真实图片块加入 manifest；failed/stale/技术坏图
                 # 不得因固定 candidates[0] 而被上传或参与比较。
-                # 之后才附本轮身份/场景/空间参考，确保是“四图同屏比较”
-                # 而不是只看第一张、凭路径猜另外三张。
+                # 之后才附本轮身份/场景/空间参考。当前单图模式不会进入
+                # 这条比较分支；它只为读取旧多图结果保留。
                 for position, candidate in enumerate(
                         eligible_candidates[1:], 2):
                     candidate_index = int(
@@ -8353,7 +8424,7 @@ class Director:
                     model=str(getattr(comparison, "model", "") or ""))
             except (AifosError, ProviderUnavailable, ProviderError) as exc:
                 self.log.warn(
-                    "director", "四图同屏比较暂不可用，已用冻结单图分数稳定"
+                    "director", "候选同屏比较暂不可用，已用冻结单图分数稳定"
                     f"回退且不阻断：{str(exc)[:180]}")
         winner_id = str(
             comparative_ranking.get("winner_candidate_id") or "")
@@ -8465,8 +8536,8 @@ class Director:
         if slot_complete:
             self.log.info(
                 "director",
-                f"镜头{working_payload.get('shot_no', '')} {pulls}张候选已"
-                "并行完成，交由AI导演自动选优")
+                f"镜头{working_payload.get('shot_no', '')} 本轮单图已完成，"
+                "直接采用该图质检结论")
         elif complete:
             self.log.warn(
                 "director",
@@ -8592,7 +8663,7 @@ class Director:
         return selected
 
     def _manual_promote_generated_candidate_group(self, selected):
-        """在当前四图波次收尾后兑现生产中人工预选。"""
+        """在当前单图轮收尾后兑现人工覆盖；兼容旧多图历史组。"""
         data = getattr(selected, "data", None) or {}
         group = data.get("candidate_group") or {}
         request = group.get("manual_selection_request") or {}
@@ -8702,14 +8773,17 @@ class Director:
         select_after_all = bool(
             (payload or {}).get("_gacha_select_best_after_all")
             or selection_group)
-        if pulls <= 1 or capability != "image":
-            return self._generate_image_with_qc(
-                capability, payload, out_dir, cancel, qc_spec)
+        # 镜头单图轮仍必须走候选组封装：断点、轮次历史、AI晋升和
+        # revision_base 链都依赖 candidate_group。只有普通非镜头单抽
+        # 才直接调用单图生成，角色/道具母资产的四候选逻辑保持不变。
         if selection_group:
             return self._generate_selection_candidates_parallel(
                 capability, payload, out_dir, cancel, qc_spec, pulls)
-        # 旧连抽依赖 QC 选优；新选片组即使关闭内容 QC，
-        # 也必须完整产出4张供人工选择。
+        if pulls <= 1 or capability != "image":
+            return self._generate_image_with_qc(
+                capability, payload, out_dir, cancel, qc_spec)
+        # 旧连抽依赖 QC 选优；镜头候选组即使关闭内容 QC，也必须完整
+        # 产出本轮单图并落下可恢复的候选组事实。
         if (not selection_group
                 and (not qc_spec or not self._image_qc_enabled())):
             return self._generate_image_with_qc(
@@ -8833,7 +8907,7 @@ class Director:
 
         通过优先级高于一切；同为通过或同为失败时，再按画面判定、身份、
         性别、服装、人数、叠层、物理和空间八项逐项计分，最后用问题数
-        破平。这样四张候选不会按生成顺序碰运气选中。
+        破平。镜头单图轮直接使用本图分数；旧多图历史仍可稳定排序。
         """
         report = report if isinstance(report, dict) else {}
         score = 1000.0 if report.get("passed") else 0.0
@@ -8934,9 +9008,9 @@ class Director:
 
         Ordinary one-shot images and historical non-repair gacha remain
         reusable.  A persisted ``select_after_all`` repair group is reusable
-        only when all three candidate hashes equal the frozen reviewed prompt.
-        This prevents an older buggy run (which re-applied stale feedback on
-        pulls 2/3) from being registered or silently reused after restart.
+        only when every candidate hash equals the frozen reviewed prompt.
+        New groups contain one image; historical 3/4-image repair groups remain
+        reusable when every saved candidate proves the same frozen contract.
         """
         qc = (
             (plan_item or {}).get("qc") or {}
@@ -8948,7 +9022,7 @@ class Director:
         frozen = str(gacha.get("frozen_prompt_hash") or "")
         pulls = int(gacha.get("pulls") or 0)
         return bool(
-            pulls in (3, 4)
+            pulls in (1, 3, 4)
             and gacha.get("same_prompt") is True
             and 0 < len(candidates) <= pulls
             and frozen
@@ -8983,7 +9057,7 @@ class Director:
 
     @staticmethod
     def _shot_candidate_group_valid(plan_item):
-        """首轮/问题返工四候选有可用图且已选片即可复用。"""
+        """首轮/问题返工有可用图且已由AI或人工晋升即可复用。"""
         group = (plan_item or {}).get("candidate_group") or {}
         if not isinstance(group, dict):
             return False
@@ -8994,7 +9068,10 @@ class Director:
         repair_group = bool(group.get("repair_batch"))
         selection = group.get("selection") or {}
         allowed_size = bool(
-            expected == 4
+            expected == 1
+            # 升级前已经完成的四图组保持可读、可人工改选；只允许复用
+            # 已落盘组，不会让新调度重新生成四张。
+            or expected == 4
             or (expected == 3 and repair_group
                 and selection.get("source") == "ai"))
         if (group.get("schema") != "aifos.shot-candidate-group/v1"
@@ -9456,13 +9533,12 @@ class Director:
 
     def _generate_shot_candidate_group(
             self, capability, payload, out_dir, cancel, qc_spec):
-        """每轮四候选、最多十轮的非阻断关键帧质检/返修闭环。
+        """每轮一张、最多十轮的非阻断关键帧质检/返修闭环。
 
-        首轮也计入十轮上限。每轮四张必须共享同一份冻结提示词和参考图；
-        任一候选真正通过内容 QC 即由 AI 在合格候选中选优收口。四张全败
-        时，Codex 只做一次整组归因，下一轮使用替换式短合同与安全重绑后
-        的参考图，绝不把历轮错误原文继续堆进生成提示词。第十轮仍未通过
-        时选择十轮中的相对最优稿并登记风险，但不阻断其他镜头或下游。
+        首轮也计入十轮上限。首轮生成一张；明确不合格时，Codex 归因并
+        优化提示词，把该失败图作为下一轮唯一 revision_base 做定向图像
+        编辑，再生成一张。每轮都替换旧基底，禁止历轮失败图混用。第十轮
+        仍未通过时选择十轮中的相对最优稿并登记风险，但不阻断其他镜头。
         """
         candidate_payload = copy.deepcopy(payload or {})
         max_rounds = self._shot_max_candidate_rounds()
@@ -9493,6 +9569,9 @@ class Director:
             # otherwise bind the persisted same-shot winner before this round's
             # resume contract is frozen.
             if (generation_round > 1 and best_provisional is not None
+                    and str(candidate_payload.get("revision_mode") or "")
+                    not in {"regenerate_clean", "fresh_redraw"}
+                    and not candidate_payload.get("structural_retry_reason")
                     and not self._candidate_revision_base_uris(
                         candidate_payload)):
                 restored_binding = self._bind_candidate_revision_base(
@@ -9508,8 +9587,10 @@ class Director:
             candidate_payload["_max_candidate_rounds"] = max_rounds
             candidate_payload["_selection_candidate_group"] = True
             candidate_payload["_qc_candidate_only"] = True
-            candidate_payload["_gacha_pulls_override"] = \
+            candidate_payload["_gacha_pulls_override"] = (
                 self._shot_candidate_count()
+                if generation_round == 1
+                else self._shot_repair_candidate_count())
             candidate_payload["_gacha_select_best_after_all"] = True
             candidate_payload["_candidate_round_history"] = copy.deepcopy(
                 round_history)
@@ -9687,7 +9768,7 @@ class Director:
                 chosen = best_provisional or promoted
                 chosen = self._promote_relative_best_nonblocking(
                     chosen,
-                    f"已完成{max_rounds}轮、每轮4张，仍无内容质检合格稿；"
+                    f"已完成{max_rounds}轮、每轮1张，仍无内容质检合格稿；"
                     "已从全部候选中选择相对最优并登记风险")
                 chosen.cost = total_cost
                 chosen_group = (chosen.data or {}).get(
@@ -9707,8 +9788,8 @@ class Director:
                 chosen.data["candidate_round_history"] = round_history
                 return chosen
 
-            # 四张全败：汇总共同问题 + 相对最优稿问题，只做一次 Codex
-            # 根因分析。本轮完整判词留在审计，下一轮只带替换后的短合同。
+            # 本轮单图失败：Codex 做一次根因分析。本轮完整判词留在审计，
+            # 下一轮只带替换后的短合同，并以本图作为唯一修改基底。
             issue_counts = {}
             for row in candidates:
                 for issue in dict.fromkeys(
@@ -9752,6 +9833,18 @@ class Director:
                 "revision_categories": revision["categories"],
                 "generation_input": copy.deepcopy(generation_input),
             }
+            best_qc_report = (
+                best.get("qc_report")
+                if isinstance(best.get("qc_report"), dict) else {})
+            for key in (
+                    "identity_checked", "identity_match",
+                    "gender_checked", "gender_match",
+                    "count_checked", "count_match",
+                    "scene_topology_checked", "scene_topology_match",
+                    "camera_deviation"):
+                if key in best_qc_report:
+                    aggregate_report[key] = copy.deepcopy(
+                        best_qc_report[key])
             aggregate_report, escalation_cost = \
                 self._escalate_failed_image_to_codex(
                     aggregate_report, qc_spec or {},
@@ -9794,11 +9887,26 @@ class Director:
             if applied["applied"]:
                 repair_payload["qc_reference_changes"] = copy.deepcopy(
                     applied)
-            base_binding = self._bind_candidate_revision_base(
-                repair_payload, promoted,
-                generation_round=generation_round, replace=True)
-            repair_payload["candidate_revision_base_binding"] = \
-                copy.deepcopy(base_binding)
+            repair_diagnostics = (
+                aggregate_report.get("input_diagnosis") or diagnostics)
+            pre_codex_diagnostics = (
+                aggregate_report.get("pre_codex_input_diagnosis") or {})
+            safe_to_edit = (
+                self._use_failed_image_as_revision_base(
+                    repair_diagnostics, aggregate_report)
+                and self._use_failed_image_as_revision_base(
+                    pre_codex_diagnostics))
+            if safe_to_edit:
+                repair_payload.pop("structural_retry_reason", None)
+                base_binding = self._bind_candidate_revision_base(
+                    repair_payload, promoted,
+                    generation_round=generation_round, replace=True)
+                repair_payload["candidate_revision_base_binding"] = \
+                    copy.deepcopy(base_binding)
+            else:
+                self._clear_candidate_revision_base(repair_payload)
+                repair_payload["structural_retry_reason"] = (
+                    "identity_count_or_reference_conflict")
             self._attach_reference_manifest(repair_payload)
             next_input = self._image_generation_input(
                 repair_payload, qc_spec=repair_qc_spec)
@@ -9839,7 +9947,7 @@ class Director:
 
     def _generate_repair_candidate_group(
             self, capability, payload, out_dir, cancel, qc_spec):
-        """问题镜头修正合同后并行补抽四张；只在出现合格稿时晋升。"""
+        """问题镜头修正合同后编辑一张；只在出现合格稿时晋升。"""
         candidate_payload = copy.deepcopy(payload or {})
         candidate_payload["qc_consecutive_failures_base"] = max(
             1, int(candidate_payload.get(
@@ -10032,12 +10140,9 @@ class Director:
                 if payload.get("_codex_profile"):
                     qc_payload["_codex_profile"] = payload[
                         "_codex_profile"]
-                # 修订后四抽本身已经要求每张都走完整单路视觉质检。若再
-                # 对四张逐一启用双路会诊，会把一次抽卡轮放大成 8 次
-                # Codex 视觉调用；会诊的价值是定位失败根因，不是重复给
-                # 独立随机样本判两遍。候选组四张各检一次，四张全败后再
-                # 对自动选出的最高分稿执行 Codex 升级分析，既保留全量
-                # 质检和自动修复闭环，也避免无效等待。
+                # 镜头候选轮已经要求当前图片走完整单路视觉质检；失败后
+                # 再由 Codex 做一次升级分析。双路会诊不在候选 worker 内
+                # 重复执行，避免同一图片被重复判定造成额度翻倍。
                 dual = (
                     not payload.get("_qc_candidate_only")
                     and self._dual_review_enabled(
@@ -10195,13 +10300,12 @@ class Director:
                 getattr(qc_result, "model", "") or "")
             report["score"] = self._image_qc_selection_score(report)
             result.qc = report
-            # 修订后的四张候选只负责独立成像与判分。每张失败都再次让
-            # Codex 改合同会让四张使用不同输入，失去“同一修订合同抽卡
-            # 选优”的意义；四张全败后才对最高分候选做下一轮根因分析。
+            # 候选 worker 只负责按冻结合同成像与判分；失败后的 Codex
+            # 根因分析由外层逐轮闭环统一执行，避免单图内部重复返修。
             if payload.get("_qc_candidate_only"):
                 return result
-            # 第一次失败就升级 Codex:出诊断 + 改提示词,随后本轮继续按新提示词
-            # 进入四张候选抽卡;四张全败后再对最高分候选做下一轮分析。
+            # 第一次失败就升级 Codex：出诊断并改提示词，随后进入下一轮
+            # 单图定向编辑。
             if (not report["passed"]
                     and report["consecutive_failures"] >= 1):
                 report, escalation_cost = \
@@ -10222,7 +10326,8 @@ class Director:
             # 只会打地鼠(实测镜头21 四轮 5→7→10 条,还撞出新的身份漂移)。
             # 改为丢掉"待修改基底"重新起画——重抽比死磕更省更准。
             if (report["consecutive_failures"] >= 2
-                    and not payload.get("_qc_fresh_redraw")):
+                    and not payload.get("_qc_fresh_redraw")
+                    and payload.get("shot_no") is None):
                 repeated = self._repeated_core_issues(attempt_history)
                 if repeated:
                     payload = copy.deepcopy(payload)
@@ -10305,28 +10410,55 @@ class Director:
                     next_revision_round(
                         next_payload.get("feedback"),
                         next_payload.get("prompt_review_feedback_applied")))
-            if ((patch or reference_changes["applied"])
-                    and not contract_replaced
-                    and self._use_failed_image_as_revision_base(diagnostics)):
+            # 单图返修优先把失败图作为唯一 revision_base 做局部编辑；但
+            # 人数、身份、物种、整场景/参考冲突属于结构性污染，继续拿它
+            # 做底图会把错误一并复制到下一轮。镜头任务也必须遵守同一
+            # 安全判定：局部缺陷编辑，结构性缺陷保留锁定参考重新生成。
+            use_revision_base = (
+                self._use_failed_image_as_revision_base(
+                    diagnostics, report)
+                and self._use_failed_image_as_revision_base(
+                    report.get("pre_codex_input_diagnosis") or {}))
+            if ((patch or reference_changes["applied"] or contract_replaced)
+                    and use_revision_base):
+                old_bases = set(
+                    self._candidate_revision_base_uris(next_payload))
                 references = [uri]
-                references.extend(next_payload.get("reference_images") or [])
-                next_payload["reference_images"] = list(
-                    dict.fromkeys(references))
+                references.extend(
+                    ref for ref in next_payload.get("reference_images") or []
+                    if str(ref) not in old_bases and str(ref) != str(uri))
+                next_payload["reference_images"] = references
                 matches = [
                     match for match in (
                         next_payload.get("asset_matches") or [])
-                    if match.get("uri") != uri]
+                    if (match.get("uri") != uri
+                        and match.get("uri") not in old_bases
+                        and match.get("reference_role") != "revision_base")]
                 matches.append({
                     "asset_id": None, "kind": "qc_revision_base",
                     "name": f"qc_attempt_{attempts + 1}",
                     "label": "质检未过的待修改基底", "uri": uri,
                     "reference_role": "revision_base",
+                    "mandatory": True,
+                    "scene_id": str(
+                        next_payload.get("physical_scene_id")
+                        or next_payload.get("scene_id")
+                        or next_payload.get("location") or ""),
+                    "shot_no": next_payload.get("shot_no"),
+                    "canonical_scene_asset_id": next_payload.get(
+                        "canonical_scene_asset_id"),
+                    "canonical_scene_reference_uri": str(
+                        next_payload.get("canonical_scene_reference_uri")
+                        or next_payload.get("scene_ref") or ""),
                 })
                 next_payload["asset_matches"] = matches
+            elif not use_revision_base:
+                self._clear_candidate_revision_base(next_payload)
             next_payload["qc_revision"] = revision
             next_payload["qc_attempt"] = attempts + 1
-            next_payload["revision_mode"] = "targeted_qc_fix"
-            next_payload["source_qc_uri"] = uri
+            if use_revision_base:
+                next_payload["revision_mode"] = "targeted_qc_fix"
+                next_payload["source_qc_uri"] = uri
             self._attach_reference_manifest(next_payload)
             next_payload["require_reference_images"] = bool(
                 next_payload.get("reference_manifest"))
@@ -10386,25 +10518,18 @@ class Director:
             ]
             if (capability == "image"
                     and report["consecutive_failures"] == 1):
-                # 旧严格内容QC规则:首图失败→Codex 修订→第二轮固定重生
-                # 四张→四张全部质检后选最符合的一张。候选共享同一修订合同，
-                # 不使用失败图作逐张修图基底，确保抽的是独立随机样本。
+                # 兼容旧严格单图入口：首图失败后进入统一单图返修器；
+                # 局部缺陷编辑失败图，结构性缺陷按锁定参考干净重生。
                 candidate_payload = copy.deepcopy(next_payload)
                 candidate_payload["qc_consecutive_failures_base"] = 1
-                candidate_payload.pop("source_qc_uri", None)
-                candidate_payload["reference_images"] = [
-                    ref for ref in (
-                        candidate_payload.get("reference_images") or [])
-                    if ref != uri]
-                candidate_payload["asset_matches"] = [
-                    match for match in (
-                        candidate_payload.get("asset_matches") or [])
-                    if match.get("reference_role") != "revision_base"]
                 self._attach_reference_manifest(candidate_payload)
                 self.log.info(
                     "director",
                     f"{qc_spec.get('item_id') or '本图'}首图质检未过，"
-                    "Codex 修订已应用；下一轮固定生成4张并全量质检选优")
+                    "Codex 修订已应用；下一轮"
+                    + ("以失败图为基底编辑1张并复检"
+                       if use_revision_base else
+                       "丢弃结构性坏基底，按锁定参考重生1张并复检"))
                 selected = self._generate_repair_candidate_group(
                     capability, candidate_payload, out_dir, cancel, qc_spec)
                 selected.cost += float(result.cost or 0.0)
@@ -10419,7 +10544,7 @@ class Director:
                     *(report.get("issues") or []),
                     *(selected_report.get("lesson_issues") or []),
                 ]))
-                selected_report["generation_attempts"] = 4
+                selected_report["generation_attempts"] = 1
                 selected.qc = selected_report
                 return selected
             spent = result.cost
@@ -10866,7 +10991,7 @@ class Director:
             "director",
             f"{item_id} 生成前审核冲突已自动就地修复"
             f"(第 {next_round} 次)，继续"
-            f"{'本轮同提示词四抽' if visual_repair_batch else '首轮同提示词四抽'}: "
+            f"{'本轮单图精修' if visual_repair_batch else '首轮单图生成'}: "
             f"{summary[:140]}")
         return summary or "生成前审核冲突已自动修复"
 
@@ -11001,8 +11126,8 @@ class Director:
                 payload = task.get("payload") or {}
                 if (task["capability"] == "image"
                         and str(task.get("item_id") or "").startswith("shot:")):
-                    # 镜头关键帧首轮即冻结合同并4路并行；
-                    # 严格QC模式的修订轮同样保持4候选。
+                    # 镜头关键帧首轮即冻结合同生成1张；
+                    # 严格QC模式的修订轮同样只编辑1张。
                     generate = self._generate_shot_candidate_group
                     result = generate(
                         task["capability"], task["payload"],
@@ -11103,8 +11228,8 @@ class Director:
                         ctx, task, error="已手动停止生成")
                     # Preserve both the first-failure diagnosis and the fact
                     # that this task was already inside its repair candidate
-                    # group. After restart it must continue with three
-                    # same-prompt candidates.
+                    # group. After restart it must continue from the saved
+                    # single-image round without recreating completed work.
                     self._plan_mark(
                         ctx, task["item_id"], "pending",
                         extra={
@@ -11853,8 +11978,8 @@ class Director:
                     if critical_error:
                         # 并行关键帧入口此前漏掉了串行入口已有的自动执行：
                         # Codex 指令写进报告后直接落 awaiting_human。现在
-                        # 主线程先落实合同修订，再把同一镜头以“四候选全量
-                        # 选优”重新放回 worker 池，无需人工确认。
+                        # 主线程先落实合同修订，再把同一镜头以“单图定向
+                        # 精修”重新放回 worker 池，无需人工确认。
                         repair = self._auto_apply_codex_escalation(
                             ctx, task, result)
                         if repair:
@@ -19795,8 +19920,8 @@ class Director:
             if (item.get("category") == "shot_image"
                     and item.get("status") in ("awaiting_human", "failed")):
                 # 历史红牌不得继续作为隐形人工闸门，不受 selection_mode
-                # 或内容质检开关影响。旧单图不伪装成新四候选，统一回到
-                # pending，按“每轮四张→Codex修词/重选参考→最多十轮”迁移。
+                # 或内容质检开关影响。旧失败统一回到 pending，按“每轮1张
+                # →Codex修词/重选参考并以上轮为基底→最多十轮”迁移。
                 previous = item.get("status")
                 item["status"] = "pending"
                 item["error"] = ""
@@ -19865,9 +19990,9 @@ class Director:
                 if has_candidate_group else True)
             if (not image_content_qc and has_candidate_group
                     and not candidate_group_valid):
-                # 新候选记录必须证明4张均已落盘；没有 candidate_group 字段
+                # 新候选记录必须证明本轮单图已落盘；没有 candidate_group 字段
                 # 的旧存量仍按旧资产+镜头内容哈希规则复用，不能被升级时
-                # 误判成“缺4张”而整集重画。
+                # 误判成“缺图”而整集重画。
                 if item.get("status") != "pending":
                     item["status"] = "pending"
                     changed = True
@@ -19896,7 +20021,7 @@ class Director:
                     and not best_effort_promoted):
                 # 质检负责发现问题并给下一轮修词，不再把阶段锁死。
                 # 只有满 10 轮后由候选器以 best_effort_promoted 收口；
-                # 未到该状态的旧失败一律回 pending 自动四抽。
+                # 未到该状态的旧失败一律回 pending 自动单图精修。
                 if item.get("status") != "pending":
                     item["status"] = "pending"
                     changed = True
@@ -20170,7 +20295,7 @@ class Director:
         reconciliation = self.reconcile_completed_shot_images(ctx)
         # 断点里已经有 Codex 最终修改指令的旧失败镜头，不能重新从首图
         # 开始、更不能继续等人工。先把指令落实到当前分镜合同，随后直接
-        # 进入同一新版提示词的四候选全量抽卡。
+        # 进入同一新版提示词的单图精准返修。
         # 生产画布:出图一开始就落盘人物/场景/镜头关系线,
         # 前端画布与出图/质检提示词共用,牵引人物关联性不漂移
         ctx["relations"] = write_relations(
@@ -20253,7 +20378,7 @@ class Director:
                 self.log.warn(
                     "director",
                     f"镜头{shot['shot_no']}生成前合同有问题，"
-                    f"已交AI导演就地修正一次，首轮仍固定四抽；"
+                    f"已交AI导演就地修正一次，首轮仍固定生成1张；"
                     f"不停止其他镜头：{reason[:500]}")
             current_content_hash = self._shot_content_hash(shot, payload)
             payload["_base_shot_content_hash"] = current_content_hash
@@ -20275,7 +20400,7 @@ class Director:
                     "director",
                     f"镜头{shot['shot_no']} 候选合同哈希已变，"
                     "旧候选图与冻结提示词仅保留历史，"
-                    "本轮重新四抽")
+                    "本轮重新生成1张")
             prior_group = (
                 stored_prior.get("candidate_group") or {}
                 if candidate_contract_current else {})
@@ -20322,11 +20447,31 @@ class Director:
                     f"镜头{shot['shot_no']} 已恢复第"
                     f"{payload.get('_candidate_generation_round')}轮精准"
                     "返修合同、前轮历史与跨轮最佳稿")
+            legacy_multi_checkpoint = payload.pop(
+                "_legacy_multi_candidate_checkpoint", None)
+            if legacy_multi_checkpoint:
+                # Keep the repaired prompt and completed round history, but do
+                # not continue the old 4-slot set.  A fresh token with one slot
+                # prevents slot 1 of a partial old group from masquerading as
+                # the new single-image repair result.
+                resumable_live_group = False
+                payload.pop("_candidate_set_id", None)
+                payload.pop("_resume_candidate_group", None)
+                payload["_legacy_candidate_checkpoint"] = copy.deepcopy(
+                    legacy_multi_checkpoint)
+                payload["_candidate_revision"] = max(
+                    int(payload.get("_candidate_revision") or 1),
+                    prior_candidate_revision + 1)
+                self.log.info(
+                    "director",
+                    f"镜头{shot['shot_no']} 已保留旧"
+                    f"{legacy_multi_checkpoint.get('expected_count')}张候选"
+                    "断点为历史；当前精准合同改用全新1张轮次继续")
             if resumable_live_group:
                 # 上次进程若已完成 0–3 个槽位，先恢复本轮精准合同；已
                 # 落盘槽位再由候选器逐一核验，避免服务重启重复扣费。
                 # 真正复用仍由候选器核对 token、三项冻结哈希、文件解码
-                # 与槽位版本；任一不符就自然回退成全新四抽。
+                # 与槽位版本；任一不符就自然回退成全新单图轮。
                 payload["_candidate_set_id"] = live_group[
                     "candidate_set_id"]
                 payload["_candidate_revision"] = max(
@@ -20358,9 +20503,57 @@ class Director:
                     "_contract_revision": max(
                         1, int(prior_group.get("contract_revision") or 1)),
                 })
+                revision_base_uri = str(
+                    prior_group.get("revision_base_uri") or "").strip()
+                if revision_base_uri and (
+                        revision_base_uri.startswith(("http://", "https://"))
+                        or Path(revision_base_uri).is_file()):
+                    self._clear_candidate_revision_base(payload)
+                    payload["reference_images"] = [
+                        revision_base_uri,
+                        *(payload.get("reference_images") or []),
+                    ]
+                    payload.setdefault("asset_matches", []).append({
+                        "asset_id": None,
+                        "kind": "manual_revision_base",
+                        "name": f"shot_{shot_no:03d}_manual_edit_base",
+                        "label": "本镜当前关键帧（待修改基底）",
+                        "uri": revision_base_uri,
+                        "reference_role": "revision_base",
+                        "mandatory": True,
+                        "scene_id": str(
+                            payload.get("physical_scene_id")
+                            or payload.get("scene_id")
+                            or payload.get("location") or ""),
+                        "shot_no": shot_no,
+                        "canonical_scene_asset_id": payload.get(
+                            "canonical_scene_asset_id"),
+                        "canonical_scene_reference_uri": str(
+                            payload.get("canonical_scene_reference_uri")
+                            or payload.get("scene_ref") or ""),
+                    })
+                    payload["source_qc_uri"] = revision_base_uri
+                    payload["revision_mode"] = "targeted_qc_fix"
+                    payload["candidate_revision_base"] = {
+                        "schema": "aifos.candidate-revision-base/v1",
+                        "uri": revision_base_uri,
+                        "source_candidate_set_id": str(
+                            prior_group.get(
+                                "revision_base_source_candidate_set_id")
+                            or ""),
+                        "source_generation_round": int(
+                            prior_group.get("generation_round") or 0),
+                        "physical_scene_id": str(
+                            payload.get("physical_scene_id")
+                            or payload.get("scene_id")
+                            or payload.get("location") or ""),
+                        "shot_no": shot_no,
+                    }
+                    self._attach_reference_manifest(payload)
             if (stored_prior.get("status") == "technical_incomplete"
                     and isinstance(prior_group, dict)
-                    and prior_group.get("candidate_set_id")):
+                    and prior_group.get("candidate_set_id")
+                    and not legacy_multi_checkpoint):
                 payload["_candidate_set_id"] = prior_group[
                     "candidate_set_id"]
                 payload["_candidate_revision"] = max(
@@ -20500,7 +20693,7 @@ class Director:
                 self._register_completed_shot_result(
                     ctx, current_shot, current_quality, result,
                     payload=current_task["payload"]))
-            # 预览片不承接旧 QC 失败轮次、四抽修复或 Codex 升级指令；
+            # 预览片不承接旧 QC 失败轮次、单图修复或 Codex 升级指令；
             # 直接按当前已编译镜头合同生成一次，避免“已关闭质检”仍被
             # 历史质检状态拉回编剧修复/候选选优链。
             stored = (
@@ -20583,7 +20776,7 @@ class Director:
                     1, failure_base)
             # 旧版 Codex escalation 有些只写 triggered + 具体指令，没有
             # status=completed。只要质检明确失败且指令可执行，就应在断点
-            # 恢复时直接落实，不能因为一个兼容字段缺失又白画同一轮四张。
+            # 恢复时直接落实，不能因为一个兼容字段缺失又白画同一轮图片。
             resumable_escalation = bool(
                 stored_escalation.get("triggered")
                 and str(stored_escalation.get(
@@ -20605,12 +20798,12 @@ class Director:
                     self.log.info(
                         "director",
                         f"{task['item_id']} 已承接断点中的 Codex 修改指令，"
-                        "本轮直接生成4张候选并全部质检选优")
+                        "本轮直接以失败图为基底编辑1张并复检")
             elif resumed_repair_group:
                 self.log.info(
                     "director",
-                    f"{task['item_id']} 上一轮四候选因产线中断未完成，"
-                    "已从修订合同断点恢复并继续固定4张并行质检选优")
+                    f"{task['item_id']} 上一轮单图因产线中断未完成，"
+                    "已从修订合同断点恢复并继续生成1张复检")
             if unresolved_prior_failure:
                 repair_instruction = str(
                     stored_escalation.get("instruction_to_aifos")
@@ -20640,7 +20833,7 @@ class Director:
                 self.log.info(
                     "director",
                     f"{task['item_id']} 历史失败稿未曾由AI选优晋升；"
-                    "已舍弃旧冲突合同并直接进入固定4张修订组")
+                    "已舍弃旧冲突合同并直接进入固定1张修订轮")
             payload = task["payload"]
             quality_by_shot[shot["shot_no"]] = payload["quality_decision"]
             payload_by_shot[shot["shot_no"]] = payload
@@ -20692,7 +20885,7 @@ class Director:
             wave_results, wave_failures = self._run_parallel(
                 ctx, wave_tasks,
                 line=(f"关键帧连续性链第{depth + 1}轮·"
-                      f"{len(wave_tasks)}组并行·每镜四候选"),
+                      f"{len(wave_tasks)}组并行·每镜1张"),
                 continue_on_qc_failure=True,
                 preserve_task_scope=True)
             for task, error in wave_failures:
@@ -26650,9 +26843,8 @@ class Director:
                     revision_base = candidate
             allow_revision_base = (
                 revision_source != "batch_current_contract"
-                and (not plan_diagnostics.get("diagnosis_complete")
-                     or self._use_failed_image_as_revision_base(
-                         plan_diagnostics)))
+                and self._use_failed_image_as_revision_base(
+                    plan_diagnostics, old_qc))
             if (revision_base and allow_revision_base
                     and (revision_base.startswith(("http://", "https://"))
                          or Path(revision_base).exists())):
@@ -26680,7 +26872,7 @@ class Director:
             if codex_profile:
                 payload["_codex_profile"] = str(codex_profile)
             # 问题镜头禁止再走旧版单张 ``_plan_run``。修订合同只允许
-            # 每轮四张同词并行候选，AI导演逐张质检并自动选优；不合格时
+            # 每轮只生成1张，AI导演质检；不合格时以上轮失败图为基底，
             # Codex继续修词与重选参考图，最多十轮，不等待手机操作。
             payload["_autonomous_repair_seeded"] = True
             payload["_candidate_revision"] = max(
@@ -26701,7 +26893,7 @@ class Director:
                 ctx, task, continue_on_qc_failure=True)
             if result is None or not str(getattr(result, "uri", "") or ""):
                 raise AifosError(
-                    f"镜头{shot_no}本轮四张返工候选均无技术可用产物；"
+                    f"镜头{shot_no}本轮返工图无技术可用产物；"
                     "已保留诊断，其他镜头可继续")
             if prompt_override:
                 # render_plan.prompt 是用户在修改框里提交的可编辑原文；
@@ -26792,9 +26984,8 @@ class Director:
             state = (shot.get("start_state", {}) if kind == "first_frame"
                      else shot.get("end_state", {}))
             use_current_revision_base = (
-                not plan_diagnostics.get("diagnosis_complete")
-                or self._use_failed_image_as_revision_base(
-                    plan_diagnostics))
+                self._use_failed_image_as_revision_base(
+                    plan_diagnostics, old_qc))
             base_prompt = prompt_override or payload.get(
                 "_reference_prompt_base", payload["prompt"])
             payload["_reference_prompt_base"] = (
@@ -27086,7 +27277,7 @@ class Director:
                 "contract_revision": int(
                     group.get("contract_revision") or 0),
                 "candidate_count": int(group.get("candidate_count") or 0),
-                "expected_count": int(group.get("expected_count") or 4),
+                "expected_count": int(group.get("expected_count") or 1),
                 "complete": bool(complete),
                 "technical_incomplete": technical_incomplete,
                 "selected": selection is not None,
@@ -27116,7 +27307,7 @@ class Director:
             state = self._shot_candidate_selection_summary(plan, shot_no)
             if shot_no is not None and not state["items"]:
                 raise AifosError(
-                    f"镜头{int(shot_no)}尚无可选择的四图候选组")
+                    f"镜头{int(shot_no)}尚无可选择的候选图")
             return state
 
     def select_shot_candidate(
@@ -27264,7 +27455,7 @@ class Director:
                 }
             if not self._shot_candidate_group_valid(item):
                 raise AifosError(
-                    "candidate_group_incomplete: 四张候选尚未全部技术完成，"
+                    "candidate_group_incomplete: 本轮镜头图尚未技术完成，"
                     "当前不能选片")
             previous = self._candidate_selection_from_item(item)
             if previous is not None:
@@ -27326,7 +27517,7 @@ class Director:
                     or str(candidate.get("candidate_id") or "")
                     != requested_candidate_id):
                 raise AifosError(
-                    "stale_candidate_set: 候选不属于当前四图组，请刷新")
+                    "stale_candidate_set: 候选不属于当前候选组，请刷新")
             result_version = CandidateResultVersion(
                 candidate_set_token=str(
                     candidate.get("candidate_set_token") or ""),
@@ -27456,15 +27647,16 @@ class Director:
             expected_candidate_set_id, expected_candidate_set_token,
             expected_candidate_revision, prompt, confirm=False,
             user_feedback=""):
-        """Retire one four-image set and queue a fresh four-image revision.
+        """Archive the current group and queue one edit of its current image.
 
         This method deliberately does not call an image provider.  It commits
         a CAS-protected pending group which the normal production worker can
         resume, preserving one owner for generation, billing and cancellation.
-        Candidate files are historical evidence and are never deleted here.
+        The selected/current image is persisted as the next round's unique
+        revision base. Candidate files remain immutable historical evidence.
         """
         if confirm is not True:
-            raise AifosError("全部重生成候选需要再次确认(confirm=true)")
+            raise AifosError("编辑返修当前图需要再次确认(confirm=true)")
         full_prompt = str(prompt or "").strip()
         if not full_prompt:
             raise AifosError("新的完整镜头提示词不能为空")
@@ -27516,6 +27708,27 @@ class Director:
                 item.get("prompt_used") or item.get("prompt") or "")
             regeneration_audit = self._candidate_regeneration_audit(
                 previous_prompt, full_prompt, user_feedback=user_feedback)
+            selection = (
+                old_group.get("selection") or item.get("selection") or {})
+            revision_base_uri = str(
+                selection.get("selected_uri")
+                or item.get("output_uri") or "").strip()
+            if not revision_base_uri:
+                candidates = [
+                    row for row in (old_group.get("candidates") or [])
+                    if isinstance(row, dict) and row.get("uri")]
+                if candidates:
+                    candidates.sort(
+                        key=lambda row: float(row.get("score") or 0.0),
+                        reverse=True)
+                    revision_base_uri = str(
+                        candidates[0].get("uri") or "").strip()
+            if (not revision_base_uri
+                    or (not revision_base_uri.startswith(
+                        ("http://", "https://"))
+                        and not Path(revision_base_uri).is_file())):
+                raise AifosError(
+                    "当前镜头没有技术可用图片作为编辑基底，请先生成关键帧")
 
             new_candidate_revision = max(1, old_candidate_revision + 1)
             new_contract_revision = max(1, old_contract_revision + 1)
@@ -27528,7 +27741,7 @@ class Director:
             retired = copy.deepcopy(old_group)
             retired.update({
                 "retired_at": now(),
-                "retired_reason": "user_regenerate_all_candidates",
+                "retired_reason": "user_edit_current_keyframe",
                 "replaced_by_candidate_set_id": candidate_set_id,
                 "render_qc": copy.deepcopy(item.get("qc")),
                 "regeneration_feedback": copy.deepcopy(
@@ -27543,7 +27756,7 @@ class Director:
                 "contract_revision": new_contract_revision,
                 "candidate_revision": new_candidate_revision,
                 "candidate_count": 0,
-                "expected_count": 4,
+                "expected_count": 1,
                 "selection_required": True,
                 "complete": False,
                 "technical_incomplete": False,
@@ -27554,6 +27767,9 @@ class Director:
                 "prompt_hash": self._stable_hash(full_prompt),
                 "regeneration_feedback": copy.deepcopy(
                     regeneration_audit),
+                "revision_base_uri": revision_base_uri,
+                "revision_base_source_candidate_set_id": actual_id,
+                "revision_base_source_candidate_set_token": actual_token,
             }
 
             # Invalidate the formal chain before publishing the new pending
@@ -27671,7 +27887,7 @@ class Director:
             r"\s+", " ", str(user_feedback or "").strip())[:1200]
         if not feedback_text:
             feedback_text = (
-                "用户明确要求整组重新生成，并以本次提交的新提示词"
+                "用户明确要求编辑返修当前图，并以本次提交的新提示词"
                 "替换上一版镜头合同")
         prompt_diff = "\n".join(difflib.unified_diff(
             previous_prompt.splitlines(), new_prompt.splitlines(),
@@ -27679,7 +27895,7 @@ class Director:
             lineterm=""))[:6000]
         return {
             "requested_at": now(),
-            "source": "user_regenerate_all_candidates",
+            "source": "user_edit_current_keyframe",
             "user_feedback": feedback_text,
             "previous_prompt_hash": self._stable_hash(previous_prompt),
             "new_prompt_hash": self._stable_hash(new_prompt),

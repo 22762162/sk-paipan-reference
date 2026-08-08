@@ -312,8 +312,8 @@ def test_nested_prompt_review_block_is_repaired_and_keeps_four_draw_mode(
     assert summary
     payload = task["payload"]
     assert payload["_codex_contract_repair_count"] == 4
-    # 合同预审修复发生在首次出图前；不能误标成“视觉失败后的三张
-    # 返工批”，否则会跳过首次四张候选。
+    # 合同预审修复发生在首次出图前；不能误标成“视觉失败后的返修
+    # 轮”，否则会跳过首次单图生成。
     assert "_autonomous_repair_seeded" not in payload
     assert payload["prompt_conflict_resolution"]["shot_contract"]["景别"] \
         == "近景"

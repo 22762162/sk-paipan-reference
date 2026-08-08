@@ -98,13 +98,12 @@ def test_episode_payload_projects_newest_candidate_progress_as_current_round():
         "candidate_revision": 7,
         "contract_revision": 7,
         "generation_round": 7,
-        "candidate_count": 2,
-        "completed_count": 2,
-        "expected_count": 4,
+        "candidate_count": 1,
+        "completed_count": 1,
+        "expected_count": 1,
         "status": "generating",
         "candidates": [
             {"candidate_index": 1, "uri": "/tmp/current-1.png"},
-            {"candidate_index": 2, "uri": "/tmp/current-2.png"},
         ],
         "resume_state": {
             "round_history": [
@@ -136,10 +135,11 @@ def test_episode_payload_projects_newest_candidate_progress_as_current_round():
         current_prompt
     assert visible["candidate_set_token"] == \
         progress["candidate_set_token"]
-    assert visible["candidate_count"] == 2
+    assert visible["candidate_count"] == 1
+    assert visible["candidate_expected_count"] == 1
     assert visible["candidate_group"]["candidate_set_token"] == \
         progress["candidate_set_token"]
-    assert visible["candidate_group"]["candidate_count"] == 2
+    assert visible["candidate_group"]["candidate_count"] == 1
     assert visible["candidate_group_history"][-1][
         "candidate_set_token"] == old_group["candidate_set_token"]
     assert "qc" not in visible
@@ -184,6 +184,7 @@ def test_episode_payload_keeps_final_selection_over_last_live_snapshot():
 
     assert visible["candidate_group"]["complete"] is True
     assert visible["candidate_group"]["selection"]["source"] == "ai"
+    assert len(visible["candidate_group"]["candidates"]) == 4
 
 
 def test_index_and_static(server):
@@ -352,6 +353,10 @@ def test_index_and_static(server):
     assert "人物介绍".encode() in app_js
     assert "每名正式角色统一4张候选".encode() in app_js
     assert "AI自动选优，无需手机逐张定版".encode() in app_js
+    assert "单图已生成 · AI质检中".encode() in app_js
+    assert "编辑当前图并再生成1张".encode() in app_js
+    assert "每轮并行生成4张".encode() not in app_js
+    assert b"group.expected_count ?? item.candidate_expected_count" in app_js
     assert "仅按场次人数与功能受控".encode() in app_js
     assert "不建立独立人物设定，不生成候选图、立绘或四视图".encode() in app_js
     for heading in ("序号", "时长", "参考分镜", "首尾帧", "运镜",
@@ -685,7 +690,7 @@ def test_asset_delete_and_video_reference_api(server):
 def test_episode_exposes_image_failures_with_artifact_urls(server):
     """二次 QC 失败必须成为可预览、可定位到镜头的待人工问题。"""
     # 这是旧式严格质检接口的兼容性用例；默认选优模式会把相同历史
-    # 失败自动转成交由系统逐轮四抽选优，不再暴露人工阻断。
+    # 失败自动转成交由系统逐轮单图编辑返修，不再暴露人工阻断。
     set_defaults(server["workspace"] / "config.json", {
         "selection_mode": False,
     })
@@ -1609,7 +1614,7 @@ def test_standard_center_api_lifecycle(server):
 def test_produce_flow_and_episode_api(server):
     port = server["port"]
     # Web 默认流程:剧本 → 人物候选四抽 AI 自动定版 → 预生产 →
-    # 开拍确认 → 每镜四候选 AI 自动选优 → 直接续产成片。
+    # 开拍确认 → 每镜单图质检，失败编辑返修 → 直接续产成片。
     status, reply = _json_request(port, "POST", "/api/produce", {
         "sentence": "开始制作《万妖图录》第15集"})
     assert status == 202
@@ -1678,7 +1683,8 @@ def test_produce_flow_and_episode_api(server):
     assert pre["artifacts"]["scene_art"], "确认页需要场景概念图"
     assert pre["artifacts"]["videos"] == {}, "确认前不应生产视频"
 
-    # 开拍确认 → 每镜固定生成4张并由 AI 选优，不停在手机选片页。
+    # 开拍确认 → 每镜每轮生成1张并质检，失败时编辑返修1张，
+    # 不停在手机选片页。
     status, reply = _json_request(port, "POST", "/api/confirm", {
         "episode_id": episode_id, "video_quality": "high"})
     assert status == 202
@@ -1700,7 +1706,7 @@ def test_produce_flow_and_episode_api(server):
     assert candidate_items
     assert all(item["status"] == "done"
                for item in candidate_items)
-    assert all(len(item["candidate_group"]["candidates"]) == 4
+    assert all(len(item["candidate_group"]["candidates"]) == 1
                for item in candidate_items)
     assert all(item["candidate_group"]["selection"]["source"] == "ai"
                for item in candidate_items)

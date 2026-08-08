@@ -107,12 +107,21 @@ def test_shot_content_hash_ignores_derived_continuity_reference():
         director._shot_content_hash(shot, changed_identity)
 
 
-def test_repair_group_generates_four_and_ai_promotes_passing_candidate(tmp_path):
+def test_repair_group_generates_one_and_ai_promotes_passing_image(tmp_path):
     director = _director({
         "selection_mode": True, "image_content_qc": True})
     seen = {}
 
     group = _complete_group(tmp_path)
+    single = copy.deepcopy(group["candidates"][1])
+    single["candidate_index"] = 1
+    single["candidate_id"] = f"{group['candidate_set_token']}#1"
+    group.update({
+        "candidate_count": 1,
+        "expected_count": 1,
+        "recommended_candidate_index": 1,
+        "candidates": [single],
+    })
 
     def generate(_capability, payload, _out_dir, _cancel, _qc_spec):
         seen.update(copy.deepcopy(payload))
@@ -126,10 +135,18 @@ def test_repair_group_generates_four_and_ai_promotes_passing_candidate(tmp_path)
 
     assert seen["prompt"] == "revised"
     assert seen["qc_consecutive_failures_base"] == 1
-    assert seen["_gacha_pulls_override"] == 4
-    assert result.uri == group["candidates"][1]["uri"]
+    assert seen["_selection_candidate_group"] is True
+    assert seen["_qc_candidate_only"] is True
+    assert seen["_gacha_pulls_override"] == 1
+    assert seen["_gacha_select_best_after_all"] is True
+    assert result.uri == single["uri"]
     assert result.data["candidate_group"]["repair_batch"] is True
+    assert result.data["candidate_group"]["generation_round"] == 2
+    assert result.data["candidate_group"]["repair_round"] == 1
+    assert result.data["candidate_group"]["max_candidate_rounds"] == 10
     assert result.data["selection"]["source"] == "ai"
+    assert result.data["selection"]["candidate_index"] == 1
+    assert result.data["candidate_group"]["selection_required"] is False
 
 
 def test_strict_mode_ai_promotes_only_qc_passing_current_candidate(tmp_path):
@@ -272,7 +289,7 @@ def test_reconcile_requires_complete_group_once_candidate_field_exists(
     assert writes[-1]["items"][0]["status"] == "pending"
 
 
-def test_regenerate_all_audit_keeps_feedback_and_prompt_diff():
+def test_edit_current_keyframe_audit_keeps_feedback_and_prompt_diff():
     director = _director({"selection_mode": True})
     director._stable_hash = lambda value: f"hash:{value}"
 
@@ -280,8 +297,10 @@ def test_regenerate_all_audit_keeps_feedback_and_prompt_diff():
         "旧提示词：人物站在门外", "新提示词：人物已经进入门内",
         user_feedback="空间位置错了，门外应改为门内")
 
-    assert audit["source"] == "user_regenerate_all_candidates"
+    assert audit["source"] == "user_edit_current_keyframe"
     assert audit["user_feedback"] == "空间位置错了，门外应改为门内"
+    assert audit["previous_prompt_hash"] == "hash:旧提示词：人物站在门外"
+    assert audit["new_prompt_hash"] == "hash:新提示词：人物已经进入门内"
     assert audit["prompt_changed"] is True
     assert "-旧提示词：人物站在门外" in audit["prompt_diff"]
     assert "+新提示词：人物已经进入门内" in audit["prompt_diff"]

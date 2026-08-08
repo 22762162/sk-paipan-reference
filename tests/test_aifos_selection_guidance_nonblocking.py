@@ -199,14 +199,15 @@ def test_selection_mode_promotes_best_effort_and_auto_takes_legacy_failure(
     assert items[2]["qc"]["blocking"] is False
     assert items[2]["automatic_repair"] == {
         "owner": "system",
-        "strategy": "codex_optimize_prompt_refs_then_generate_4",
-        "candidate_count": 4,
+        "strategy": "codex_optimize_prompt_refs_then_edit_1",
+        "candidate_count": 1,
         "max_candidate_rounds": 10,
         "first_round_included": True,
-        "requires_human": False,
-        "label": (
-            "Codex自动归因并优化提示词与参考图；每轮生成4张、"
-            "AI选优复检，最多10轮"),
+            "requires_human": False,
+            "label": (
+                "Codex自动归因并优化提示词与参考图；每轮单图质检，"
+                "局部问题编辑当前图；结构问题按锁定参考重生1张，"
+                "最多10轮"),
     }
     assert detail["image_failures"] == []
 
@@ -226,11 +227,14 @@ def test_selection_mode_promotes_best_effort_and_auto_takes_legacy_failure(
         "keyframes_pending"]
     assert "Codex 自动归因并优化提示词与参考图" in (
         guidance["blockers"][0]["message"])
-    assert "每轮并行生成4张" in guidance["blockers"][0]["message"]
+    assert "每轮单图质检，局部问题编辑当前图" in (
+        guidance["blockers"][0]["message"])
+    assert "结构问题按锁定参考重生1张" in (
+        guidance["blockers"][0]["message"])
     assert "最多10轮" in guidance["blockers"][0]["message"]
     assert guidance["next_action"] == {
         "action": "resume_keyframes",
-        "label": "自动四抽选优并复检（最多10轮 · 1镜）",
+        "label": "自动单图质检并编辑返修（最多10轮 · 1镜）",
         "count": 1,
     }
     resolve = guidance["actions"]["resolve_image_issues"]
@@ -261,8 +265,8 @@ def test_selection_mode_api_reports_effective_nonblocking_qc_policy(
     assert payload["content_qc_auto_retry"] is True
     assert payload["codex_repair_enabled"] is True
     assert payload["reference_reselection_enabled"] is True
-    assert payload["shot_candidate_count"] == 4
-    assert payload["shot_repair_candidate_count"] == 4
+    assert payload["shot_candidate_count"] == 1
+    assert payload["shot_repair_candidate_count"] == 1
     assert payload["max_candidate_rounds"] == 10
     assert payload["first_round_included"] is True
     assert payload["failure_blocks_other_shots"] is False

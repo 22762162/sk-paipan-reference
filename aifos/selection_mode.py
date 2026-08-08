@@ -5,11 +5,12 @@
 
 * 内容视觉质检保留并负责触发自动返修，但不能卡住其他镜头或阶段；
 * 提示词、导演合同和技术完整性检查始终开启；
-* 首次每镜固定产生四个同合同候选，AI 自动选优晋升；
+* 首次每镜固定产生一张关键帧，AI 自动判断是否晋升；
   人工仍可覆盖选择，但不再是生产门禁；
-* 内容/合同问题由 Codex 汇总原因、优化提示词和参考图后，每轮补抽四张；
-* 首轮也计入抽卡轮数，最多十轮（九个返修批次、四十张）；
-* 每轮 AI 自动选最高分复检，合格即收口，达到上限则标记风险并晋升最优张；
+* 内容/合同问题由 Codex 汇总原因、优化提示词和参考图后，以失败图为
+  唯一 revision_base 编辑并每轮重生一张；
+* 首轮也计入抽卡轮数，最多十轮（九个返修轮、总计最多十张）；
+* 每轮 AI 复检，合格即收口，达到上限则标记风险并晋升相对最优张；
 * 只有零张技术可用图时记 ``technical_incomplete``，且不阻断其他镜头；
 * 网络/API 等技术失败仍可以做候选槽位级重试；
 * 旧版本任务迟到时不得覆盖当前正式资产。
@@ -25,8 +26,11 @@ from typing import Any, Mapping, Optional, Union
 
 
 SELECTION_POLICY_SCHEMA = "aifos.selection-policy/v2"
-CANDIDATES_PER_SHOT = 4
-REPAIR_CANDIDATES_PER_BATCH = 4
+CANDIDATES_PER_SHOT = 1
+REPAIR_CANDIDATES_PER_BATCH = 1
+# 只用于读取/选择升级前已经落盘的四图历史组。新版本凭证仍只生成1个，
+# 不能借这个兼容上限重新开启四抽。
+LEGACY_MAX_CANDIDATES_PER_SHOT = 4
 MAX_CANDIDATE_ROUNDS = 10
 # 兼容旧字段。首轮计入 MAX_CANDIDATE_ROUNDS，因此最多只有9个返修批次。
 MAX_AUTO_REPAIR_BATCHES = MAX_CANDIDATE_ROUNDS - 1
@@ -113,13 +117,13 @@ def build_selection_policy(
     initial_candidates = _positive_int(
         initial_candidates_per_shot, field="initial_candidates_per_shot")
     if initial_candidates != CANDIDATES_PER_SHOT:
-        raise ValueError("首轮候选当前固定为4张")
+        raise ValueError("镜头关键帧首轮当前固定为1张")
     repair_candidates = _positive_int(
         repair_candidates_per_batch,
         field="repair_candidates_per_batch",
     )
     if repair_candidates != REPAIR_CANDIDATES_PER_BATCH:
-        raise ValueError("问题镜头每个返修轮当前固定为4张")
+        raise ValueError("问题镜头每个返修轮当前固定为1张")
     candidate_rounds = _positive_int(
         max_candidate_rounds, field="max_candidate_rounds")
     if candidate_rounds > MAX_CANDIDATE_ROUNDS:
@@ -151,7 +155,7 @@ def build_selection_policy(
         max_candidate_rounds=candidate_rounds,
         max_auto_repair_batches=repair_batches,
         # 候选视觉排名与“质检是否通过”是两件事。关闭内容
-        # QC 只关闭生产门禁，不关闭 AI 在每轮4张里选优。
+        # QC 只关闭生产门禁；开启时仍逐轮判断这一张是否需要返修。
         candidate_ai_ranking_enabled=True,
         auto_select_best=True,
         manual_selection_override_allowed=True,
@@ -193,7 +197,7 @@ def selection_policy_from_config(
     ``shot_max_candidate_rounds``。旧 ``shot_auto_repair_batches`` 只在
     正式总轮数字段缺失时兼容读取，并钳制为最多9批。旧工作区没有
     ``image_content_qc`` 时才回退
-    到 ``image_qc``；候选数不是 4 时拒绝启动新策略，避免静默回到不同
+    到 ``image_qc``；镜头张数不是 1 时拒绝启动新策略，避免静默回到不同
     镜头不同张数的旧行为。
     """
     config = config if isinstance(config, Mapping) else {}
@@ -222,7 +226,7 @@ def selection_policy_from_config(
     )
     if candidate_count != CANDIDATES_PER_SHOT:
         raise ValueError(
-            "defaults.shot_candidate_count 当前只允许固定为4")
+            "defaults.shot_candidate_count 当前只允许固定为1")
     repair_candidate_count = _positive_int(
         defaults.get(
             "shot_repair_candidate_count", REPAIR_CANDIDATES_PER_BATCH),
@@ -230,7 +234,7 @@ def selection_policy_from_config(
     )
     if repair_candidate_count != REPAIR_CANDIDATES_PER_BATCH:
         raise ValueError(
-            "defaults.shot_repair_candidate_count 当前只允许固定为4")
+            "defaults.shot_repair_candidate_count 当前只允许固定为1")
     if "shot_max_candidate_rounds" in defaults:
         candidate_rounds = _positive_int(
             defaults.get("shot_max_candidate_rounds"),
@@ -407,7 +411,7 @@ class CandidateResultVersion:
 def build_candidate_result_versions(
         version: CandidateSetVersion,
 ) -> tuple[CandidateResultVersion, ...]:
-    """固定生成四个同版本任务凭证，供调度层并行扇出。"""
+    """为新镜头轮次生成唯一任务凭证。"""
     return tuple(
         CandidateResultVersion(version.token, index)
         for index in range(1, CANDIDATES_PER_SHOT + 1)
@@ -437,7 +441,7 @@ def evaluate_candidate_promotion(
         *,
         selection_source: str,
 ) -> PromotionDecision:
-    """只允许人工/AI选中的当前四候选之一覆盖正式资产。"""
+    """只允许人工/AI选中的当前镜头候选覆盖正式资产。"""
     source = str(selection_source or "").strip().lower()
     if source not in SELECTION_SOURCES:
         return PromotionDecision(
@@ -445,11 +449,14 @@ def evaluate_candidate_promotion(
             stale=is_stale_candidate_result(result, current_version),
             reason="必须由人工或 AI 明确选中候选",
         )
-    if result.candidate_index not in range(1, CANDIDATES_PER_SHOT + 1):
+    # 新轮次只会产生 index=1；这里仍允许升级前已落盘四图组的 2-4，
+    # 实际 candidate_id/组版本匹配由调用方 CAS 校验，不能伪造新候选。
+    if result.candidate_index not in range(
+            1, LEGACY_MAX_CANDIDATES_PER_SHOT + 1):
         return PromotionDecision(
             allowed=False,
             stale=is_stale_candidate_result(result, current_version),
-            reason="候选序号不属于当前四图候选组",
+            reason="候选序号不属于当前或兼容历史候选组",
         )
     if is_stale_candidate_result(result, current_version):
         return PromotionDecision(

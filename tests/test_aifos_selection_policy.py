@@ -50,10 +50,10 @@ def test_selection_mode_keeps_content_qc_nonblocking_and_auto_repairs():
     assert policy.prompt_review_enabled is True
     assert policy.director_contract_review_enabled is True
     assert policy.technical_integrity_checks_enabled is True
-    assert policy.candidates_per_shot == CANDIDATES_PER_SHOT == 4
-    assert policy.initial_candidates_per_shot == CANDIDATES_PER_SHOT == 4
+    assert policy.candidates_per_shot == CANDIDATES_PER_SHOT == 1
+    assert policy.initial_candidates_per_shot == CANDIDATES_PER_SHOT == 1
     assert policy.repair_candidates_per_batch == \
-        REPAIR_CANDIDATES_PER_BATCH == 4
+        REPAIR_CANDIDATES_PER_BATCH == 1
     assert policy.max_candidate_rounds == MAX_CANDIDATE_ROUNDS == 10
     assert policy.max_auto_repair_batches == MAX_AUTO_REPAIR_BATCHES == 9
     assert policy.candidate_ai_ranking_enabled is True
@@ -90,8 +90,8 @@ def test_final_settings_keys_feed_nonblocking_qc_and_ten_round_policy():
             "selection_mode": True,
             "image_content_qc": True,
             "video_content_qc": True,
-            "shot_candidate_count": 4,
-            "shot_repair_candidate_count": 4,
+            "shot_candidate_count": 1,
+            "shot_repair_candidate_count": 1,
             "shot_max_candidate_rounds": 10,
             "shot_auto_repair_batches": 9,
         },
@@ -101,8 +101,8 @@ def test_final_settings_keys_feed_nonblocking_qc_and_ten_round_policy():
     assert policy.image_content_qc_enabled is True
     assert policy.video_content_qc_enabled is True
     assert policy.content_qc_blocking is False
-    assert policy.candidates_per_shot == 4
-    assert policy.repair_candidates_per_batch == 4
+    assert policy.candidates_per_shot == 1
+    assert policy.repair_candidates_per_batch == 1
     assert policy.max_candidate_rounds == 10
     assert policy.max_auto_repair_batches == 9
 
@@ -128,8 +128,8 @@ def test_empty_legacy_workspace_uses_new_selection_mode_default():
     assert policy.max_candidate_rounds == 10
 
 
-def test_candidate_count_setting_rejects_any_value_other_than_four():
-    with pytest.raises(ValueError, match="只允许固定为4"):
+def test_candidate_count_setting_rejects_any_value_other_than_one():
+    with pytest.raises(ValueError, match="只允许固定为1"):
         selection_policy_from_config({
             "defaults": {"shot_candidate_count": 3},
         })
@@ -167,7 +167,7 @@ def test_problem_shot_gets_up_to_nine_nonblocking_repair_batches(failure):
         failure, completed_repair_batches=8, policy=policy) is True
     assert should_start_repair_batch(
         failure, completed_repair_batches=9, policy=policy) is False
-    assert policy.repair_candidates_per_batch == 4
+    assert policy.repair_candidates_per_batch == 1
     assert policy.max_candidate_rounds == 10
     assert policy.failed_after_repair_auto_select_best is True
     assert policy.failed_after_repair_marks_risk is True
@@ -203,8 +203,8 @@ def test_legacy_repair_batch_setting_never_creates_eleventh_round():
     assert shorter.max_auto_repair_batches == 2
 
 
-def test_repair_candidate_count_is_fixed_to_four():
-    with pytest.raises(ValueError, match="固定为4"):
+def test_repair_candidate_count_is_fixed_to_one():
+    with pytest.raises(ValueError, match="固定为1"):
         selection_policy_from_config({
             "defaults": {"shot_repair_candidate_count": 3},
         })
@@ -234,18 +234,18 @@ def test_any_generation_fact_change_creates_a_new_candidate_version(change):
     assert _version(**change).token != _version().token
 
 
-def test_exactly_four_parallel_candidate_credentials_share_one_version():
+def test_exactly_one_candidate_credential_is_created_for_new_round():
     version = _version()
     results = build_candidate_result_versions(version)
 
-    assert len(results) == 4
-    assert tuple(result.candidate_index for result in results) == (1, 2, 3, 4)
+    assert len(results) == 1
+    assert tuple(result.candidate_index for result in results) == (1,)
     assert {result.candidate_set_token for result in results} == {version.token}
 
 
 def test_manual_or_ai_selection_of_current_version_unlocks_downstream():
     version = _version()
-    candidate = build_candidate_result_versions(version)[2]
+    candidate = build_candidate_result_versions(version)[0]
 
     assert downstream_ready(candidate, version, selection_source="manual") is True
     assert downstream_ready(candidate, version, selection_source="ai") is True

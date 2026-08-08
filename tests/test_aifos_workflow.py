@@ -81,7 +81,7 @@ def test_five_dimension_preflight_and_delivery(tmp_path):
         first_shot = next(
             item for item in render_plan["items"] if item["id"] == "shot:1")
         assert first_shot["status"] == "done"
-        assert first_shot["candidate_group"]["candidate_count"] == 4
+        assert first_shot["candidate_group"]["candidate_count"] == 1
         selection = first_shot["candidate_group"]["selection"]
         assert selection["source"] == "ai"
         first_keyframe = Path(selection["selected_uri"])

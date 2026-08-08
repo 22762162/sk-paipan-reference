@@ -406,6 +406,13 @@ def test_image_qc_schema_validates_camera_contract_fields():
         "camera_deviation": "large",
         "issues": [],
     }) == "camera_deviation 必须是 none/minor/major"
+    assert validate_image_qc({
+        "pass": False,
+        "repair_strategy": "redraw_everything",
+        "issues": ["手机方向反了"],
+    }) == (
+        "repair_strategy 必须是 edit_revision_base/"
+        "replace_revision_base/regenerate_clean")
 
 
 def test_qc_treats_visible_wardrobe_drift_as_hard_failure(app):
@@ -532,6 +539,11 @@ def test_qc_prompt_audits_exact_current_prompt_and_reference_manifest():
     assert "低矮粗跟" in prompt
     assert "不能凭一条暗线猜成液面" in prompt
     assert "局部近景被画成全身宽景" in prompt
+    assert "repair_strategy" in prompt
+    assert "edit_revision_base" in prompt
+    assert "未指出的像素" in prompt
+    assert "每轮始终只生成1张" in prompt
+    assert "局部手部、道具朝向" in prompt
 
 
 def test_codex_qc_prompt_uses_same_structured_input_diagnosis_contract(
@@ -566,6 +578,58 @@ def test_codex_qc_prompt_uses_same_structured_input_diagnosis_contract(
     assert "低矮粗跟" in instruction
     assert "不能凭一条暗线猜成液面" in instruction
     assert "斜侧局部近景却画成全身/大宽景" in instruction
+    assert "repair_strategy" in instruction
+    assert "edit_revision_base" in instruction
+    assert "只生成1张再复检" in instruction
+    assert "局部手部、道具方向" in instruction
+
+
+def test_keyframe_retry_is_single_image_edit_of_failed_revision_base(
+        tmp_path):
+    from aifos.adapters.codex_image import build_instruction
+
+    failed = tmp_path / "failed-shot-7.png"
+    failed.write_bytes(_valid_png())
+    instruction, targets, _ = build_instruction("image", {
+        "shot_no": 7,
+        "prompt_compact": "只把反向手机转为屏幕朝向使用者",
+        "feedback": "手机方向不符合真实使用逻辑",
+        "revision_mode": "targeted_qc_fix",
+        "source_qc_uri": str(failed),
+        "reference_manifest": [{
+            "index": 1,
+            "uri": str(failed),
+            "label": "质检未过的待修改基底",
+            "role": "revision_base",
+            "binding": "只修正手机方向",
+        }],
+    }, tmp_path)
+
+    assert targets == [tmp_path / "shot_007.keyframe.png"]
+    assert "图像编辑" in instruction
+    assert str(failed) in instruction
+    assert "唯一 revision_base" in instruction
+    assert "本轮只编辑并输出1张" in instruction
+    assert "未被指出的像素" in instruction
+    assert "人物身份、脸和发型" in instruction
+    assert "固定场景几何与家具位置" in instruction
+    assert "禁止输出多张候选" in instruction
+    assert "重新设计或多候选抽卡" in instruction
+
+
+def test_initial_keyframe_is_one_image_without_revision_edit_contract(
+        tmp_path):
+    from aifos.adapters.codex_image import build_instruction
+
+    instruction, targets, _ = build_instruction("image", {
+        "shot_no": 3,
+        "prompt_compact": "现代酒店走廊，女主独自站在电梯门前",
+    }, tmp_path)
+
+    assert targets == [tmp_path / "shot_003.keyframe.png"]
+    assert "本轮只能生成1张独立关键帧" in instruction
+    assert "关键帧返修方式—图像编辑" not in instruction
+    assert "4张候选" not in instruction
 
 
 def test_final_image_qc_prompt_uses_static_phase_projection_not_raw_payload(
@@ -823,7 +887,7 @@ def test_over_shoulder_qc_uses_face_for_front_and_silhouette_for_back(app):
 
 
 def test_qc_fail_triggers_auto_redraw(app, tmp_path):
-    """严格QC首败经Codex定向修订后固定生成四候选。"""
+    """严格QC首败经Codex定向修订后只生成一张。"""
     image = tmp_path / "shot.png"
     image.write_bytes(_valid_png())
     calls = {"image": [], "qc": []}
@@ -913,14 +977,14 @@ def test_qc_fail_triggers_auto_redraw(app, tmp_path):
                   "_episode_id": "unit-test"}, tmp_path, None,
         {"characters": ["小鹿"], "count": 1, "designs": "",
          "location": "", "action": "", "forbid": []})
-    assert len(calls["image"]) == 5          # 首画 + 同合同四候选
+    assert len(calls["image"]) == 2          # 首画 + 单张定向返修
     for candidate in calls["image"][1:]:
         assert "小鹿是人类女性" in candidate["feedback"]
         assert "【Codex 通知 AIFOS】" in candidate["feedback"]
         assert "只修改当前镜头" in candidate["feedback"]
         assert "【质检原因】" not in candidate["feedback"]
     assert result.qc["passed"] is True
-    assert result.qc["gacha"]["pulls"] == 4
+    assert result.qc["gacha"]["pulls"] == 1
     assert calls["qc"][0]["generation_input"]["scope"]["shot_no"] == 1
     assert calls["qc"][0]["generation_input"]["input_hash"]
     assert result.qc["first_failure"]["input_hash"]
@@ -1044,7 +1108,7 @@ def _qc_spec():
 
 def test_first_failure_escalates_then_redraws_with_codex_prompt(
         app, tmp_path):
-    """第1张不合格:Codex 改提示词，第二轮固定生成4张并全量选优。"""
+    """第1张不合格:Codex 改提示词并以失败图为基底编辑1张。"""
     image = tmp_path / "first-failed.png"
     image.write_bytes(_valid_png())
     router = _EscalationRouter(image, "targeted_redraw")
@@ -1059,28 +1123,27 @@ def test_first_failure_escalates_then_redraws_with_codex_prompt(
     assert router.codex_payloads[0]["required_provider"] == "codex"
     assert router.codex_payloads[0]["codex_escalation_context"][
         "consecutive_failures"] == 1
-    # 初版1张 + 同一份 Codex 修订合同候选4张，候选不得提前停止。
-    assert router.calls["image"] == 5
-    # 初检1 + 首败升级1 + 4张候选逐张判分 + 四图同屏比较1；
-    # 不再逐候选重复升级。
-    assert router.calls["qc"] == 7
+    # 初版1张 + 同一份 Codex 修订合同编辑1张。
+    assert router.calls["image"] == 2
+    # 初检1 + 首败升级1 + 修订图复检1；不再做四图同屏比较。
+    assert router.calls["qc"] == 3
     for candidate in router.image_payloads[1:]:
         feedback = candidate.get("feedback") or ""
         assert "把静态关键帧改为唯一拱手完成瞬间" in feedback
         assert candidate["revision_mode"] == "targeted_qc_fix"
         assert candidate["qc_revision"]["source"] == "codex_escalation"
-    # 四张仍不合格：晋升相对最高分候选并记风险，不转人工确认。
+    # 单张仍不合格：本轮记录风险，不转人工确认。
     assert result.qc["consecutive_failures"] == 2
     assert result.qc["best_effort_promoted"] is True
     assert result.qc["nonblocking_risk"]["best_effort"] is True
-    assert result.qc["gacha"]["pulls"] == 4
+    assert result.qc["gacha"]["pulls"] == 1
     assert result.qc["gacha"]["select_after_all"] is True
 
 
 def test_contract_repair_auto_applies_then_stops_on_second_failure(
         app, tmp_path):
     """repair_contract 不再是死路:首失败用 Codex 指令替换旧提示词，
-    第二轮用同一份干净合同固定生成4张并自动择优。
+    第二轮用同一份干净合同编辑1张并自动复检。
 
     旧契约(首失败即停)的死结:Codex 下达了修合同指令,但全仓库没有代码
     执行它——escalation_redraw_block 等着「合同真的改了就放行」,而没有人
@@ -1096,7 +1159,7 @@ def test_contract_repair_auto_applies_then_stops_on_second_failure(
                   "_episode_id": "unit-test"},
         tmp_path, None, _qc_spec())
 
-    assert router.calls["image"] == 5
+    assert router.calls["image"] == 2
     for candidate in router.image_payloads[1:]:
         prompt = str(candidate.get("prompt_compact") or "")
         assert prompt.startswith("【返工静态合同v1】")
@@ -1566,11 +1629,19 @@ def test_reference_diagnosis_removes_wrong_manual_ref_before_retry(
         })
 
     assert result.qc["passed"] is True
-    assert len(calls["image"]) == 5
+    assert len(calls["image"]) == 2
     assert all(str(wrong) not in payload.get("reference_images", [])
                for payload in calls["image"][1:])
-    assert all(payload.get("reference_manifest") == []
-               for payload in calls["image"][1:])
+    assert all(not any(
+        item.get("uri") == str(wrong)
+        for item in payload.get("reference_manifest", []))
+        for payload in calls["image"][1:])
+    # 失败图由冲突参考直接污染，继续做编辑底图会把错误服装复制过去；
+    # 移除冲突参考后应从其余锁定参考安全重生，而不是绑定坏图。
+    assert all(not any(
+        item.get("role") == "revision_base"
+        for item in payload.get("reference_manifest", []))
+        for payload in calls["image"][1:])
 
 
 def test_gender_mismatch_is_a_hard_identity_gate(app, tmp_path):
@@ -1668,7 +1739,7 @@ def test_physical_and_spatial_logic_are_hard_gates(app):
 
 def test_count_mismatch_auto_revises_bad_image_with_locked_references(
         app, tmp_path):
-    """人数错误必须把失败图作为待修改基底重画，并与最终立绘一起复检。"""
+    """人数整体错误允许丢弃失败图，并以锁定立绘安全重生1张。"""
     image = tmp_path / "shot.png"
     identity = tmp_path / "identity.png"
     image.write_bytes(_valid_png())
@@ -1692,7 +1763,7 @@ def test_count_mismatch_auto_revises_bad_image_with_locked_references(
                         "画面多出一名人物",
                         "画面严格只保留甲、乙两人"))
             calls["qc"].append(dict(payload))
-            first = len(calls["qc"]) == 1
+            failing = len(calls["qc"]) == 1
             if payload.get("required_provider") == "codex":
                 return ProviderResult(provider="codex", cost=0.1, data={
                     "pass": False,
@@ -1727,12 +1798,12 @@ def test_count_mismatch_auto_revises_bad_image_with_locked_references(
                     },
                 })
             return ProviderResult(provider="vision", cost=0.1, data={
-                "pass": not first,
+                "pass": not failing,
                 "identity_checked": True, "identity_match": True,
                 "gender_checked": True, "gender_match": True,
-                "count_checked": True, "count_match": not first,
-                "detected_count": 3 if first else 2,
-                "issues": ["多出一名人物"] if first else [],
+                "count_checked": True, "count_match": not failing,
+                "detected_count": 3 if failing else 2,
+                "issues": ["多出一名人物"] if failing else [],
                 **({
                     "image_error": {
                         "summary": "画面多出一名人物",
@@ -1754,7 +1825,7 @@ def test_count_mismatch_auto_revises_bad_image_with_locked_references(
                         "max_scope": "current_shot_only",
                     },
                     "reference_adjustments": [],
-                } if first else {}),
+                } if failing else {}),
             })
 
     app.director.router = StubRouter()
@@ -1772,9 +1843,9 @@ def test_count_mismatch_auto_revises_bad_image_with_locked_references(
                 {"character": "甲", "uri": str(identity)}],
         })
     assert result.qc["passed"] is True
-    assert len(calls["image"]) == 5
+    assert len(calls["image"]) == 2
     revised = calls["image"][1:]
-    assert all(row["revision_mode"] == "targeted_qc_fix"
+    assert all(row["revision_mode"] == "regenerate_clean"
                for row in revised)
     # 人数/身份错误稿不能反过来成为第二次生成的参考图，否则多余人物
     # 容易被继续复制；只保留锁定人物参考并用短提示词定向重生。
@@ -1786,6 +1857,26 @@ def test_count_mismatch_auto_revises_bad_image_with_locked_references(
         for row in revised)
     assert all(row["reference_manifest"][0]["uri"] == str(identity)
                for row in revised)
+
+
+def test_revision_base_safety_uses_hard_qc_and_structural_categories(app):
+    targeted = {
+        "reference_diagnosis": {"status": "correct"},
+        "image_error": {"categories": ["targeted_repair"]},
+        "reference_adjustments": [],
+    }
+    assert app.director._use_failed_image_as_revision_base(
+        targeted, {"count_match": False}) is False
+    assert app.director._use_failed_image_as_revision_base(
+        targeted, {"scene_topology_match": False}) is False
+    assert app.director._use_failed_image_as_revision_base({
+        **targeted,
+        "image_error": {"categories": ["whole_scene"]},
+    }) is False
+    assert app.director._use_failed_image_as_revision_base({
+        **targeted,
+        "image_error": {"categories": ["wardrobe"]},
+    }, {"identity_match": True, "count_match": True}) is True
 
 
 @pytest.mark.parametrize("worker_count", [1, 2])
@@ -2535,8 +2626,8 @@ def test_codex_qc_instruction_and_parse(tmp_path, monkeypatch):
     assert "藏入袖内" in escalation_instruction
     assert "split_shot" in escalation_instruction
     assert "aifos_instructions" in escalation_instruction
-    # 候选组三抽仍失败后，Codex 继续给唯一自动执行指令，不转人工。
-    assert "修订候选组仍未通过" in escalation_instruction
+    # 单图返修仍失败后，Codex 继续给唯一自动执行指令，不转人工。
+    assert "上一轮单张修订图仍未通过" in escalation_instruction
     assert "AIFOS 会自动应用" in escalation_instruction
     assert "不会停在人工确认点" in escalation_instruction
 

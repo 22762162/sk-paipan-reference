@@ -1511,6 +1511,20 @@ hidden/absent 道具或隐藏载体文字，只能记入 prompt_diagnosis，不�
 引用上述实际输入，不得虚构未提交的提示词或参考图。输入诊断是后续优化建议：
 提示词重复、略长或参考图说明不够简洁，不得单独令 visual_pass 或 pass 为 false。
 
+返修策略（只决定下一轮怎么修，不降低本轮质检标准）：
+- 默认 repair_strategy 必须是 edit_revision_base：把当前失败图作为唯一
+  revision_base 做 image edit，下一轮只生成1张；只修改QC明确指出的局部，
+  未指出的像素、人物身份/脸/发型/服装、人数、固定场景几何与家具位置、
+  镜位/景别/构图、光线/色调及未提及道具必须保持不变。
+- 只有整图错人/错性别/错物种、错人数、整个场景/时代错误、场景拓扑整体
+  错误、全局构图完全不可用，或失败图损坏时，才可选择
+  replace_revision_base/regenerate_clean，并在 reference_adjustments 中明确
+  drop_revision_base 或 replace；局部手部、道具朝向、接触/支撑、屏幕文字、
+  配饰、光影错误不得丢弃失败图基底。
+- targeted_prompt_patch 必须是可执行的局部编辑差量，禁止重写整镜；preserve
+  必须列出所有已经正确且不得变化的区域。每镜总生成上限10轮（首轮计入），
+  每轮始终只生成1张，禁止出现多候选或拼图指令。
+
 质检判定阈值（按手机竖屏正常播放观看，禁止放大像素挑刺）：
 - 只有普通观众一眼可见、会影响身份识别、剧情理解或画面可信度的明显问题才失败：
   明显错人/错性别/错人数，人物严重跑脸，关键服装、道具、场景或时代明显错误，
@@ -1604,13 +1618,14 @@ advisory_issues且通过。相邻景别内轻微取景差、焦段数字、精�
 "issues": ["不通过的具体原因,每条一句,指出在画面哪里"],
 "image_error": {{"summary":"画面错误摘要","categories":["identity/count/camera等"],
 "evidence":["画面中可见证据"]}},
+"repair_strategy": "edit_revision_base/replace_revision_base/regenerate_clean",
 "prompt_diagnosis": {{"status":"correct/needs_patch/conflicting/insufficient",
 "issues":["提示词问题"],"irrelevant_or_conflicting_sections":["应删除或冲突片段"]}},
 "reference_diagnosis": {{"status":"correct/needs_adjustment/conflicting/missing/uncertain",
 "issues":["参考图问题"],"missing_roles":[{{"role":"identity/spatial/scene等",
 "character":"角色名或空","reason":"缺失原因"}}]}},
-"targeted_prompt_patch": {{"instructions":["只针对当前镜头的短修正指令"],
-"preserve":["必须保持不变的内容"],"max_scope":"current_shot_only"}},
+"targeted_prompt_patch": {{"instructions":["以当前失败图为revision_base做image edit，只写QC指出的局部修改"],
+"preserve":["未指出的像素、身份、场景几何、构图、光色和道具"],"max_scope":"current_shot_only"}},
 "reference_adjustments": [{{"action":"keep/remove/rebind/replace/add/drop_revision_base",
 "target_index":参考图编号整数,"role":"用途","character":"角色名或空",
 "replacement_selector":{{"asset_id":已有资产ID或null,"role":"用途","character":"角色名或空"}},
@@ -2225,6 +2240,15 @@ def validate_image_qc(data):
         if deviation not in {"none", "minor", "major"}:
             return "camera_deviation 必须是 none/minor/major"
         data["camera_deviation"] = deviation
+    if "repair_strategy" in data:
+        strategy = str(data.get("repair_strategy") or "").lower()
+        if strategy not in {
+                "edit_revision_base", "replace_revision_base",
+                "regenerate_clean"}:
+            return (
+                "repair_strategy 必须是 edit_revision_base/"
+                "replace_revision_base/regenerate_clean")
+        data["repair_strategy"] = strategy
     issues = data.get("issues")
     if not isinstance(issues, list):
         issues = [str(issues)] if issues else []

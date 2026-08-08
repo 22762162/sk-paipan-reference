@@ -77,7 +77,9 @@ def test_gacha_restores_best_when_all_fail(tmp_path):
     assert not list(tmp_path.glob("*.gacha*"))
 
 
-def test_repair_round_draws_all_four_then_selects_best_pass(tmp_path):
+def test_legacy_four_candidate_group_draws_all_then_selects_best_pass(
+        tmp_path):
+    """保留旧四图候选组的底层兼容；当前镜头返修调用固定传入1。"""
     director = _director()
     target = tmp_path / "shot_015.keyframe.png"
     calls = {"n": 0}
@@ -124,7 +126,8 @@ def test_repair_round_draws_all_four_then_selects_best_pass(tmp_path):
     assert not list(tmp_path.glob("*.gacha*"))
 
 
-def test_repair_round_freezes_first_reviewed_prompt_for_all_four(tmp_path):
+def test_legacy_four_candidate_group_freezes_first_reviewed_prompt(tmp_path):
+    """旧四图历史/母资产仍可复用冻结提示词，不代表镜头返修张数。"""
     director = _director()
     target = tmp_path / "shot_018.keyframe.png"
     seen = []
@@ -200,7 +203,7 @@ def test_gacha_skips_batch_and_frames(tmp_path):
     assert calls["n"] == 1                 # frames 成对语义,不参与连抽
 
 
-def test_repair_gacha_reuse_requires_four_identical_prompt_hashes():
+def test_legacy_four_candidate_reuse_requires_identical_prompt_hashes():
     frozen = "frozen-hash"
     valid = {
         "qc": {

@@ -1,4 +1,4 @@
-"""关键帧四候选 Web 契约：CAS、选片续产、重生成与安全 URL。"""
+"""关键帧单图返修 Web 契约及旧候选组兼容：CAS、续产与安全 URL。"""
 
 import copy
 import http.client
@@ -203,7 +203,7 @@ def test_selection_mode_rejects_legacy_single_shot_regen(
     assert status == 409
     assert "/api/shot-candidates/regenerate" in result["error"]
     assert "/api/shot-candidates/select" in result["error"]
-    assert "整组重新生成4张" in result["error"]
+    assert "以当前图为基底编辑返修1张" in result["error"]
     assert calls == []
 
     status, setting = _request(
@@ -277,7 +277,7 @@ def test_regenerate_requires_confirmation_full_cas_and_runs_in_queue(
         Director, "regenerate_shot_candidates", regenerate, raising=False)
     monkeypatch.setattr(Director, "produce", produce)
 
-    body = _cas_body(server, prompt="只保留本镜动作，重新生成四张",
+    body = _cas_body(server, prompt="只保留本镜动作，编辑当前图生成1张",
                      confirm_regenerate=False)
     status, _ = _request(
         server, "POST", "/api/shot-candidates/regenerate", body)
@@ -298,7 +298,7 @@ def test_regenerate_requires_confirmation_full_cas_and_runs_in_queue(
     assert len(regenerate_calls) == 1
     args, kwargs = regenerate_calls[0]
     assert args[2:6] == (1, "set-1", "token-1", 7)
-    assert args[6] == "只保留本镜动作，重新生成四张"
+    assert args[6] == "只保留本镜动作，编辑当前图生成1张"
     assert kwargs == {"confirm": True}
     assert len(resume_calls) == 1
 
