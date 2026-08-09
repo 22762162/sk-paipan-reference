@@ -17176,6 +17176,18 @@ class Director:
                 continue
             verification = self._locked_identity_headwear_verification(
                 project_id, character, identity, headwear)
+            source_verification = None
+            if identity.get("identity_anchor_type") == "face_only_derived":
+                source_verification = (
+                    self._locked_identity_headwear_verification(
+                        project_id, character, {
+                            "character": character,
+                            "asset_id": identity.get(
+                                "source_identity_asset_id"),
+                            "uri": identity.get("source_identity_uri"),
+                            "version": identity.get(
+                                "source_identity_version"),
+                        }, headwear))
             if verification:
                 identity["headwear_anchor_verified"] = verification
             locked_identity = self._locked_identity(project_id, character)
@@ -17188,18 +17200,25 @@ class Director:
                     project_id, "character_sheet", f"{character}:{key}")
                 meta = self._asset_meta(row) if row is not None else {}
                 uri = str(row["uri"] or "") if row is not None else ""
-                if (row is None
-                        or (ctx.get("fresh_assets")
-                            and meta.get("fresh_run_id")
-                            != ctx.get("run_id"))
-                        or (locked_identity is not None
-                            and not self._character_sheet_matches_locked_identity(
-                                row, locked_identity))
-                        or not formal_reference_allowed(
-                            self._asset_quality(row))
-                        or not uri
-                        or (not uri.startswith(("http://", "https://"))
-                            and not Path(uri).exists())):
+                invalid_structure_row = (
+                    row is None
+                    or (ctx.get("fresh_assets")
+                        and meta.get("fresh_run_id") != ctx.get("run_id"))
+                    or (locked_identity is not None
+                        and not self._character_sheet_matches_locked_identity(
+                            row, locked_identity))
+                    or not formal_reference_allowed(self._asset_quality(row))
+                    or not uri
+                    or (not uri.startswith(("http://", "https://"))
+                        and not Path(uri).exists()))
+                if invalid_structure_row:
+                    if (identity.get("identity_anchor_type")
+                            == "face_only_derived"
+                            and key == "closeup"):
+                        raise AifosError(
+                            f"{character}的锁定母图虽已证明本镜头饰，但"
+                            "当前面部锚不是有效的专用closeup结构图；"
+                            "禁止把features/makeup等其他视图冒充头饰证明")
                     continue
                 if uri in used_uris:
                     same_attached_closeup = (
@@ -17211,15 +17230,22 @@ class Director:
                         == int(row["id"])
                         and not self._locked_identity_has_headwear_qc_conflict(
                             project_id, character)
-                        and self._headwear_states_compatible(
-                            headwear, self._look_headwear_text(
-                                self._locked_look_variant(
-                                    project_id, character))))
+                        and (bool(source_verification)
+                             or self._headwear_states_compatible(
+                                 headwear, self._look_headwear_text(
+                                     self._locked_look_variant(
+                                         project_id, character)))))
                     # A dedicated closeup can already occupy the identity slot
                     # after a wardrobe-only face crop. It remains real attached
                     # structure evidence, so a duplicate upload is unnecessary.
                     # This is distinct from deferring an unattached supplement.
                     if same_attached_closeup:
+                        if source_verification:
+                            identity["headwear_anchor_verified"] = {
+                                **source_verification,
+                                "attachment": "dedicated_face_closeup",
+                                "attached_asset_id": int(row["id"]),
+                            }
                         break
                     if (self._director_autonomy_enabled()
                             and can_defer_closeup):

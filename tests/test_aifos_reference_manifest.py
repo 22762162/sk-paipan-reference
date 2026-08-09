@@ -452,6 +452,85 @@ def test_face_only_anchor_keeps_matching_signature_hair_ornament(
     assert "短发夹、垂坠金钗" in entry["binding"]
     assert "headwear_signature_details" in entry["inherits"]
 
+    # A wardrobe-only face crop may use the exact dedicated closeup already
+    # attached in its identity slot.  When tolerant text compatibility misses
+    # an inserted material adjective, scoped visual proof on the source locked
+    # portrait still establishes the ordinary front-view headwear.
+    soft_hat = {
+        "presence": "worn", "kind": "soft_hat",
+        "name": "低矮软角吏巾",
+    }
+    monkeypatch.setattr(
+        app.director, "_locked_look_variant",
+        lambda _project_id, _name: {
+            "costume": "另一场礼服，戴低矮软角吏巾",
+            "hair": "灰发束入低矮软角布质吏巾",
+        })
+    assert not app.director._headwear_states_compatible(
+        soft_hat, app.director._look_headwear_text(
+            app.director._locked_look_variant(project["id"], name)))
+    locked = app.director._locked_identity(project["id"], name)
+    locked_meta = app.assets.meta(locked)
+    app.assets.register(
+        project["id"], locked["kind"], locked["name"], uri=locked["uri"],
+        meta={
+            **locked_meta,
+            "selection_qc_passed": True,
+            "selection_qc": {
+                "passed": True,
+                "identity_checked": True,
+                "identity_match": True,
+                "identity_checks": [{
+                    "character": name,
+                    "basis": ["低矮软角吏巾清晰可见"],
+                    "checked": True,
+                    "match": True,
+                }],
+                "image_error": {"categories": [], "evidence": []},
+            },
+        },
+        new_version=False)
+
+    scoped = app.director._art_refs(
+        {"project": dict(project), "episode": dict(episode)},
+        [name], "", wardrobe_states={name: "当前场常服"},
+        headwear_states={name: soft_hat})
+
+    scoped_identity = scoped["identity_references"][0]
+    assert scoped_identity["identity_anchor_type"] == "face_only_derived"
+    assert scoped_identity["headwear_anchor_verified"]["attachment"] == (
+        "dedicated_face_closeup")
+
+    original_latest = app.assets.latest
+
+    def latest_without_closeup(project_id, kind, asset_name, *args, **kwargs):
+        if kind == "character_sheet" and asset_name == f"{name}:closeup":
+            return None
+        return original_latest(project_id, kind, asset_name, *args, **kwargs)
+
+    # Even a legacy source without scoped visual QC must not let a features or
+    # makeup sheet masquerade as the missing dedicated headwear closeup.
+    monkeypatch.setattr(
+        app.director, "_locked_look_variant",
+        lambda _project_id, _name: {
+            "costume": "另一场礼服",
+            "accessories": soft_hat,
+        })
+    app.assets.register(
+        project["id"], locked["kind"], locked["name"], uri=locked["uri"],
+        meta={
+            **app.assets.meta(locked),
+            "selection_qc_passed": None,
+            "selection_qc": {},
+        },
+        new_version=False)
+    monkeypatch.setattr(app.assets, "latest", latest_without_closeup)
+    with pytest.raises(AifosError, match="不是有效的专用closeup结构图"):
+        app.director._art_refs(
+            {"project": dict(project), "episode": dict(episode)},
+            [name], "", wardrobe_states={name: "当前场常服"},
+            headwear_states={name: soft_hat})
+
 
 def test_rear_headwear_contract_adds_scoped_back_structure_anchor(
         app, monkeypatch):
