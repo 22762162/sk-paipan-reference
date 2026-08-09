@@ -11,12 +11,15 @@ second creative-model pass.
 from __future__ import annotations
 
 import copy
+import json
 
 import pytest
 
+from aifos.adapters import claude_script
 from aifos.adapters.claude_script import (
     _merge_storyboard_full_repair,
     _merge_storyboard_shot_repairs,
+    _repair_with_engine,
     _storyboard_error_fields,
     validate_storyboard,
 )
@@ -636,6 +639,94 @@ def test_full_repair_requires_safe_shot_patch(malformed):
         source, malformed, positions=[1],
         allowed_fields={"frame_targets"}) is None
     assert source == {"shots": [{"shot_no": 1, "prompt": "keep"}]}
+
+
+def test_full_repair_can_replace_null_shots_when_nothing_is_preservable(
+        monkeypatch):
+    repaired = {"shots": [{
+        "shot_no": 1,
+        "scene_no": 1,
+        "duration": 8,
+        "prompt": "现代酒店房间建立镜头",
+        "characters": [],
+        "frame_targets": {
+            "keyframe": {
+                "phase": "freeze", "state": "房间稳定建立",
+                "fallback": False,
+            },
+            "first_frame": {
+                "phase": "start", "state": "房间进入画面",
+                "fallback": False,
+            },
+            "last_frame": {
+                "phase": "end", "state": "房间稳定收束",
+                "fallback": False,
+            },
+        },
+    }]}
+
+    monkeypatch.setattr(
+        "aifos.adapters.claude_script._invoke_engine",
+        lambda *_args, **_kwargs: (
+            True, json.dumps(repaired, ensure_ascii=False)))
+
+    fixed, note = _repair_with_engine(
+        "codex", "codex", "storyboard", {}, {"shots": None},
+        "缺少 shots", 60)
+
+    assert note == ""
+    assert fixed is not None
+    assert len(fixed["shots"]) == 1
+    assert validate_storyboard(fixed) is None
+
+
+@pytest.mark.parametrize("malformed", [
+    {},
+    {"shots": None},
+    {"shots": "bad"},
+    {"shots": []},
+])
+def test_full_repair_with_invalid_source_shots_never_uses_len_on_none(
+        monkeypatch, malformed):
+    calls = []
+
+    def invoke(*_args, **_kwargs):
+        calls.append(True)
+        return True, '{"shots":null}'
+
+    monkeypatch.setattr(
+        "aifos.adapters.claude_script._invoke_engine", invoke)
+
+    fixed, note = _repair_with_engine(
+        "codex", "codex", "storyboard", {}, malformed,
+        "缺少 shots", 60)
+
+    assert fixed is None
+    assert "缺少有效 shots" in note
+    assert len(calls) == 1
+
+
+def test_adapter_repair_exception_still_persists_storyboard_evidence(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        claude_script, "_invoke_engine",
+        lambda *_args, **_kwargs: (True, '{"shots":null}'))
+
+    def fail_repair(*_args, **_kwargs):
+        raise TypeError("object of type 'NoneType' has no len()")
+
+    monkeypatch.setattr(claude_script, "_repair_with_engine", fail_repair)
+
+    reply = claude_script.run(
+        {"capability": "storyboard", "payload": {},
+         "out_dir": str(tmp_path)},
+        "claude", 60, engine="codex", codex="/bin/echo")
+
+    assert reply["ok"] is False
+    assert "就地修复结构异常: TypeError" in reply["error"]
+    evidence = tmp_path / "writer_failure_storyboard.txt"
+    assert evidence.exists()
+    assert '"shots":null' in evidence.read_text(encoding="utf-8")
 
 
 def test_repair_permissions_ignore_keys_in_diagnostic_shot_dump():

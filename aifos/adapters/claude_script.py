@@ -3618,13 +3618,26 @@ def _repair_with_engine(engine, binary, capability, payload, data, error,
     if fixed is None:
         return None, "(就地修复输出中未找到 JSON)"
     if capability == "storyboard":
-        shots = data.get("shots") if isinstance(data, dict) else []
-        positions = _storyboard_error_shot_positions(error, len(shots))
-        fixed = _merge_storyboard_full_repair(
-            data, fixed, positions=positions,
-            allowed_fields=_storyboard_error_fields(error))
-        if fixed is None:
-            return None, "(就地修复输出未返回可安全合并的 shots)"
+        shots = data.get("shots") if isinstance(data, dict) else None
+        if isinstance(shots, list) and shots:
+            positions = _storyboard_error_shot_positions(error, len(shots))
+            fixed = _merge_storyboard_full_repair(
+                data, fixed, positions=positions,
+                allowed_fields=_storyboard_error_fields(error))
+            if fixed is None:
+                return None, "(就地修复输出未返回可安全合并的 shots)"
+        else:
+            # The first writer occasionally returns {"shots": null}.  There
+            # is then no trustworthy source shot to preserve or merge, but the
+            # full repair call above can still have produced a complete valid
+            # storyboard.  Accept that repair only through the same strict
+            # postprocess/validator used for an initial generation.  The old
+            # unconditional len(shots) raised TypeError here and discarded the
+            # already-repaired result before the router could use it.
+            repaired_shots = (
+                fixed.get("shots") if isinstance(fixed, dict) else None)
+            if not isinstance(repaired_shots, list) or not repaired_shots:
+                return None, "(就地修复仍缺少有效 shots)"
     fixed, fixed_error = _postprocess_and_validate(capability, payload, fixed)
     if fixed_error:
         return None, f"(就地修复复检仍未通过: {str(fixed_error)[:300]})"
@@ -3657,9 +3670,19 @@ def run(request, claude, timeout, engine="claude", codex="codex",
     if error:
         # 产出已在手,只是字段不合规——丢弃整份重来是对已消耗时间的
         # 浪费;先让同一引擎局部修复并复检,复检仍不过才交回路由换路。
-        fixed, note = _repair_with_engine(
-            engine, binary, capability, payload, data, error, timeout,
-            codex_home=codex_home, stall_timeout=stall_timeout)
+        try:
+            fixed, note = _repair_with_engine(
+                engine, binary, capability, payload, data, error, timeout,
+                codex_home=codex_home, stall_timeout=stall_timeout)
+        except Exception as exc:
+            # A malformed model response must remain a provider-local failure
+            # with its raw evidence persisted below.  Never let an adapter
+            # TypeError bypass writer_failure_storyboard.txt and collapse into
+            # the router's generic "no available Provider" message.
+            fixed = None
+            note = (
+                "(就地修复结构异常: "
+                f"{type(exc).__name__}: {str(exc)[:240]})")
         if fixed is not None:
             return {"ok": True, "data": fixed, "uri": "",
                     "repaired_fields": True}
