@@ -6,6 +6,7 @@ import pytest
 
 from aifos.adapters.codex_image import build_instruction
 from aifos.app import App
+from aifos.errors import AifosError
 from aifos.production.api_providers import _local_refs, _reference_entries
 
 PNG = (b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00"
@@ -478,6 +479,8 @@ def test_rear_headwear_contract_adds_scoped_back_structure_anchor(
         lambda _project_id, _name: {
             "costume": "深靛圆领袍", "accessories": headwear,
         })
+    original_conflict_check = (
+        app.director._locked_identity_has_headwear_qc_conflict)
     monkeypatch.setattr(
         app.director, "_locked_identity_has_headwear_qc_conflict",
         lambda _project_id, _name: True)
@@ -508,6 +511,198 @@ def test_rear_headwear_contract_adds_scoped_back_structure_anchor(
     assert "顶髻突出在网巾上方" in headwear_entry["binding"]
     assert "headwear_signature_details" in headwear_entry["inherits"]
     assert "face_identity_override" in headwear_entry["excludes"]
+
+    # When immutable hard anchors fill the attachment budget, only an ordinary
+    # closeup may defer to an already matching identity/headwear anchor.
+    # Rear/profile morphology must remain fail-closed.
+    monkeypatch.setattr(
+        "aifos.director.SHOT_BASE_REFERENCE_LIMIT", 1)
+    monkeypatch.setattr(
+        app.director, "_director_autonomy_enabled", lambda: True)
+    ordinary_headwear = {
+        "presence": "worn", "kind": "official_hat",
+        "name": "黑纱官帽与网巾", "shape": "标准正面官帽轮廓",
+        "material": "黑纱与布边", "color": "烟墨黑",
+        "placement": "贴合发际线佩戴",
+        "forbidden_variants": ["无帽", "金冠"],
+    }
+    monkeypatch.setattr(
+        app.director, "_locked_look_variant",
+        lambda _project_id, _name: {
+            "costume": "深靛圆领袍", "accessories": ordinary_headwear,
+        })
+    monkeypatch.setattr(
+        app.director, "_locked_identity_has_headwear_qc_conflict",
+        original_conflict_check)
+    locked_identity = app.director._locked_identity(project["id"], name)
+    locked_meta = app.assets.meta(locked_identity)
+    app.assets.register(
+        project["id"], locked_identity["kind"], locked_identity["name"],
+        uri=locked_identity["uri"],
+        meta={
+            **locked_meta,
+            # The portrait has an unrelated belt defect, but its scoped
+            # identity/headwear evidence is still independently usable.
+            "selection_qc_passed": False,
+            "selection_qc": {
+                "passed": False,
+                "visual_pass": False,
+                "image_passed": False,
+                "critical_failures": ["腰带金属扣样式不符合设定"],
+                "identity_checked": True,
+                "identity_match": True,
+                "wardrobe_checked": True,
+                "wardrobe_match": False,
+                "identity_checks": [{
+                    "character": name,
+                    "view": "front_or_three_quarter",
+                    "basis": ["正面身份、年龄与脸型匹配"],
+                    "checked": True,
+                    "match": True,
+                }],
+                "image_error": {
+                    "categories": ["wardrobe"],
+                    "evidence": ["黑纱官帽与网巾清晰可见"],
+                },
+            },
+        },
+        new_version=False)
+    assert original_conflict_check(project["id"], name) is False
+    constrained = app.director._art_refs(
+        {"project": dict(project), "episode": dict(episode)},
+        [name], "", shot_no=11,
+        wardrobe_states={name: "深靛圆领袍"},
+        headwear_states={name: ordinary_headwear})
+    assert constrained["identity_references"][0][
+        "headwear_anchor"] == ordinary_headwear
+    assert constrained["identity_references"][0][
+        "headwear_anchor_verified"]["source"] == (
+            "locked_identity_visual_qc")
+    assert constrained["identity_references"][0][
+        "headwear_anchor_verified"]["source_qc_passed"] is False
+    assert constrained["headwear_references"] == []
+    assert any(
+        item.get("character") == name and item.get("sheet") == "closeup"
+        for item in constrained["appearance_reference_warnings"])
+
+    identity = constrained["identity_references"][0]
+    negative_evidence = (
+        "黑纱官帽未佩戴",
+        "黑纱官帽与设定不符",
+        "应为黑纱官帽，实际无帽",
+        "佩戴朱红帽而非黑纱官帽",
+        "应佩戴黑纱官帽",
+    )
+    for evidence in negative_evidence:
+        negative_qc = {
+            **app.assets.meta(locked_identity),
+            "selection_qc": {
+                "passed": True,
+                "identity_checked": True,
+                "identity_match": True,
+                "identity_checks": [{
+                    "character": name,
+                    "basis": [evidence],
+                    "checked": True,
+                    "match": True,
+                }],
+                "image_error": {"categories": [], "evidence": []},
+            },
+        }
+        app.assets.register(
+            project["id"], locked_identity["kind"],
+            locked_identity["name"], uri=locked_identity["uri"],
+            meta=negative_qc, new_version=False)
+        assert app.director._locked_identity_headwear_verification(
+            project["id"], name, identity, ordinary_headwear) is None
+
+    # Structured belt evidence must ignore the synthesized umbrella issue,
+    # but a concrete contradictory hat issue must still fail closed.
+    monkeypatch.setattr(
+        app.director, "_locked_identity_has_headwear_qc_conflict",
+        original_conflict_check)
+    scoped_qc = {
+        "passed": False,
+        "identity_checked": True,
+        "identity_match": True,
+        "identity_checks": [{
+            "character": name,
+            "basis": ["黑纱官帽清晰可见"],
+            "checked": True,
+            "match": True,
+        }],
+        "image_error": {
+            "categories": ["wardrobe"],
+            "evidence": ["腰带金属扣错误"],
+        },
+        "issues": ["画面服装、头饰或妆发与本镜继承状态不一致"],
+    }
+    scoped_meta = {
+        **app.assets.meta(locked_identity),
+        "selection_qc_passed": False,
+        "selection_qc": scoped_qc,
+    }
+    app.assets.register(
+        project["id"], locked_identity["kind"], locked_identity["name"],
+        uri=locked_identity["uri"], meta=scoped_meta,
+        new_version=False)
+    assert original_conflict_check(project["id"], name) is False
+    assert app.director._locked_identity_headwear_verification(
+        project["id"], name, identity, ordinary_headwear)
+    for issue in (
+            "黑纱官帽形制错误",
+            "黑纱官帽与设定不一致",
+            "画面服装、头饰或妆发与本镜继承状态不一致，且黑纱官帽戴反"):
+        scoped_qc["issues"] = [issue]
+        app.assets.register(
+            project["id"], locked_identity["kind"],
+            locked_identity["name"], uri=locked_identity["uri"],
+            meta=scoped_meta, new_version=False)
+        assert original_conflict_check(project["id"], name) is True
+        assert app.director._locked_identity_headwear_verification(
+            project["id"], name, identity, ordinary_headwear) is None
+
+    monkeypatch.setattr(
+        app.director, "_director_autonomy_enabled", lambda: False)
+    with pytest.raises(AifosError, match="closeup发饰结构"):
+        app.director._art_refs(
+            {"project": dict(project), "episode": dict(episode)},
+            [name], "", shot_no=11,
+            wardrobe_states={name: "深靛圆领袍"},
+            headwear_states={name: ordinary_headwear})
+
+    monkeypatch.setattr(
+        app.director, "_director_autonomy_enabled", lambda: True)
+    monkeypatch.setattr(
+        app.director, "_locked_look_variant",
+        lambda _project_id, _name: {
+            "costume": "深靛圆领袍", "accessories": headwear,
+        })
+    original_latest = app.assets.latest
+
+    def latest_without_back(project_id, kind, asset_name):
+        if kind == "character_sheet" and asset_name == f"{name}:back":
+            return None
+        return original_latest(project_id, kind, asset_name)
+
+    monkeypatch.setattr(app.assets, "latest", latest_without_back)
+    with pytest.raises(AifosError, match="closeup发饰结构"):
+        app.director._art_refs(
+            {"project": dict(project), "episode": dict(episode)},
+            [name], "", shot_no=11,
+            wardrobe_states={name: "深靛圆领袍"},
+            headwear_states={name: headwear})
+
+    monkeypatch.setattr(app.assets, "latest", original_latest)
+    mismatched_headwear = {
+        **ordinary_headwear, "name": "朱红软角官帽",
+    }
+    with pytest.raises(AifosError, match="closeup发饰结构"):
+        app.director._art_refs(
+            {"project": dict(project), "episode": dict(episode)},
+            [name], "", shot_no=11,
+            wardrobe_states={name: "深靛圆领袍"},
+            headwear_states={name: mismatched_headwear})
 
 
 def test_headwear_conflict_cannot_reenter_through_wardrobe_reference(

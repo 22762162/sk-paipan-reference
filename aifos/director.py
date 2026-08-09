@@ -16672,12 +16672,155 @@ class Director:
                 "headwear", "hair_ornament", "hat", "hairstyle"}
                for item in categories):
             return True
-        evidence = "；".join(str(item) for item in (
-            (qc.get("critical_failures") or [])
-            + (qc.get("issues") or [])))
-        return bool(re.search(
-            r"头饰|发饰|网巾|帽(?:冠|檐|箍)?|发簪|发钗|顶髻|低髻|发髻",
-            evidence)) and not bool(qc.get("passed"))
+        headwear_pattern = (
+            r"头饰|发饰|网巾|帽(?:冠|檐|箍)?|发簪|发钗|顶髻|低髻|发髻")
+        negative_pattern = (
+            r"未佩戴|未出现|没出现|没有|缺少|缺失|错戴|戴错|戴反|"
+            r"错误|不符|不一致|不对|不存在|不可见|而非")
+
+        def has_specific_conflict(values):
+            for value in values or []:
+                text = str(value).strip()
+                if not text:
+                    continue
+                if re.fullmatch(
+                        r"画面服装、?头饰或妆发与本镜继承状态"
+                        r"不一致[。；]?", text):
+                    continue
+                if (re.search(headwear_pattern, text)
+                        and re.search(negative_pattern, text)):
+                    return True
+            return False
+
+        critical_evidence = "；".join(
+            str(item) for item in (qc.get("critical_failures") or []))
+        if re.search(headwear_pattern, critical_evidence):
+            return True
+        if (isinstance(image_error, dict)
+                and has_specific_conflict(image_error.get("evidence"))):
+            return True
+        # New QC reports already separate the visible error into structured
+        # categories/evidence. Do not let a synthesized umbrella issue such
+        # as ``服装、头饰或妆发不一致`` turn a belt-only failure into a false
+        # headwear conflict. Old reports without structured image evidence
+        # retain the conservative text fallback.
+        if isinstance(image_error, dict):
+            return has_specific_conflict(qc.get("issues"))
+        issue_evidence = "；".join(
+            str(item) for item in (qc.get("issues") or []))
+        return bool(re.search(headwear_pattern, issue_evidence)) \
+            and not bool(qc.get("passed"))
+
+    def _locked_identity_headwear_verification(
+            self, project_id, character, identity, expected):
+        """Return provenance only when the locked portrait proves headwear.
+
+        ``identity['headwear_anchor']`` is a prompt contract and may have been
+        copied from the current shot.  It is not visual evidence by itself.
+        Deferring a supplemental closeup therefore requires the original
+        locked mother asset and scoped, positive visual proof of the exact
+        headwear in both the locked look and the QC evidence. An unrelated
+        wardrobe defect (for example a wrong belt) must not erase valid hat
+        proof, while a headwear-specific conflict always fails closed.
+        """
+        if not isinstance(identity, dict) or not expected:
+            return None
+        if identity.get("identity_anchor_type") in {
+                "user_reference", "face_only_derived"}:
+            return None
+        locked = self._locked_identity(project_id, character)
+        if locked is None:
+            return None
+        if (int(identity.get("asset_id") or 0) != int(locked["id"])
+                or str(identity.get("uri") or "")
+                != str(locked["uri"] or "")):
+            return None
+        meta = self._asset_meta(locked)
+        qc = (meta.get("selection_qc")
+              if isinstance(meta.get("selection_qc"), dict) else {})
+        if (qc.get("identity_checked") is not True
+                or qc.get("identity_match") is not True):
+            return None
+        if self._locked_identity_has_headwear_qc_conflict(
+                project_id, character):
+            return None
+        expected_name = str(
+            expected.get("name") if isinstance(expected, dict)
+            else expected).strip()
+        name_parts = [
+            part.strip() for part in re.split(r"[与和及、/]", expected_name)
+            if len(part.strip()) >= 2
+            and part.strip() not in {"头饰", "发饰", "官帽", "帽", "冠"}
+        ]
+        if not name_parts:
+            return None
+        locked_look_text = self._look_headwear_text(
+            self._locked_look_variant(project_id, character))
+        if not all(part in locked_look_text for part in name_parts):
+            return None
+        signature = str(
+            (expected.get("signature_details") or "")
+            if isinstance(expected, dict) else "").strip()
+        if signature and signature not in locked_look_text:
+            return None
+        primary_name = max(name_parts, key=len)
+        positive_basis = []
+        for item in (qc.get("identity_checks") or []):
+            if (not isinstance(item, dict)
+                    or str(item.get("character") or "").strip()
+                    != character
+                    or item.get("checked") is not True
+                    or item.get("match") is not True):
+                continue
+            basis = item.get("basis") or []
+            if not isinstance(basis, list):
+                basis = [basis]
+            positive_basis.extend(
+                str(value).strip() for value in basis
+                if str(value).strip())
+        image_error = qc.get("image_error")
+        if isinstance(image_error, dict):
+            evidence = image_error.get("evidence") or []
+            if not isinstance(evidence, list):
+                evidence = [evidence]
+            positive_basis.extend(
+                str(value).strip() for value in evidence
+                if str(value).strip())
+        # Do not search the whole QC JSON: expected contracts and issue text
+        # can mention the requested hat even when the image does not show it.
+        # Only a positive per-character visual identity check is evidence.
+        negative_prefix = (
+            rf"(?:未|无|没有|不曾|并非|错误|错戴|戴错|缺少|缺失|"
+            rf"应为|应佩戴|应该|应当|本应|要求|需要|目标|而非)"
+            rf"[^，。；]{{0,12}}"
+            rf"{re.escape(primary_name)}")
+        negative_suffix = (
+            rf"{re.escape(primary_name)}[^，。；]{{0,12}}"
+            r"(?:未佩戴|未出现|没出现|没有|缺失|错误|错戴|戴错|"
+            r"不符|不存在|不可见|而非)")
+        observation_pattern = (
+            r"清晰可见|可见|可辨|佩戴|戴着|戴有|外戴|收束于|"
+            r"束入|画面显示|实际显示|呈现|符合设定")
+        matching_basis = [
+            value for value in positive_basis
+            if primary_name in value
+            and re.search(observation_pattern, value)
+            and not re.search(negative_prefix, value)
+            and not re.search(negative_suffix, value)
+        ]
+        if not matching_basis:
+            return None
+        return {
+            "source": "locked_identity_visual_qc",
+            "asset_id": int(locked["id"]),
+            "asset_version": int(locked["version"]),
+            "headwear_visual_qc_verified": True,
+            "source_qc_passed": bool(meta.get("selection_qc_passed")),
+            "visual_matched_name": primary_name,
+            "locked_contract_parts": name_parts,
+            "matched_signature": signature,
+            "visual_evidence": matching_basis,
+        }
 
     @classmethod
     def _headwear_structure_sheet_keys(cls, headwear):
@@ -17031,8 +17174,16 @@ class Director:
             keys = self._headwear_structure_sheet_keys(headwear)
             if not character or not keys:
                 continue
+            verification = self._locked_identity_headwear_verification(
+                project_id, character, identity, headwear)
+            if verification:
+                identity["headwear_anchor_verified"] = verification
             locked_identity = self._locked_identity(project_id, character)
             for key in keys:
+                can_defer_closeup = (
+                    keys == ("closeup",)
+                    and key == "closeup"
+                    and bool(verification))
                 row = self.assets.latest(
                     project_id, "character_sheet", f"{character}:{key}")
                 meta = self._asset_meta(row) if row is not None else {}
@@ -17051,10 +17202,58 @@ class Director:
                             and not Path(uri).exists())):
                     continue
                 if uri in used_uris:
-                    # The selected identity/face anchor already is the best
-                    # matching proof image, so no duplicate upload is needed.
-                    break
+                    same_attached_closeup = (
+                        keys == ("closeup",)
+                        and key == "closeup"
+                        and identity.get("identity_anchor_type")
+                        == "face_only_derived"
+                        and int(identity.get("asset_id") or 0)
+                        == int(row["id"])
+                        and not self._locked_identity_has_headwear_qc_conflict(
+                            project_id, character)
+                        and self._headwear_states_compatible(
+                            headwear, self._look_headwear_text(
+                                self._locked_look_variant(
+                                    project_id, character))))
+                    # A dedicated closeup can already occupy the identity slot
+                    # after a wardrobe-only face crop. It remains real attached
+                    # structure evidence, so a duplicate upload is unnecessary.
+                    # This is distinct from deferring an unattached supplement.
+                    if same_attached_closeup:
+                        break
+                    if (self._director_autonomy_enabled()
+                            and can_defer_closeup):
+                        break
+                    raise AifosError(
+                        f"{character}当前身份锚未被视觉质检证明含有本镜"
+                        f"{key}发饰结构；禁止把同一张脸部图兼作发饰证明")
                 if not remember(uri):
+                    if (self._director_autonomy_enabled()
+                            and can_defer_closeup):
+                        # Three-person shots can legitimately consume all five
+                        # Codex-image slots with immutable identities, the
+                        # canonical scene and the spatial plan.  A supplemental
+                        # rear/profile headwear sheet must not stop the whole
+                        # blocking stage: the identity row already carries the
+                        # exact headwear contract, so keep that text binding,
+                        # expose the visual-reference omission and continue.
+                        warning = {
+                            "character": character,
+                            "headwear": headwear,
+                            "sheet": key,
+                            "reason": (
+                                "参考图硬槽位已由人物身份、统一物理母场景"
+                                "和空间调度占满；保留身份锚中的精确发饰文字"
+                                "与正面形制合同，未追加closeup补充图"),
+                        }
+                        refs["appearance_reference_warnings"].append(warning)
+                        self.log.warn(
+                            "director",
+                            f"镜头{shot_no}参考图已达"
+                            f"{SHOT_BASE_REFERENCE_LIMIT}张，未追加"
+                            f"{character}的{key}发饰补充锚；保留精确"
+                            "发饰合同并继续，不阻断空间调度")
+                        break
                     raise AifosError(
                         f"本镜需要追加{character}的{key}发饰结构锚，但人物、"
                         f"空间、道具参考已达到{SHOT_BASE_REFERENCE_LIMIT}张；"
