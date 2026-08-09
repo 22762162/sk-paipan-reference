@@ -17,6 +17,7 @@ import pytest
 
 from aifos.adapters import claude_script
 from aifos.adapters.claude_script import (
+    extract_json,
     _merge_storyboard_full_repair,
     _merge_storyboard_shot_repairs,
     _repair_with_engine,
@@ -162,6 +163,194 @@ def test_storyboard_contract_normalizes_phase_aliases_disclosure_and_transition(
     reconcile_storyboard_prop_registry(storyboard, source_script)
     assert storyboard == snapshot
 
+
+def test_no_change_prop_wording_does_not_require_fictional_transition():
+    storyboard = {
+        "prop_registry": _registry("shot-001", "start"),
+        "shots": [_shot(1, frame_props=[
+            _prop_row(
+                "start", state="展开、无字、干燥", holder="none",
+                location="书案中央", visibility="visible"),
+            _prop_row(
+                "end", state="展开、无字、干燥，未使用", holder="none",
+                location="书案中央", visibility="visible"),
+        ])],
+    }
+
+    normalize_storyboard_contract(storyboard)
+
+    rows = storyboard["shots"][0]["frame_props"]
+    start = next(row for row in rows if row["phase"] == "start")
+    end = next(row for row in rows if row["phase"] == "end")
+    assert end["physical_state"] == start["physical_state"]
+    assert end["visibility"] == start["visibility"]
+    assert end["noop_state_normalized"] is True
+    assert storyboard["shots"][0]["prop_transitions"] == []
+    assert audit_storyboard_prop_contract(storyboard)["passed"] is True
+
+
+def test_hidden_to_occluded_disclosure_is_never_normalized_as_noop():
+    storyboard = {
+        "prop_registry": _registry("shot-001", "start"),
+        "shots": [_shot(1, frame_props=[
+            _prop_row(
+                "start", state="藏于右袖暗袋", holder="顾明昭",
+                location="右袖暗袋", visibility="hidden"),
+            _prop_row(
+                "end", state="位置未变，仅形成轻微垂坠", holder="顾明昭",
+                location="右袖暗袋", visibility="occluded"),
+        ])],
+    }
+    storyboard["shots"][0]["description"] = "顾明昭右袖因抬手形成轻微垂坠"
+
+    normalize_storyboard_contract(storyboard)
+
+    end = next(
+        row for row in storyboard["shots"][0]["frame_props"]
+        if row["phase"] == "end")
+    assert end["physical_state"] == "位置未变，仅形成轻微垂坠"
+    assert end["visibility"] == "occluded"
+    assert "noop_state_normalized" not in end
+    transitions = storyboard["shots"][0]["prop_transitions"]
+    assert len(transitions) == 1
+    assert "右袖" in transitions[0]["action"]
+
+
+@pytest.mark.parametrize("description", [
+    "顾明昭左袖轻微垂坠",
+    "顾明昭右袖没有垂坠",
+    "顾明昭右袖无明显鼓起",
+    "人物保持站立",
+])
+def test_sleeve_outline_transition_requires_positive_side_matched_evidence(
+        description):
+    storyboard = {
+        "prop_registry": _registry("shot-001", "start"),
+        "shots": [_shot(1, frame_props=[
+            _prop_row(
+                "start", state="藏于右袖暗袋", holder="陆沉",
+                location="右袖暗袋", visibility="hidden"),
+            _prop_row(
+                "end", state="位置未变，仅形成轻微垂坠", holder="陆沉",
+                location="右袖暗袋", visibility="occluded"),
+        ])],
+    }
+    storyboard["shots"][0]["description"] = description
+    storyboard["shots"][0]["prompt"] = "人物近景"
+
+    normalize_storyboard_contract(storyboard)
+
+    assert storyboard["shots"][0]["prop_transitions"] == []
+    report = audit_storyboard_prop_contract(storyboard)
+    assert any(
+        "缺少 start→end prop_transitions" in issue
+        for issue in report["issues"])
+
+
+def test_other_characters_sleeve_cannot_authorize_prop_transition():
+    storyboard = {
+        "prop_registry": _registry("shot-001", "start"),
+        "shots": [_shot(1, frame_props=[
+            _prop_row(
+                "start", state="藏于右袖暗袋", holder="陆沉",
+                location="右袖暗袋", visibility="hidden"),
+            _prop_row(
+                "end", state="位置未变，仅形成轻微垂坠", holder="陆沉",
+                location="右袖暗袋", visibility="occluded"),
+        ])],
+    }
+    storyboard["shots"][0]["description"] = "顾明昭右袖形成轻微垂坠"
+    storyboard["shots"][0]["prompt"] = "双人近景"
+
+    normalize_storyboard_contract(storyboard)
+
+    assert storyboard["shots"][0]["prop_transitions"] == []
+
+
+@pytest.mark.parametrize("end_state", [
+    "仍在燃烧",
+    "位置未变，但屏幕已熄灭",
+    "未使用但瓶身已经破裂",
+    "取用被阻断，但玻璃碎裂",
+    "位置未变，瓶盖松动",
+    "仍静置书案，液体已浑浊",
+    "仍只剩半瓶",
+    "维持同一位置颜色变蓝",
+    "仍在匣内，封条断裂后取用被阻断",
+    "仍只通过袖料显出破损裂口",
+    "仍在开启木匣内，被压匣动作阻断取用",
+])
+def test_positive_change_wording_is_never_laundered_as_noop(end_state):
+    storyboard = {
+        "prop_registry": _registry("shot-001", "start"),
+        "shots": [_shot(1, frame_props=[
+            _prop_row(
+                "start", state=("封存在闭合木匣内"
+                                if "开启木匣" in end_state else "完好"),
+                holder="none",
+                location="书案中央"),
+            _prop_row(
+                "end", state=end_state, holder="none",
+                location="书案中央"),
+        ])],
+    }
+    storyboard["shots"][0]["description"] = "人物凝视前方"
+
+    normalize_storyboard_contract(storyboard)
+
+    end = next(
+        row for row in storyboard["shots"][0]["frame_props"]
+        if row["phase"] == "end")
+    assert end["physical_state"] == end_state
+    assert "noop_state_normalized" not in end
+    assert storyboard["shots"][0]["prop_transitions"] == []
+
+
+def test_derived_freeze_tracks_safe_noop_normalization():
+    storyboard = {
+        "prop_registry": _registry("shot-001", "start"),
+        "shots": [_shot(1, frame_props=[
+            _prop_row(
+                "start", state="展开、无字、干燥", holder="none",
+                location="书案中央"),
+            _prop_row(
+                "end", state="展开、无字、干燥，未使用", holder="none",
+                location="书案中央"),
+        ])],
+    }
+
+    normalize_storyboard_contract(storyboard)
+
+    rows = storyboard["shots"][0]["frame_props"]
+    freeze = next(row for row in rows if row["phase"] == "freeze")
+    assert freeze["phase_backfilled"] is True
+    assert freeze["derived_from"] == "end_state"
+    assert freeze["physical_state"] == "展开、无字、干燥"
+
+
+def test_real_prop_move_is_not_normalized_as_noop():
+    storyboard = {
+        "prop_registry": _registry("shot-001", "start"),
+        "shots": [_shot(1, frame_props=[
+            _prop_row(
+                "start", state="静置书案", holder="none",
+                location="书案中央"),
+            _prop_row(
+                "end", state="仍待决断", holder="陆沉",
+                location="陆沉右手"),
+        ])],
+    }
+
+    normalize_storyboard_contract(storyboard)
+
+    end = next(
+        row for row in storyboard["shots"][0]["frame_props"]
+        if row["phase"] == "end")
+    assert end["physical_state"] == "仍待决断"
+    assert "noop_state_normalized" not in end
+    report = audit_storyboard_prop_contract(storyboard)
+    assert report["passed"] is True
+    assert storyboard["shots"][0]["prop_transitions"]
 
 def test_hidden_presence_does_not_move_disclosure_before_visible_reveal():
     """A concealed physical prop exists, but its first disclosure is still later."""
@@ -678,6 +867,86 @@ def test_full_repair_can_replace_null_shots_when_nothing_is_preservable(
     assert fixed is not None
     assert len(fixed["shots"]) == 1
     assert validate_storyboard(fixed) is None
+
+
+def test_extract_json_drops_anonymous_duplicate_character_states():
+    malformed = (
+        '{"shots":[{"start_state":{'
+        '"甲":{"pose":"甲起"},{"pose":"甲重复"},'
+        '"乙":{"pose":"乙起"},{"pose":"乙重复"}}},'
+        '"end_state":{"甲":{"pose":"甲终"},'
+        '"乙":{"pose":"乙终"}}}]}')
+
+    fixed = extract_json(malformed)
+
+    assert fixed is not None
+    shot = fixed["shots"][0]
+    assert shot["start_state"] == {
+        "甲": {"pose": "甲起"}, "乙": {"pose": "乙起"}}
+    assert shot["end_state"] == {
+        "甲": {"pose": "甲终"}, "乙": {"pose": "乙终"}}
+
+
+def test_anonymous_pose_outside_storyboard_state_is_not_silently_dropped():
+    malformed_cases = [
+        ('{"metadata":{"owner":{"pose":"保留"},'
+         '{"pose":"不得静默删除"},"other":1}}'),
+        ('{"metadata":{"start_state":{"owner":{"pose":"保留"},'
+         '{"pose":"不得静默删除"},"other":1}}}'),
+    ]
+
+    for malformed in malformed_cases:
+        fixed = extract_json(malformed)
+        assert fixed is None or (
+            fixed.get("metadata", {}).get("pose") == "不得静默删除"
+            or fixed.get("metadata", {}).get(
+                "start_state", {}).get("pose") == "不得静默删除")
+
+
+def test_missing_shots_retry_receives_authoritative_storyboard_context(
+        monkeypatch):
+    repaired = {"shots": [{
+        "shot_no": 1,
+        "scene_no": 1,
+        "duration": 8,
+        "prompt": "值房建立镜头",
+        "characters": [],
+        "frame_targets": {
+            "keyframe": {
+                "phase": "freeze", "state": "值房稳定建立",
+                "fallback": False,
+            },
+            "first_frame": {
+                "phase": "start", "state": "值房进入画面",
+                "fallback": False,
+            },
+            "last_frame": {
+                "phase": "end", "state": "值房稳定收束",
+                "fallback": False,
+            },
+        },
+    }]}
+    prompts = []
+
+    def invoke(_engine, _binary, prompt, *_args, **_kwargs):
+        prompts.append(prompt)
+        return True, json.dumps(repaired, ensure_ascii=False)
+
+    monkeypatch.setattr(
+        "aifos.adapters.claude_script._invoke_engine", invoke)
+    payload = {"script": {
+        "episode_title": "袖中旧印",
+        "scenes": [{"scene_no": 1, "location": "都察院东值房"}],
+    }}
+
+    fixed, _note = _repair_with_engine(
+        "codex", "codex", "storyboard", payload, {"shots": None},
+        "缺少 shots", 60)
+
+    assert fixed is not None
+    assert "袖中旧印" in prompts[0]
+    assert "都察院东值房" in prompts[0]
+    assert "【结构重试】" in prompts[0]
 
 
 @pytest.mark.parametrize("malformed", [

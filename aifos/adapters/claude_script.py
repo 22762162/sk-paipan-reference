@@ -633,6 +633,80 @@ def _match_brace(text, start):
     return None
 
 
+def _directly_inside_storyboard_state_map(text, position):
+    """Return whether ``position`` is a direct member of a shot state map."""
+    key_positions = [
+        text.rfind(key, 0, position)
+        for key in ('"start_state"', '"end_state"')
+    ]
+    key_position = max(key_positions)
+    if key_position < 0:
+        return False
+    state_match = re.match(
+        r'"(?:start_state|end_state)"\s*:\s*\{',
+        text[key_position:position])
+    if state_match is None:
+        return False
+    opening = key_position + state_match.end() - 1
+
+    # ``extract_json`` serves every capability, so state-specific salvage is
+    # allowed only inside an open storyboard ``shots`` array.  A metadata
+    # object that happens to use the same key must fail closed instead of
+    # silently losing an anonymous row.
+    shots_position = text.rfind('"shots"', 0, key_position)
+    if shots_position < 0:
+        return False
+    shots_match = re.match(
+        r'"shots"\s*:\s*\[', text[shots_position:key_position])
+    if shots_match is None:
+        return False
+    shots_opening = shots_position + shots_match.end() - 1
+    square_depth = 0
+    in_str = False
+    escaped = False
+    for char in text[shots_opening:position]:
+        if in_str:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_str = False
+            continue
+        if char == '"':
+            in_str = True
+        elif char == "[":
+            square_depth += 1
+        elif char == "]":
+            square_depth -= 1
+            if square_depth <= 0:
+                return False
+    if square_depth != 1:
+        return False
+
+    depth = 0
+    in_str = False
+    escaped = False
+    for char in text[opening:position]:
+        if in_str:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_str = False
+            continue
+        if char == '"':
+            in_str = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth <= 0:
+                return False
+    return depth == 1
+
+
 def _mend_json_syntax(block, prefer_unwrap=False):
     """错误制导的机械修补:每轮只动解析器报错的那一处,直到可解析。
 
@@ -647,6 +721,7 @@ def _mend_json_syntax(block, prefer_unwrap=False):
     - JSON 主体后有杂讯(Extra data) → 截断到主体结束。
     修不动或超轮数即放弃(返回 None),绝不猜测语义。
     """
+    repaired_anonymous_state = False
     for _ in range(60):
         try:
             json.loads(block)
@@ -659,6 +734,52 @@ def _mend_json_syntax(block, prefer_unwrap=False):
             if pos >= len(block):
                 return None
             char = block[pos]
+            anonymous_state_close = (
+                _match_brace(block, pos)
+                if msg.startswith("Expecting property name")
+                and char == "{"
+                and block[pos:pos + 8] == '{"pose":' else None)
+            trailing_duplicate_before_end = False
+            if (anonymous_state_close is not None
+                    and repaired_anonymous_state
+                    and block[max(0, pos - 3):pos] == "}},"):
+                after = block[anonymous_state_close + 1:
+                              anonymous_state_close + 40]
+                trailing_duplicate_before_end = bool(re.match(
+                    r'}\s*,\s*"end_state"\s*:', after))
+            if (anonymous_state_close is not None
+                    and (_directly_inside_storyboard_state_map(block, pos)
+                         or trailing_duplicate_before_end)):
+                # A real Codex storyboard failure inserted a second anonymous
+                # character-state object after an already named state:
+                #   "顾明昭": {...}, {"pose": "duplicate", ...}, "沈..."
+                # The anonymous row has no owner and cannot safely participate
+                # in continuity.  Drop exactly that balanced object, retaining
+                # the named start_state and the separately authored end_state.
+                close = anonymous_state_close
+                if block[close + 1:close + 2] == ",":
+                    block = block[:pos] + block[close + 2:]
+                elif pos > 0 and block[pos - 1:pos] == ",":
+                    block = block[:pos - 1] + block[close + 1:]
+                else:
+                    return None
+                repaired_anonymous_state = True
+                continue
+            if (msg.startswith("Expecting ',' delimiter")
+                    and char == ":"
+                    and repaired_anonymous_state
+                    and block[max(0, pos - 20):pos + 1].endswith(
+                        '"end_state":')):
+                # The same malformed state sequence can leave one surplus
+                # closing brace immediately before the legitimate end_state
+                # member.  Only remove it for the exact }}} , "end_state"
+                # signature; any other delimiter error remains unguessable.
+                key_start = block.rfind('"end_state"', 0, pos + 1)
+                comma = block.rfind(",", 0, key_start)
+                if comma > 1 and block[comma - 3:comma] == "}}}":
+                    block = block[:comma - 1] + block[comma:]
+                    continue
+                return None
             if msg.startswith("Expecting property name") and char == "{":
                 close = _match_brace(block, pos) if prefer_unwrap else None
                 inner = (block[pos + 1:close].strip()
@@ -3592,11 +3713,28 @@ def _repair_with_engine(engine, binary, capability, payload, data, error,
         source = json.dumps(data, ensure_ascii=False)
     except (TypeError, ValueError):
         return None, "(产出不可序列化,跳过就地修复)"
-    prompt = (
-        "你刚为漫剧平台生成了一份 JSON 产出,机器校验发现以下问题:\n"
-        f"{error}\n\n"
-        "只修复校验指出的字段,其余内容一字不动;修复后输出完整 JSON,"
-        "不要任何解释或 Markdown 代码块。\n原 JSON:\n" + source)
+    source_shots = (
+        data.get("shots") if capability == "storyboard"
+        and isinstance(data, dict) else None)
+    if capability == "storyboard" and not (
+            isinstance(source_shots, list) and source_shots):
+        # A missing shot list cannot be repaired from {"shots": null}; the
+        # second process is ephemeral and has none of the first call's script
+        # context.  Re-send the authoritative storyboard prompt so a structural
+        # retry can still cover the actual scenes and high-value event beats.
+        prompt = (
+            build_prompt(capability, payload)
+            + "\n\n【结构重试】上一次输出无法解析为含非空 shots 的完整"
+            "分镜对象。必须重新输出上述任务要求的完整顶层 JSON，保留"
+            "episode_title、prop_registry、high_value_event_coverage 和"
+            "全部 shots；不得只输出单个镜头。上次机器错误："
+            + str(error))
+    else:
+        prompt = (
+            "你刚为漫剧平台生成了一份 JSON 产出,机器校验发现以下问题:\n"
+            f"{error}\n\n"
+            "只修复校验指出的字段,其余内容一字不动;修复后输出完整 JSON,"
+            "不要任何解释或 Markdown 代码块。\n原 JSON:\n" + source)
     # timeout=0(不设上限)时修复调用仍用自身上限兜底
     repair_timeout = (min(int(timeout), REPAIR_TIMEOUT_CAP)
                       if timeout and timeout > 0 else REPAIR_TIMEOUT_CAP)

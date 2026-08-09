@@ -610,6 +610,140 @@ def _prop_state_signature(rows) -> list[tuple[str, ...]]:
     )
 
 
+def _normalize_storyboard_prop_noops(storyboard: dict) -> None:
+    """Collapse explicit no-change wording before transition auditing.
+
+    Models often rewrite an unchanged end row as ``位置未变`` or append
+    ``未使用`` while keeping the same holder, location and support.  Treating
+    that wording-only delta as physical motion forces a fictional transition
+    and can reject every shot in a long storyboard.  This normalization is
+    deliberately narrow: an explicit transition wins, carrier geometry and
+    visibility must be identical, and newly authored physical changes are
+    never erased.  In particular, ``hidden`` -> ``occluded`` is a disclosure
+    event rather than a wording alias.
+    """
+    suffix_cues = (
+        "未使用", "尚未拿取", "未受压",
+    )
+    # A no-op sentence may repeat an existing state feature, but it may not
+    # introduce one.  This rejects dangerous forms such as
+    # ``位置未变，屏幕已熄灭`` while allowing
+    # ``仍只通过袖料显出轮廓`` when the start row already says ``显出``.
+    positive_change_cues = (
+        "燃烧", "熄灭", "熄屏", "点亮", "亮起", "暗下", "黑屏", "破裂",
+        "碎裂", "打碎", "漏水", "渗漏", "打开", "关闭", "合上", "撕开",
+        "折断", "烧毁", "浸湿", "湿润", "变色", "移动", "移入", "移出",
+        "取出", "拿起", "掉落", "滑落", "垂坠", "鼓起", "形成", "显出",
+        "露出", "出现",
+    )
+    contrast_cues = ("但", "却", "同时", "然而", "不过")
+    stable_fields = (
+        "holder", "location", "support", "representation", "visibility")
+
+    def is_safe_noop(start_state: str, end_state: str) -> bool:
+        start_state = start_state.strip()
+        end_state = end_state.strip()
+        if not start_state or not end_state or start_state == end_state:
+            return False
+        if any(cue in end_state for cue in contrast_cues):
+            return False
+        if any(cue in end_state and cue not in start_state
+               for cue in positive_change_cues):
+            return False
+        if end_state.startswith(start_state):
+            remainder = end_state[len(start_state):]
+            suffix_pattern = "|".join(
+                re.escape(cue) for cue in suffix_cues)
+            if re.fullmatch(
+                    rf"[，,\s]*(?:{suffix_pattern})"
+                    rf"(?:[，,\s]*(?:{suffix_pattern}))*",
+                    remainder):
+                return True
+        if re.fullmatch(
+                r"(?:位置未变|位置不变)"
+                r"(?:[，,](?:完全隐藏|仍待决断))?",
+                end_state):
+            return True
+        if re.fullmatch(
+                r"(?:保持不动|未移动|仍待决断)", end_state):
+            return True
+        if re.fullmatch(
+                r"维持同一(?:轻压)?(?:位置|状态)(?:一息|片刻)?",
+                end_state):
+            return True
+        if ("匣内" in start_state
+                and all(cue not in end_state or cue in start_state
+                        for cue in ("开启", "闭合"))
+                and re.fullmatch(
+                    r"仍在(?:开启|闭合)?(?:木)?匣内，"
+                    r"被压匣动作阻断取用",
+                    end_state)):
+            return True
+        if ("匣内" in start_state
+                and all(cue not in end_state or cue in start_state
+                        for cue in ("开启", "闭合"))
+                and re.fullmatch(
+                    r"仍静置(?:于)?(?:开启|闭合)?(?:木)?匣内，"
+                    r"取用被阻断",
+                    end_state)):
+            return True
+        if ("显出" in start_state
+                and re.fullmatch(
+                    r"仍只通过(?:衣料|布料|袖料)显出(?:轮廓|边缘)，"
+                    r"(?:印面|实体)不可见",
+                    end_state)):
+            return True
+        return False
+    for shot in storyboard.get("shots") or []:
+        if not isinstance(shot, dict):
+            continue
+        rows = shot.get("frame_props")
+        if not isinstance(rows, list):
+            continue
+        transitions = {
+            (_text(item.get("prop_id")),
+             _normalize_storyboard_phase(item.get("from_phase")),
+             _normalize_storyboard_phase(item.get("to_phase")))
+            for item in shot.get("prop_transitions") or []
+            if isinstance(item, dict)
+        }
+        by_prop: dict[str, dict[str, list[dict]]] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            prop_id = _text(row.get("prop_id"))
+            phase = _normalize_storyboard_phase(row.get("phase"))
+            if prop_id and phase in {"start", "freeze", "end"}:
+                by_prop.setdefault(prop_id, {}).setdefault(
+                    phase, []).append(row)
+        for prop_id, phases in by_prop.items():
+            starts = phases.get("start") or []
+            ends = phases.get("end") or []
+            if (len(starts) != 1 or len(ends) != 1
+                    or (prop_id, "start", "end") in transitions):
+                continue
+            start, end = starts[0], ends[0]
+            start_state = _text(start.get("physical_state"))
+            end_state = _text(end.get("physical_state"))
+            if any(_text(start.get(field)).lower()
+                   != _text(end.get(field)).lower()
+                   for field in stable_fields):
+                continue
+            if not is_safe_noop(start_state, end_state):
+                continue
+            if end_state != start_state:
+                end["physical_state_normalized_from"] = end_state
+                end["physical_state"] = start.get("physical_state")
+            end["noop_state_normalized"] = True
+            # A missing freeze row is mechanically cloned from end before this
+            # pass. Keep only that derived row aligned with the normalized end;
+            # never overwrite a model-authored intermediate state.
+            for freeze in phases.get("freeze") or []:
+                if (freeze.get("phase_backfilled") is True
+                        and freeze.get("derived_from") == "end_state"):
+                    freeze["physical_state"] = end.get("physical_state")
+
+
 def _backfill_storyboard_prop_transitions(storyboard: dict) -> None:
     """Add only transitions already proven by explicit start/end states.
 
@@ -676,6 +810,81 @@ def _backfill_storyboard_prop_transitions(storyboard: dict) -> None:
                         clause)
                     if cue_before_prop or prop_before_cue:
                         return clause[:300]
+        return ""
+
+    def concealed_sleeve_outline_evidence(shot, starts, ends):
+        """Authorize only an explicitly pictured sleeve-outline disclosure.
+
+        A concealed hard object may stay in the same sewn pocket while its
+        outline becomes visible through the cloth.  That is a real
+        ``hidden`` -> ``occluded`` transition, not a no-op.  Require an
+        independently authored, side-matched sleeve cue so an end-state row
+        cannot prove itself and a left-sleeve action cannot authorize a
+        right-sleeve prop.
+        """
+        rows = [item for item in starts + ends if isinstance(item, dict)]
+        if not rows:
+            return ""
+        start_visibility = {
+            _text(item.get("visibility")).lower()
+            for item in starts if isinstance(item, dict)
+        }
+        end_visibility = {
+            _text(item.get("visibility")).lower()
+            for item in ends if isinstance(item, dict)
+        }
+        if start_visibility != {"hidden"} or end_visibility != {"occluded"}:
+            return ""
+        fixed_fields = ("holder", "location", "support", "representation")
+        fixed_values = {}
+        for field in fixed_fields:
+            values = {
+                _text(item.get(field)).lower() for item in rows}
+            if len(values) != 1 or not next(iter(values), ""):
+                return ""
+            fixed_values[field] = next(iter(values))
+        holder = fixed_values["holder"]
+        if holder in {"none", "无", "无人", "unknown", "未知"}:
+            return ""
+
+        anchor_source = " ".join(
+            _text(item.get(field)) for item in rows
+            for field in ("location", "support", "physical_state"))
+        if "右袖" in anchor_source:
+            anchors = ("右袖",)
+        elif "左袖" in anchor_source:
+            anchors = ("左袖",)
+        elif "袖口" in anchor_source:
+            anchors = ("袖口",)
+        elif "暗袋" in anchor_source:
+            anchors = ("暗袋",)
+        else:
+            return ""
+        outline_cues = ("垂坠", "鼓起", "显出轮廓", "显形")
+        negative_outline_cues = (
+            "未垂坠", "不垂坠", "没有垂坠", "无明显垂坠",
+            "未鼓起", "不鼓起", "没有鼓起", "无明显鼓起",
+            "未显出轮廓", "不显出轮廓", "没有显出轮廓",
+            "未显形", "不显形", "没有显形",
+        )
+        candidates = []
+        for beat in shot.get("temporal_beats") or []:
+            if isinstance(beat, dict):
+                candidates.append(beat.get("action"))
+        candidates.extend(shot.get(key) for key in (
+            "description", "physical_logic", "video_action", "prompt"))
+        for candidate in candidates:
+            for clause in re.split(
+                    r"[；;。.!！？?]", _text(candidate)):
+                clause = clause.strip()
+                if (not clause
+                        or any(cue in clause
+                               for cue in negative_outline_cues)
+                        or holder not in clause
+                        or not any(anchor in clause for anchor in anchors)
+                        or not any(cue in clause for cue in outline_cues)):
+                    continue
+                return clause[:300]
         return ""
 
     def attached_transition_evidence(shot, starts, ends):
@@ -774,6 +983,9 @@ def _backfill_storyboard_prop_transitions(storyboard: dict) -> None:
                     or (prop_id, "start", "end") in transition_keys):
                 continue
             evidence = transition_evidence(shot, prop_id)
+            if not evidence:
+                evidence = concealed_sleeve_outline_evidence(
+                    shot, starts, ends)
             if not evidence:
                 evidence = attached_transition_evidence(shot, starts, ends)
             if not evidence:
@@ -954,6 +1166,7 @@ def normalize_storyboard_contract(storyboard: dict) -> dict:
                     transition.get("to_phase"))
 
     normalize_storyboard_frame_phase_pairs(storyboard)
+    _normalize_storyboard_prop_noops(storyboard)
     _backfill_storyboard_prop_transitions(storyboard)
     return storyboard
 
