@@ -1301,6 +1301,10 @@ def test_regen_image_applies_codex_instruction(app, monkeypatch):
         captured["item_id"] = task["item_id"]
         captured["payload"] = task["payload"]
         captured["revision_source"] = task["revision_source"]
+        # A prompt-review repair can immediately rebuild the spatial contract
+        # from this regeneration context.  Keep the continuity bible present
+        # so that repair path cannot fail with KeyError('continuity').
+        captured["continuity"] = ctx["continuity"]
         raise _Stop()
 
     from aifos.director import Director
@@ -1319,6 +1323,12 @@ def test_regen_image_applies_codex_instruction(app, monkeypatch):
     assert escalation["instruction_to_aifos"] == instruction
     assert escalation.get("override") is None
     assert captured["payload"]["qc_consecutive_failures_base"] == 1
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=?",
+        (project["id"], 1))
+    continuity, _ = app.projects.latest_document(
+        episode["id"], "continuity")
+    assert captured["continuity"] == continuity
 
 
 def test_regen_image_passes_human_override_into_escalation(app, monkeypatch):

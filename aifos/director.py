@@ -26785,6 +26785,14 @@ class Director:
                   or self.config.get("defaults", "aspect", default="9:16"))
         standard, _ = self.projects.latest_document(
             episode["id"], "production_standard")
+        # Prompt-review repairs can revise the camera/staging contract while a
+        # single-image regeneration is already in flight.  That path rebuilds
+        # the deterministic blocking plan and therefore needs the same
+        # continuity bible as the full production context.  Without it, a
+        # successfully repaired prompt crashes at the spatial refresh with
+        # ``KeyError('continuity')`` before the image provider is called.
+        continuity, _ = self.projects.latest_document(
+            episode["id"], "continuity")
         blocking, _ = self.projects.latest_document(
             episode["id"], "blocking")
         ctx = {
@@ -26795,6 +26803,7 @@ class Director:
             "script": script, "force": True,
             "production_standard": standard,
             "production_profile": production_profile(self.config, standard),
+            "continuity": continuity or {},
             "blocking": blocking,
             "character_asset_policy": self.character_asset_policy(
                 episode["id"], script=script),
