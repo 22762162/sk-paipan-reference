@@ -36,6 +36,56 @@ _PBR_PRESETS = {
 }
 
 
+# The physics layer intentionally keeps one conservative collision box per
+# object.  The viewer, however, should not make a desk, a lattice window and a
+# tea cup look like the same translucent cuboid.  These deterministic semantic
+# prefabs only change render geometry; they never rewrite measured positions,
+# footprints or collision dimensions.
+_PREFAB_RULES = (
+    ("lantern", ("灯笼", "宫灯", "油灯", "烛台", "蜡烛")),
+    ("brazier", ("香炉", "熏炉", "火盆", "炉")),
+    ("vessel", ("茶盏", "茶杯", "酒杯", "水杯", "小碗", "瓷碗", "杯", "盏")),
+    ("cabinet", ("药柜", "书架", "书柜", "卷柜", "格柜", "抽屉", "柜")),
+    ("paper", ("宣纸", "信笺", "纸卷", "书卷", "卷册", "书册", "竹简", "文书")),
+    ("bed", ("床榻", "卧榻", "床", "榻")),
+    ("chair", ("椅", "凳", "坐墩")),
+    ("lattice", ("格心窗", "格栅", "隔扇", "花窗", "槛窗", "支摘窗")),
+    ("doorway", ("门洞", "门道", "入口", "出口")),
+    ("door", ("板门", "木门", "房门", "车门", "门扇")),
+    ("curtain", ("竹帘", "布帘", "纱帘", "垂帘", "帷幔", "纱帐", "帐幔")),
+    ("column", ("方柱", "圆柱", "檐柱", "立柱", "柱")),
+    ("screen", ("屏风", "屏障", "围屏")),
+    ("table", ("书案", "画案", "条案", "矮案", "案几", "方几", "茶几", "桌", "台几")),
+)
+
+
+def _render_prefab(name, category):
+    text = _text(name).lower()
+    for prefab_type, words in _PREFAB_RULES:
+        if any(word.lower() in text for word in words):
+            return {
+                "type": prefab_type,
+                "version": 1,
+                "source": "semantic_name",
+                "confidence": {"score": 0.85, "level": "high",
+                               "basis": ["object.name"]},
+            }
+    fallback = {
+        "opening": "architectural_frame",
+        "light": "lantern",
+        "furniture": "generic_furniture",
+        "prop": "generic_prop",
+        "decor": "decor_panel",
+    }.get(category, "generic_object")
+    return {
+        "type": fallback,
+        "version": 1,
+        "source": "category_fallback",
+        "confidence": {"score": 0.3, "level": "low",
+                       "basis": ["object.category"]},
+    }
+
+
 def _mapping(value):
     return value if isinstance(value, dict) else {}
 
@@ -245,6 +295,7 @@ def _object_contract(raw, index):
                 f"「{name}」的朝向为径向回退值，并非视觉标注",
                 object_name=name))
     material, material_confidence = _material_contract(obj, category)
+    render_prefab = _render_prefab(name, category)
     if material["source"] == "category_render_default":
         warnings.append(_warning(
             "unverified_material", "material",
@@ -262,12 +313,120 @@ def _object_contract(raw, index):
         "footprint_3d": footprint,
         "geometry_sources": geometry_sources,
         "material": material,
+        "render_prefab": render_prefab,
         "geometry_confidence": _geometry_confidence(
             geometry_values, geometry_sources),
         "material_confidence": material_confidence,
         "occlusion_completion": "unverified",
         "warnings": warnings,
     }
+
+
+_SUPPORT_MARKERS = (
+    ("案上", ("案", "桌", "几", "台")),
+    ("桌上", ("桌", "案", "几", "台")),
+    ("几上", ("几", "桌", "案", "台")),
+    ("台上", ("台", "几", "桌", "案")),
+    ("柜上", ("柜",)),
+    ("床上", ("床", "榻")),
+)
+
+
+def _explicit_support_words(name):
+    text = _text(name)
+    for marker, words in _SUPPORT_MARKERS:
+        if marker in text:
+            return marker, words
+    return "", ()
+
+
+def _render_position_on_support(obj, support):
+    """Return a visual placement on an explicitly named support surface.
+
+    This is deliberately a render-only transform.  The panorama-derived
+    position remains untouched for audit and physics.  If an annotation says
+    "案上" while its panorama floor ray lands just beyond the desk footprint,
+    the prop is clamped onto the visible top instead of being rendered on the
+    floor or floating beside the desk.
+    """
+    position = _mapping(obj.get("position"))
+    base = _mapping(support.get("position"))
+    values = [position.get("x"), position.get("z"),
+              base.get("x"), base.get("z"),
+              support.get("width"), support.get("depth"),
+              support.get("height")]
+    if any(_number(value) is None for value in values):
+        return None
+    ox, oz, sx, sz, width, depth, height = map(_number, values)
+    yaw = _number(_mapping(support.get("rotation")).get("y_deg")) or 0.0
+    radians = math.radians(yaw)
+    cos_yaw, sin_yaw = math.cos(radians), math.sin(radians)
+    dx, dz = ox - sx, oz - sz
+    local_x = dx * cos_yaw - dz * sin_yaw
+    local_z = dx * sin_yaw + dz * cos_yaw
+    prop_width = _number(obj.get("width")) or 0.0
+    prop_depth = _number(obj.get("depth")) or 0.0
+    margin = 0.03
+    limit_x = max(0.0, width / 2.0 - prop_width / 2.0 - margin)
+    limit_z = max(0.0, depth / 2.0 - prop_depth / 2.0 - margin)
+    local_x = max(-limit_x, min(limit_x, local_x))
+    local_z = max(-limit_z, min(limit_z, local_z))
+    world_x = sx + local_x * cos_yaw + local_z * sin_yaw
+    world_z = sz - local_x * sin_yaw + local_z * cos_yaw
+    support_y = _number(base.get("y")) or 0.0
+    return {
+        "x": round(world_x, 4),
+        "y": round(support_y + height, 4),
+        "z": round(world_z, 4),
+    }
+
+
+def _attach_render_supports(objects):
+    for obj in objects:
+        position = dict(_mapping(obj.get("position")))
+        obj["render_transform"] = {
+            "position": position,
+            "source": "measured_geometry",
+            "support": None,
+        }
+        marker, support_words = _explicit_support_words(obj.get("name"))
+        if not marker:
+            continue
+        candidates = [
+            candidate for candidate in objects
+            if candidate is not obj
+            and any(word in _text(candidate.get("name"))
+                    for word in support_words)
+            and _number(_mapping(candidate.get("position")).get("x"))
+            is not None
+            and _number(_mapping(candidate.get("position")).get("z"))
+            is not None
+        ]
+        ox = _number(position.get("x"))
+        oz = _number(position.get("z"))
+        if ox is None or oz is None or not candidates:
+            continue
+        support = min(candidates, key=lambda candidate: math.hypot(
+            ox - _number(_mapping(candidate.get("position")).get("x")),
+            oz - _number(_mapping(candidate.get("position")).get("z"))))
+        render_position = _render_position_on_support(obj, support)
+        if render_position is None:
+            continue
+        obj["render_transform"] = {
+            "position": render_position,
+            "source": "explicit_name_support",
+            "support": {
+                "name": support.get("name"),
+                "relation": marker,
+                "confidence": {"score": 0.75, "level": "medium",
+                               "basis": ["object.name", "nearest_support"]},
+            },
+        }
+        obj["warnings"].append(_warning(
+            "render_support_inference", "render_transform.position",
+            f"「{obj.get('name')}」按名称中的「{marker}」放到"
+            f"「{support.get('name')}」顶面；原始全景落地点仍保留用于审计",
+            object_name=_text(obj.get("name"))))
 
 
 def _room_contract(scene_model):
@@ -416,6 +575,7 @@ def build_scene_render_contract(scene_model, panorama_info=None, *,
         warnings.append(_warning(
             "missing_lighting", "lighting",
             "场景没有已验证灯光参数；合同不推断光源方向或强度"))
+    _attach_render_supports(objects)
     for obj in objects:
         warnings.extend(obj["warnings"])
 

@@ -518,6 +518,16 @@ def test_blocking_svg_url_uses_document_version_to_bust_cache(server):
     assert payload["blocking"]["scenes"][0]["svg_url"].endswith("?v=1")
 
 
+def test_blocking_overlay_links_to_clean_realistic_stage(server):
+    status, ctype, app_js = _request(
+        server["port"], "GET", "/static/app.js")
+
+    assert status == 200 and "javascript" in ctype
+    assert b"blocking-real-stage-link" in app_js
+    assert b"/scene3d?episode=" in app_js
+    assert "真实布景".encode() in app_js
+
+
 def test_episode_status_is_lightweight_and_changes_with_documents(server):
     app2 = App(server["workspace"])
     try:

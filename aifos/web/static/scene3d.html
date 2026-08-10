@@ -367,6 +367,39 @@ function materialFor(obj){
  return {color,roughness,metallic,gloss,specular,panoBlend:.68,
          usedDefault:raw.source==="category_render_default"||
           !(Object.keys(raw).length||Object.keys(own).length)}}
+function renderContractObject(obj){
+ return lookupContractObject(activeRenderContract(),obj)||{}}
+function prefabFor(obj){
+ const row=renderContractObject(obj),declared=row.render_prefab||obj.render_prefab;
+ if(declared&&declared.type)return declared;
+ const text=String(obj.name||"").toLowerCase(),rules=[
+  ["lantern",["灯笼","宫灯","油灯","烛台","蜡烛"]],
+  ["brazier",["香炉","熏炉","火盆","炉"]],
+  ["vessel",["茶盏","茶杯","酒杯","水杯","小碗","瓷碗","杯","盏"]],
+  ["cabinet",["药柜","书架","书柜","卷柜","格柜","抽屉","柜"]],
+  ["paper",["宣纸","信笺","纸卷","书卷","卷册","书册","竹简","文书"]],
+  ["bed",["床榻","卧榻","床","榻"]],
+  ["chair",["椅","凳","坐墩"]],
+  ["lattice",["格心窗","格栅","隔扇","花窗","槛窗","支摘窗"]],
+  ["doorway",["门洞","门道","入口","出口"]],
+  ["door",["板门","木门","房门","车门","门扇"]],
+  ["curtain",["竹帘","布帘","纱帘","垂帘","帷幔","纱帐","帐幔"]],
+  ["column",["方柱","圆柱","檐柱","立柱","柱"]],
+  ["screen",["屏风","屏障","围屏"]],
+  ["table",["书案","画案","条案","矮案","案几","方几","茶几","桌","台几"]]];
+ for(const [type,words] of rules)if(words.some(word=>text.includes(word)))
+  return {type,source:"semantic_name",confidence:{level:"high"}};
+ const fallback={opening:"architectural_frame",light:"lantern",
+  furniture:"generic_furniture",prop:"generic_prop",decor:"decor_panel"};
+ return {type:fallback[String(obj.category||"")]||"generic_object",
+  source:"category_fallback",confidence:{level:"low"}}}
+function renderPlacementFor(obj){
+ const row=renderContractObject(obj),render=row.render_transform||{},
+       position=render.position;
+ if(position&&[position.x,position.y,position.z].every(
+  value=>Number.isFinite(Number(value))))return position;
+ const transform=obj.transform||{};
+ return obj.position_3d||transform.position_3d||transform.position}
 function lightingFor(){
  const contract=activeRenderContract();
  const light=contract.lighting||contract.light||contract.directional_light||{};
@@ -382,7 +415,8 @@ function lightingFor(){
                 contract.ambient_intensity??.30,.08,.8),
   intensity:clamp(light.intensity??light.key_intensity??
                   contract.key_intensity??.78,.15,1.5)}}
-let renderStats={objects:0,invalid:0,defaultMaterials:0};
+let renderStats={objects:0,invalid:0,defaultMaterials:0,
+                 semanticPrefabs:0,fallbackPrefabs:0};
 function updateSceneStatus(extra=[]){
  const rows=[...extra],modelEntry=locationEntry("scene_models"),
        renderEntry=locationEntry("render_contracts"),model=activeSceneModel();
@@ -402,6 +436,9 @@ function updateSceneStatus(extra=[]){
  if(renderStats.invalid)rows.push(`已跳过 ${renderStats.invalid} 件坐标或尺寸无效的物体。`);
  if(renderStats.defaultMaterials&&renderEntry)
   rows.push(`${renderStats.defaultMaterials} 件物体缺少材质，已使用分类默认值。`);
+ if(renderStats.fallbackPrefabs)
+  rows.push(`${renderStats.fallbackPrefabs} 件未知物体仍使用低置信占位体；`+
+            "不会把占位形状当成真实物件提交给生成模型。");
  const pano=((DATA&&DATA.panoramas)||{})[String((SCENE&&SCENE.location)||"")];
  if(!pano)rows.push("本场没有全景母版，房间背景将使用纯色结构底。");
  warn(rows,Boolean(modelEntry&&modelEntry.error))}
@@ -428,8 +465,128 @@ function buildGeometry(silent){
   face(v[0],v[1],v[2],v[3],m);face(v[4],v[7],v[6],v[5],m);
   face(v[0],v[4],v[5],v[1],m);face(v[1],v[5],v[6],v[2],m);
   face(v[2],v[6],v[7],v[3],m);face(v[3],v[7],v[4],v[0],m);
-  if(edges){const edge=m.color.map(v=>Math.min(1,v*1.35));
+ if(edges){const edge=m.color.map(v=>Math.min(1,v*1.35));
    edgePairs.forEach(pair=>push(v[pair[0]],v[pair[1]],edge))}}
+ function addRound(center,width,height,depth,yawDeg,m,topScale=1,sides=18){
+  const [x,y,z]=center,yaw=yawDeg*Math.PI/180,co=Math.cos(yaw),si=Math.sin(yaw),
+        point=(radiusX,yy,radiusZ,t)=>{
+         const lx=Math.cos(t)*radiusX,lz=Math.sin(t)*radiusZ;
+         return [x+lx*co+lz*si,yy,z-lx*si+lz*co]},
+        bottom=[x,y,z],top=[x,y+height,z];
+  for(let i=0;i<sides;i++){
+   const t0=i/sides*Math.PI*2,t1=(i+1)/sides*Math.PI*2,
+         b0=point(width/2,y,depth/2,t0),b1=point(width/2,y,depth/2,t1),
+         t0p=point(width/2*topScale,y+height,depth/2*topScale,t0),
+         t1p=point(width/2*topScale,y+height,depth/2*topScale,t1);
+   face(b0,b1,t1p,t0p,m);tri(top,t0p,t1p,m);tri(bottom,b1,b0,m)}}
+ function addScenePrefab(prefab,name,x,y,z,width,height,depth,yaw,m,edges){
+  const type=String((prefab&&prefab.type)||"generic_object"),
+        radians=yaw*Math.PI/180,co=Math.cos(radians),si=Math.sin(radians),
+        local=(lx,ly,lz)=>[x+lx*co+lz*si,y+ly,z-lx*si+lz*co],
+        part=(lx,ly,lz,w,h,d,turn=0,mat=m)=>
+         addBox(local(lx,ly,lz),Math.max(.015,w),Math.max(.015,h),
+                Math.max(.015,d),yaw+turn,mat,edges),
+        round=(lx,ly,lz,w,h,d,scale=1,mat=m)=>
+         addRound(local(lx,ly,lz),Math.max(.02,w),Math.max(.02,h),
+                  Math.max(.02,d),yaw,mat,scale),
+        dark={...m,color:m.color.map(value=>value*.70),panoBlend:m.panoBlend*.75},
+        light={...m,color:m.color.map(value=>Math.min(1,value*1.20)),
+               specular:Math.min(1,m.specular+.08)};
+  if(type==="table"){
+   const slab=Math.max(.055,Math.min(.13,height*.11)),leg=Math.max(.045,
+    Math.min(width,depth)*.075),ix=Math.max(0,width/2-leg*.9),
+    iz=Math.max(0,depth/2-leg*.9);
+   part(0,height-slab,0,width,slab,depth,0,light);
+   for(const lx of [-ix,ix])for(const lz of [-iz,iz])
+    part(lx,0,lz,leg,height-slab,leg,0,dark);
+   part(0,height*.68,-depth*.40,width*.78,Math.max(.035,height*.07),
+        Math.max(.025,depth*.07),0,dark);return}
+  if(type==="cabinet"){
+   const frame=Math.max(.035,Math.min(width,depth)*.10),back=Math.max(.025,depth*.12);
+   part(0,0,depth/2-back/2,width,height,back,0,dark);
+   part(-width/2+frame/2,0,0,frame,height,depth);
+   part(width/2-frame/2,0,0,frame,height,depth);
+   part(0,0,0,width,frame,depth);part(0,height-frame,0,width,frame,depth);
+   const shelves=Math.max(2,Math.min(6,Math.round(height/.55)));
+   for(let i=1;i<shelves;i++)part(0,height*i/shelves,0,width-frame*2,
+    Math.max(.025,frame*.45),depth*.90,0,light);
+   if(String(name).includes("抽屉"))for(let i=0;i<3;i++)
+    part(0,height*(.10+i*.13),-depth*.50-.012,width*.82,height*.10,.025,0,light);
+   return}
+  if(type==="lattice"){
+   const frame=Math.max(.035,Math.min(width,height)*.055),front=-depth*.12;
+   part(0,0,front,width,frame,depth,0,dark);part(0,height-frame,front,width,frame,depth,0,dark);
+   part(-width/2+frame/2,0,front,frame,height,depth,0,dark);
+   part(width/2-frame/2,0,front,frame,height,depth,0,dark);
+   const cols=Math.max(2,Math.min(9,Math.round(width/.45))),
+         rows=Math.max(2,Math.min(8,Math.round(height/.48)));
+   for(let i=1;i<cols;i++)part(-width/2+width*i/cols,frame,front,
+    Math.max(.018,frame*.38),height-frame*2,depth*.68,0,light);
+   for(let i=1;i<rows;i++)part(0,height*i/rows,front,width-frame*2,
+    Math.max(.018,frame*.38),depth*.68,0,light);return}
+  if(type==="door"||type==="doorway"||type==="architectural_frame"){
+   const frame=Math.max(.045,Math.min(width,height)*.075);
+   part(-width/2+frame/2,0,0,frame,height,depth,0,dark);
+   part(width/2-frame/2,0,0,frame,height,depth,0,dark);
+   part(0,height-frame,0,width,frame,depth,0,dark);
+   if(type==="door"){
+    part(0,frame*.25,0,width-frame*2,height-frame*1.5,
+         Math.max(.035,depth*.58),0,m);
+    part(0,height*.48,-depth*.32,width*.66,Math.max(.025,height*.025),.025,0,light)}
+   return}
+  if(type==="curtain"||type==="decor_panel"){
+   const folds=Math.max(5,Math.min(16,Math.round(width/.22))),foldW=width/folds;
+   part(0,height-.035,0,width,.035,Math.max(.035,depth),0,dark);
+   for(let i=0;i<folds;i++)part(-width/2+foldW*(i+.5),0,
+    (i%2?1:-1)*Math.max(.015,depth*.22),foldW*.82,height-.04,
+    Math.max(.018,depth*.46),0,i%2?m:dark);return}
+  if(type==="column"){
+   if(String(name).includes("方柱")){
+    part(0,0,0,width,height,depth);part(0,0,0,width*1.28,Math.max(.04,height*.035),depth*1.28,0,dark);
+    part(0,height-Math.max(.04,height*.04),0,width*1.20,Math.max(.04,height*.04),depth*1.20,0,light)}
+   else{round(0,0,0,width,height,depth,1,m);round(0,0,0,width*1.25,
+    Math.max(.04,height*.04),depth*1.25,1,dark)}return}
+  if(type==="chair"){
+   const seatY=Math.max(height*.42,.24),slab=Math.max(.035,height*.075),
+         leg=Math.max(.03,Math.min(width,depth)*.09),ix=width/2-leg,
+         iz=depth/2-leg;
+   part(0,seatY,0,width,slab,depth,0,light);
+   for(const lx of [-ix,ix])for(const lz of [-iz,iz])part(lx,0,lz,leg,seatY,leg,0,dark);
+   part(0,seatY+slab,depth/2-leg/2,width,Math.max(.08,height-seatY-slab),leg,0,m);
+   return}
+  if(type==="bed"){
+   const base=Math.max(.16,height*.30),mattress=Math.max(.16,height*.24);
+   part(0,0,0,width,base,depth,0,dark);part(0,base,0,width*.96,mattress,depth*.96,0,light);
+   part(0,0,depth/2-Math.max(.035,depth*.035),width,height,
+        Math.max(.04,depth*.07),0,m);return}
+  if(type==="screen"){
+   const panels=Math.max(2,Math.min(5,Math.round(width/.65))),panelW=width/panels;
+   for(let i=0;i<panels;i++){
+    const lx=-width/2+panelW*(i+.5),turn=(i-(panels-1)/2)*4;
+    part(lx,0,0,panelW*.94,height,Math.max(.025,depth*.55),turn,i%2?m:dark)}return}
+  if(type==="lantern"){
+   const baseH=Math.max(.03,height*.07),bodyH=height*.60;
+   part(0,0,0,width*.65,baseH,depth*.75,0,dark);
+   part(0,baseH,0,width*.82,bodyH,depth*.82,0,light);
+   part(0,baseH+bodyH,0,width,baseH,depth,0,dark);
+   const post=Math.max(.018,width*.055);
+   for(const lx of [-width*.36,width*.36])for(const lz of [-depth*.36,depth*.36])
+    part(lx,baseH,lz,post,bodyH,post,0,dark);
+   round(0,baseH+bodyH+baseH,0,width*.22,height*.18,depth*.22,.42,dark);return}
+  if(type==="brazier"){
+   round(0,height*.20,0,width,height*.45,depth,.72,m);
+   round(0,0,0,width*.36,height*.22,depth*.40,1,dark);
+   for(const lx of [-width*.53,width*.53])round(lx,height*.40,0,width*.18,
+    height*.12,depth*.22,1,dark);return}
+  if(type==="vessel"){
+   round(0,0,0,width,height,depth,1.16,m);
+   round(0,0,0,width*.54,Math.max(.018,height*.08),depth*.54,1,dark);return}
+  if(type==="paper"){
+   const thin=Math.max(.012,Math.min(.035,height*.10));
+   part(0,0,0,width,thin,depth,0,light);
+   if(String(name).includes("卷"))round(width*.34,thin,0,Math.min(width*.18,.12),
+    Math.min(width*.18,.12),depth*.52,1,dark);return}
+  addBox([x,y,z],width,height,depth,yaw,m,edges)}
  function shadowEllipse(x,z,rx,rz,offX,offZ,alpha){
   const count=20,c=[x+offX,.008,z+offZ];
   for(let i=0;i<count;i++){
@@ -469,11 +626,12 @@ function buildGeometry(silent){
    push([x,.002,-fd/2],[x,.002,fd/2],Math.abs(x)<1e-6?gridMain:grid);
   for(let z=-fd/2;z<=fd/2+1e-6;z+=1)
    push([-fw/2,.002,z],[fw/2,.002,z],Math.abs(z)<1e-6?gridMain:grid)}
- renderStats={objects:0,invalid:0,defaultMaterials:0};
+ renderStats={objects:0,invalid:0,defaultMaterials:0,
+              semanticPrefabs:0,fallbackPrefabs:0};
  for(const obj of model.objects||[]){
   if(!obj||typeof obj!=="object"){renderStats.invalid++;continue}
   const transform=obj.transform||{},bounds=obj.bounds||{},
-        rawPos=obj.position_3d||transform.position_3d||transform.position;
+        rawPos=renderPlacementFor(obj);
   if(!rawPos||![rawPos.x,rawPos.y??0,rawPos.z].every(v=>Number.isFinite(Number(v)))){
    renderStats.invalid++;continue}
   const x=Number(rawPos.x),y=finite(rawPos.y,0),z=Number(rawPos.z),
@@ -482,9 +640,11 @@ function buildGeometry(silent){
         depth=Math.max(.08,finite(obj.depth_m??obj.depth??bounds.depth_m??bounds.depth,
                                   Math.min(width*.55,.8))),
         yaw=finite(obj.rotation_y_deg??transform.rotation_y_deg??transform.yaw_deg,0),
-        material=materialFor(obj);
+        material=materialFor(obj),prefab=prefabFor(obj);
   renderStats.objects++;if(material.usedDefault)renderStats.defaultMaterials++;
-  addBox([x,y,z],width,height,depth,yaw,material,structure);
+  if(prefab.source==="category_fallback")renderStats.fallbackPrefabs++;
+  else renderStats.semanticPrefabs++;
+  addScenePrefab(prefab,obj.name||"",x,y,z,width,height,depth,yaw,material,structure);
   if(!structure){const sy=Math.max(.24,Math.abs(light.direction[1])),
     offX=-light.direction[0]/sy*Math.min(.55,height*.16),
     offZ=-light.direction[2]/sy*Math.min(.55,height*.16);
@@ -600,9 +760,9 @@ function drawLabels(mvp){
      `<b>机位</b> ${cam.lens_mm?cam.lens_mm+"mm ":""}`+
      `${(Number(cam.fov_degrees)||0).toFixed(0)}°`,"cam");
  for(const obj of activeSceneModel().objects||[]){
-  if(!obj||typeof obj!=="object")continue;
+ if(!obj||typeof obj!=="object")continue;
   const transform=obj.transform||{},bounds=obj.bounds||{},
-        p=P(obj.position_3d||transform.position_3d||transform.position),
+        p=P(renderPlacementFor(obj)),
         height=Math.max(.08,finite(obj.height_m??obj.height??
                                    bounds.height_m??bounds.height,.8));
   add([p[0],p[1]+height+.08,p[2]],
@@ -712,7 +872,7 @@ function draw(now){
   ? `本镜机位 · fov ${(Number((SHOT&&SHOT.camera||{}).fov_degrees)||0).toFixed(0)}°`
   : `环视 · ${orbit.dist.toFixed(1)}m`;
  hud.textContent=`${displayMode==="realistic"?"写实":"结构"} · ${viewText}`+
-  ` · 实体 ${renderStats.objects}`;
+  ` · 真实物件 ${renderStats.semanticPrefabs}/${renderStats.objects}`;
  requestAnimationFrame(draw)}
 
 // ---- 动态预演:播放引擎 ----
@@ -967,6 +1127,7 @@ function loadPano(location){
 
 const qs=new URLSearchParams(location.search);
 const episode=qs.get("episode");
+const requestedShot=Number(qs.get("shot"));
 if(!episode){fail("缺少 episode 参数。请从剧集页面进入,或用 /scene3d?episode=<id>")}
 else{
  fetch("/api/scene3d?episode="+encodeURIComponent(episode))
@@ -981,7 +1142,7 @@ else{
    nos.forEach(n=>{const b=document.createElement("button");
     b.textContent="镜"+n;b.dataset.no=String(n);
     b.onclick=()=>pvSeekShot(n);box.appendChild(b)});
-   selectShot(nos[0]);
+   selectShot(nos.includes(requestedShot)?requestedShot:nos[0]);
    pvInit();
    loadStatement();
    draw()})

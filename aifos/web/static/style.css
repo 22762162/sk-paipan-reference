@@ -3165,12 +3165,14 @@ textarea:focus-visible, select:focus-visible {
 .blocking-3d-shot-tabs {
   overflow-x: auto; padding-bottom: 1px; scrollbar-width: thin;
 }
-.blocking-3d-toolbar button {
+.blocking-3d-toolbar button, .blocking-3d-toolbar a {
   min-height: 31px; padding: 5px 9px;
   border: 1px solid #334155; border-radius: 7px;
   background: #111827; color: #94a3b8; font-size: 11px; white-space: nowrap;
+  text-decoration: none; font-family: inherit; line-height: 19px;
 }
-.blocking-3d-toolbar button:hover, .blocking-3d-toolbar button:focus-visible {
+.blocking-3d-toolbar button:hover, .blocking-3d-toolbar button:focus-visible,
+.blocking-3d-toolbar a:hover, .blocking-3d-toolbar a:focus-visible {
   border-color: #52b8ff; color: #e0f2fe;
 }
 .blocking-3d-toolbar button.active {
@@ -4169,8 +4171,8 @@ textarea:focus-visible, select:focus-visible {
   .blocking-actor-legend > span { width: 100%; border-radius: 8px; }
   .blocking-3d-toolbar { align-items: stretch; flex-direction: column; }
   .blocking-3d-shot-tabs, .blocking-3d-views { width: 100%; }
-  .blocking-3d-views { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); }
-  .blocking-3d-views button { padding: 5px 3px; }
+  .blocking-3d-views { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); }
+  .blocking-3d-views button, .blocking-3d-views a { padding: 5px 3px; text-align: center; }
   .blocking-3d-canvas { height: 360px; }
   .blocking-3d-hint { line-height: 1.5; }
   .blocking-map-scroll { border: 1px solid var(--hairline); }
