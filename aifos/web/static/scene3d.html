@@ -225,12 +225,12 @@ const pLine=prog(
  `precision mediump float;varying vec3 vc;uniform float alpha;
   void main(){gl_FragColor=vec4(vc,alpha);}`);
 const pLit=prog(
- `attribute vec3 pos;attribute vec3 nor;attribute vec3 col;attribute vec3 mat;
+ `attribute vec3 pos;attribute vec3 nor;attribute vec3 col;attribute vec4 mat;
   uniform mat4 mvp;varying vec3 wp;varying vec3 wn;varying vec3 vc;
-  varying vec3 vm;
+  varying vec4 vm;
   void main(){wp=pos;wn=nor;vc=col;vm=mat;gl_Position=mvp*vec4(pos,1.0);}`,
  `precision mediump float;varying vec3 wp;varying vec3 wn;varying vec3 vc;
-  varying vec3 vm;uniform vec3 eye;uniform vec3 lightDir;
+  varying vec4 vm;uniform vec3 eye;uniform vec3 lightDir;
   uniform vec3 lightColor;uniform float ambient;uniform float keyLight;
   uniform float alpha;uniform float realistic;uniform sampler2D panoTex;
   uniform vec3 panoEye0;uniform float panoAvailable;
@@ -244,9 +244,16 @@ const pLit=prog(
    if(panoAvailable>0.5&&vm.z>0.0){vec3 pd=normalize(wp-panoEye0);
     float pu=atan(pd.x,pd.z)/6.2831853+0.5;
     float pv=0.5-asin(clamp(pd.y,-1.0,1.0))/3.14159265;
-    surface=mix(vc,texture2D(panoTex,vec2(pu,pv)).rgb,clamp(vm.z,0.0,.82));}
-   vec3 lit=surface*(vec3(ambient)+keyLight*ndl*lightColor)+
+    vec3 pano=texture2D(panoTex,vec2(pu,pv)).rgb*1.15;
+    surface=mix(vc,pano,clamp(vm.z,0.0,1.0)*.42);}
+   vec3 hemi=mix(vec3(.60,.51,.42),vec3(1.10,1.05,.96),n.y*.5+.5);
+   float ao=mix(.68,1.0,clamp(wp.y*.9,0.0,1.0));
+   vec3 fillDir=normalize(vec3(-l.x,.22,-l.z));
+   float fill=max(dot(n,fillDir),0.0)*.24*realistic;
+   vec3 lit=surface*(ambient*hemi*ao+keyLight*ndl*lightColor+
+            fill*keyLight*vec3(.58,.66,.80))+
             lightColor*spec+surface*rim;
+   lit+=(surface*.55+vec3(.45))*vm.w*(.35+.65*realistic);
    gl_FragColor=vec4(clamp(lit,0.0,1.0),alpha);}`);
 const pAlpha=prog(
  `attribute vec3 pos;attribute float opa;uniform mat4 mvp;varying float va;
@@ -278,10 +285,15 @@ function bindAttr(p,name,buf,size,stride,off){
 let roomFaces=[];
 const CAPTURE=[0,1.55,0];   // 全景拍摄点:房间中心、站立视平线
 function buildRoomBox(fw,fd,h){
- for(const old of roomFaces)if(old&&old.buf)gl.deleteBuffer(old.buf);
+ const oldBufs=roomFaces.map(f=>f&&f.buf);let fi=0;
  const x=fw/2,z=fd/2;
- const face=(a,b,c,d,center,inward)=>({
-  buf:buffer([...a,...b,...c,...a,...c,...d]),count:6,center,inward});
+ // 复用旧缓冲(理由同 refill:删除会使已启用属性失效并中断整帧绘制)
+ const face=(a,b,c,d,center,inward)=>{
+  const buf=oldBufs[fi++]||gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER,buf);
+  gl.bufferData(gl.ARRAY_BUFFER,
+   new Float32Array([...a,...b,...c,...a,...c,...d]),gl.DYNAMIC_DRAW);
+  return {buf,count:6,center,inward}};
  roomFaces=[
   face([-x,0,-z],[x,0,-z],[x,0,z],[-x,0,z],[0,0,0],[0,1,0]),      // 地板
   face([-x,h,-z],[-x,h,z],[x,h,z],[x,h,-z],[0,h,0],[0,-1,0]),     // 顶
@@ -293,11 +305,21 @@ function buildRoomBox(fw,fd,h){
 buildRoomBox(10,7,4.2);
 const panoTex=gl.createTexture();let panoReady=false;
 
+// 种子化随机:布景细节(书堆/褶皱/木色差)在预演逐帧重建时必须稳定,
+// 不能用运行时随机数,否则家具每帧抖动。
+function seedRng(key){let h=2166136261;const s=String(key);
+ for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619)}
+ return()=>{h=Math.imul(h^h>>>15,2246822507);h=Math.imul(h^h>>>13,3266489909);
+  h^=h>>>16;return(h>>>0)/4294967296}}
+
 // ---- 状态 ----
 let DATA=null,SHOT=null,SCENE=null;
 let orbit={yaw:0.6,pitch:0.85,dist:11,target:[0,1,0]},mode="orbit";
 let displayMode="realistic";
 const show={pano:true,path:true,frus:true,axis:true,control:false};
+// 布景(sceneGeo)只在换场景/换模式时重建;人物与控制层(geo)逐帧重建。
+let sceneGeo={lit:null,litCount:0,shadow:null,shadowCount:0,
+              lines:null,lineCount:0};
 let geo={lit:null,litCount:0,shadow:null,shadowCount:0,
          lines:null,lineCount:0,pts:null,ptCount:0};
 
@@ -364,7 +386,8 @@ function materialFor(obj){
                       own.metalness??defaults.metallic,0,1);
  const gloss=clamp(raw.gloss??raw.glossiness??own.gloss??(1-roughness),0,1);
  const specular=clamp(raw.specular??own.specular??(.14+metallic*.58),0,1);
- return {color,roughness,metallic,gloss,specular,panoBlend:.68,
+ const emissive=clamp(raw.emissive??own.emissive??0,0,1);
+ return {color,roughness,metallic,gloss,specular,emissive,panoBlend:.68,
          usedDefault:raw.source==="category_render_default"||
           !(Object.keys(raw).length||Object.keys(own).length)}}
 function renderContractObject(obj){
@@ -386,7 +409,10 @@ function prefabFor(obj){
   ["curtain",["竹帘","布帘","纱帘","垂帘","帷幔","纱帐","帐幔"]],
   ["column",["方柱","圆柱","檐柱","立柱","柱"]],
   ["screen",["屏风","屏障","围屏"]],
-  ["table",["书案","画案","条案","矮案","案几","方几","茶几","桌","台几"]]];
+  ["table",["书案","画案","条案","矮案","琴案","案几","方几","茶几","桌","台几"]],
+  ["instrument",["古琴","瑶琴","琵琶","琴"]],
+  ["rug",["地毯","毛毯","地衣","草席","凉席","竹席","蒲团"]],
+  ["plant",["盆栽","盆景","绿植","翠竹","竹丛","兰草","花木"]]];
  for(const [type,words] of rules)if(words.some(word=>text.includes(word)))
   return {type,source:"semantic_name",confidence:{level:"high"}};
  const fallback={opening:"architectural_frame",light:"lantern",
@@ -440,16 +466,17 @@ function updateSceneStatus(extra=[]){
   rows.push(`${renderStats.fallbackPrefabs} 件未知物体仍使用低置信占位体；`+
             "不会把占位形状当成真实物件提交给生成模型。");
  const pano=((DATA&&DATA.panoramas)||{})[String((SCENE&&SCENE.location)||"")];
- if(!pano)rows.push("本场没有全景母版，房间背景将使用纯色结构底。");
+ if(!pano)rows.push("本场没有全景母版：已使用中性写实房壳作为背景。");
  warn(rows,Boolean(modelEntry&&modelEntry.error))}
 
-function buildGeometry(silent){
+// ---- 网格工具箱:静态布景与动态人物共用的几何生成器 ----
+function meshKit(){
  const L=[],PT=[],LIT=[],SHADOW=[];
  const push=(a,b,c)=>{L.push(a[0],a[1],a[2],c[0],c[1],c[2],
                              b[0],b[1],b[2],c[0],c[1],c[2])};
  const litVertex=(p,n,m)=>LIT.push(
   p[0],p[1],p[2],n[0],n[1],n[2],m.color[0],m.color[1],m.color[2],
-  m.specular,m.gloss,finite(m.panoBlend,0));
+  m.specular,m.gloss,finite(m.panoBlend,0),finite(m.emissive,0));
  const tri=(a,b,c,m)=>{const n=V.norm(V.cross(V.sub(b,a),V.sub(c,a)));
   litVertex(a,n,m);litVertex(b,n,m);litVertex(c,n,m)};
  const face=(a,b,c,d,m)=>{tri(a,b,c,m);tri(a,c,d,m)};
@@ -465,7 +492,7 @@ function buildGeometry(silent){
   face(v[0],v[1],v[2],v[3],m);face(v[4],v[7],v[6],v[5],m);
   face(v[0],v[4],v[5],v[1],m);face(v[1],v[5],v[6],v[2],m);
   face(v[2],v[6],v[7],v[3],m);face(v[3],v[7],v[4],v[0],m);
- if(edges){const edge=m.color.map(v=>Math.min(1,v*1.35));
+  if(edges){const edge=m.color.map(c=>Math.min(1,c*1.35));
    edgePairs.forEach(pair=>push(v[pair[0]],v[pair[1]],edge))}}
  function addRound(center,width,height,depth,yawDeg,m,topScale=1,sides=18){
   const [x,y,z]=center,yaw=yawDeg*Math.PI/180,co=Math.cos(yaw),si=Math.sin(yaw),
@@ -479,153 +506,441 @@ function buildGeometry(silent){
          t0p=point(width/2*topScale,y+height,depth/2*topScale,t0),
          t1p=point(width/2*topScale,y+height,depth/2*topScale,t1);
    face(b0,b1,t1p,t0p,m);tri(top,t0p,t1p,m);tri(bottom,b1,b0,m)}}
- function addScenePrefab(prefab,name,x,y,z,width,height,depth,yaw,m,edges){
-  const type=String((prefab&&prefab.type)||"generic_object"),
-        radians=yaw*Math.PI/180,co=Math.cos(radians),si=Math.sin(radians),
-        local=(lx,ly,lz)=>[x+lx*co+lz*si,y+ly,z-lx*si+lz*co],
-        part=(lx,ly,lz,w,h,d,turn=0,mat=m)=>
-         addBox(local(lx,ly,lz),Math.max(.015,w),Math.max(.015,h),
-                Math.max(.015,d),yaw+turn,mat,edges),
-        round=(lx,ly,lz,w,h,d,scale=1,mat=m)=>
-         addRound(local(lx,ly,lz),Math.max(.02,w),Math.max(.02,h),
-                  Math.max(.02,d),yaw,mat,scale),
-        dark={...m,color:m.color.map(value=>value*.70),panoBlend:m.panoBlend*.75},
-        light={...m,color:m.color.map(value=>Math.min(1,value*1.20)),
-               specular:Math.min(1,m.specular+.08)};
-  if(type==="table"){
-   const slab=Math.max(.055,Math.min(.13,height*.11)),leg=Math.max(.045,
-    Math.min(width,depth)*.075),ix=Math.max(0,width/2-leg*.9),
-    iz=Math.max(0,depth/2-leg*.9);
-   part(0,height-slab,0,width,slab,depth,0,light);
-   for(const lx of [-ix,ix])for(const lz of [-iz,iz])
-    part(lx,0,lz,leg,height-slab,leg,0,dark);
-   part(0,height*.68,-depth*.40,width*.78,Math.max(.035,height*.07),
-        Math.max(.025,depth*.07),0,dark);return}
-  if(type==="cabinet"){
-   const frame=Math.max(.035,Math.min(width,depth)*.10),back=Math.max(.025,depth*.12);
-   part(0,0,depth/2-back/2,width,height,back,0,dark);
-   part(-width/2+frame/2,0,0,frame,height,depth);
-   part(width/2-frame/2,0,0,frame,height,depth);
-   part(0,0,0,width,frame,depth);part(0,height-frame,0,width,frame,depth);
-   const shelves=Math.max(2,Math.min(6,Math.round(height/.55)));
-   for(let i=1;i<shelves;i++)part(0,height*i/shelves,0,width-frame*2,
-    Math.max(.025,frame*.45),depth*.90,0,light);
-   if(String(name).includes("抽屉"))for(let i=0;i<3;i++)
-    part(0,height*(.10+i*.13),-depth*.50-.012,width*.82,height*.10,.025,0,light);
-   return}
-  if(type==="lattice"){
-   const frame=Math.max(.035,Math.min(width,height)*.055),front=-depth*.12;
-   part(0,0,front,width,frame,depth,0,dark);part(0,height-frame,front,width,frame,depth,0,dark);
-   part(-width/2+frame/2,0,front,frame,height,depth,0,dark);
-   part(width/2-frame/2,0,front,frame,height,depth,0,dark);
-   const cols=Math.max(2,Math.min(9,Math.round(width/.45))),
-         rows=Math.max(2,Math.min(8,Math.round(height/.48)));
-   for(let i=1;i<cols;i++)part(-width/2+width*i/cols,frame,front,
-    Math.max(.018,frame*.38),height-frame*2,depth*.68,0,light);
-   for(let i=1;i<rows;i++)part(0,height*i/rows,front,width-frame*2,
-    Math.max(.018,frame*.38),depth*.68,0,light);return}
-  if(type==="door"||type==="doorway"||type==="architectural_frame"){
-   const frame=Math.max(.045,Math.min(width,height)*.075);
-   part(-width/2+frame/2,0,0,frame,height,depth,0,dark);
-   part(width/2-frame/2,0,0,frame,height,depth,0,dark);
-   part(0,height-frame,0,width,frame,depth,0,dark);
-   if(type==="door"){
-    part(0,frame*.25,0,width-frame*2,height-frame*1.5,
-         Math.max(.035,depth*.58),0,m);
-    part(0,height*.48,-depth*.32,width*.66,Math.max(.025,height*.025),.025,0,light)}
-   return}
-  if(type==="curtain"||type==="decor_panel"){
-   const folds=Math.max(5,Math.min(16,Math.round(width/.22))),foldW=width/folds;
-   part(0,height-.035,0,width,.035,Math.max(.035,depth),0,dark);
-   for(let i=0;i<folds;i++)part(-width/2+foldW*(i+.5),0,
-    (i%2?1:-1)*Math.max(.015,depth*.22),foldW*.82,height-.04,
-    Math.max(.018,depth*.46),0,i%2?m:dark);return}
-  if(type==="column"){
-   if(String(name).includes("方柱")){
-    part(0,0,0,width,height,depth);part(0,0,0,width*1.28,Math.max(.04,height*.035),depth*1.28,0,dark);
-    part(0,height-Math.max(.04,height*.04),0,width*1.20,Math.max(.04,height*.04),depth*1.20,0,light)}
-   else{round(0,0,0,width,height,depth,1,m);round(0,0,0,width*1.25,
-    Math.max(.04,height*.04),depth*1.25,1,dark)}return}
-  if(type==="chair"){
-   const seatY=Math.max(height*.42,.24),slab=Math.max(.035,height*.075),
-         leg=Math.max(.03,Math.min(width,depth)*.09),ix=width/2-leg,
-         iz=depth/2-leg;
-   part(0,seatY,0,width,slab,depth,0,light);
-   for(const lx of [-ix,ix])for(const lz of [-iz,iz])part(lx,0,lz,leg,seatY,leg,0,dark);
-   part(0,seatY+slab,depth/2-leg/2,width,Math.max(.08,height-seatY-slab),leg,0,m);
-   return}
-  if(type==="bed"){
-   const base=Math.max(.16,height*.30),mattress=Math.max(.16,height*.24);
-   part(0,0,0,width,base,depth,0,dark);part(0,base,0,width*.96,mattress,depth*.96,0,light);
-   part(0,0,depth/2-Math.max(.035,depth*.035),width,height,
-        Math.max(.04,depth*.07),0,m);return}
-  if(type==="screen"){
-   const panels=Math.max(2,Math.min(5,Math.round(width/.65))),panelW=width/panels;
-   for(let i=0;i<panels;i++){
-    const lx=-width/2+panelW*(i+.5),turn=(i-(panels-1)/2)*4;
-    part(lx,0,0,panelW*.94,height,Math.max(.025,depth*.55),turn,i%2?m:dark)}return}
-  if(type==="lantern"){
-   const baseH=Math.max(.03,height*.07),bodyH=height*.60;
-   part(0,0,0,width*.65,baseH,depth*.75,0,dark);
-   part(0,baseH,0,width*.82,bodyH,depth*.82,0,light);
-   part(0,baseH+bodyH,0,width,baseH,depth,0,dark);
-   const post=Math.max(.018,width*.055);
-   for(const lx of [-width*.36,width*.36])for(const lz of [-depth*.36,depth*.36])
-    part(lx,baseH,lz,post,bodyH,post,0,dark);
-   round(0,baseH+bodyH+baseH,0,width*.22,height*.18,depth*.22,.42,dark);return}
-  if(type==="brazier"){
-   round(0,height*.20,0,width,height*.45,depth,.72,m);
-   round(0,0,0,width*.36,height*.22,depth*.40,1,dark);
-   for(const lx of [-width*.53,width*.53])round(lx,height*.40,0,width*.18,
-    height*.12,depth*.22,1,dark);return}
-  if(type==="vessel"){
-   round(0,0,0,width,height,depth,1.16,m);
-   round(0,0,0,width*.54,Math.max(.018,height*.08),depth*.54,1,dark);return}
-  if(type==="paper"){
-   const thin=Math.max(.012,Math.min(.035,height*.10));
-   part(0,0,0,width,thin,depth,0,light);
-   if(String(name).includes("卷"))round(width*.34,thin,0,Math.min(width*.18,.12),
-    Math.min(width*.18,.12),depth*.52,1,dark);return}
-  addBox([x,y,z],width,height,depth,yaw,m,edges)}
- function shadowEllipse(x,z,rx,rz,offX,offZ,alpha){
-  const count=20,c=[x+offX,.008,z+offZ];
+ function shadowEllipse(x,z,rx,rz,offX,offZ,alpha,yawDeg=0){
+  const count=20,yaw=(yawDeg||0)*Math.PI/180,
+        co=Math.cos(yaw),si=Math.sin(yaw),c=[x+offX,.008,z+offZ],
+        at=t=>{const lx=rx*Math.cos(t),lz=rz*Math.sin(t);
+         return [c[0]+lx*co+lz*si,c[1],c[2]-lx*si+lz*co]};
   for(let i=0;i<count;i++){
-   const t0=i/count*Math.PI*2,t1=(i+1)/count*Math.PI*2,
-         p0=[c[0]+rx*Math.cos(t0),c[1],c[2]+rz*Math.sin(t0)],
-         p1=[c[0]+rx*Math.cos(t1),c[1],c[2]+rz*Math.sin(t1)];
+   const p0=at(i/count*Math.PI*2),p1=at((i+1)/count*Math.PI*2);
    SHADOW.push(c[0],c[1],c[2],alpha,p0[0],p0[1],p0[2],.015,
                p1[0],p1[1],p1[2],.015)}}
- function addActorSolid(x,y,z,h,col){
-  const skin={color:col.map(v=>Math.min(1,v*1.18)),specular:.18,gloss:.22,
-              panoBlend:0},
-        cloth={color:col.map(v=>v*.72),specular:.12,gloss:.16,panoBlend:0};
-  addBox([x,y,z],.075*h,.49*h,.09*h,0,cloth);
-  addBox([x+.09*h,y,z],.065*h,.49*h,.085*h,0,cloth);
-  addBox([x+.045*h,y+.49*h,z],.27*h,.29*h,.14*h,0,cloth);
-  addBox([x-.13*h,y+.48*h,z],.055*h,.29*h,.07*h,0,cloth);
-  addBox([x+.22*h,y+.48*h,z],.055*h,.29*h,.07*h,0,cloth);
-  addBox([x+.045*h,y+.80*h,z],.16*h,.18*h,.15*h,0,skin)}
- function stickman(x,y,z,h,col){
-  const hip=y+.50*h,shoulder=y+.80*h,headC=y+.90*h,headR=.09*h;
-  push([x,hip,z],[x,shoulder,z],col);
-  for(let i=0;i<14;i++){const t0=i/14*Math.PI*2,t1=(i+1)/14*Math.PI*2;
-   push([x+headR*Math.sin(t0),headC+headR*Math.cos(t0),z],
-        [x+headR*Math.sin(t1),headC+headR*Math.cos(t1),z],col);
-   push([x,headC+headR*Math.cos(t0),z+headR*Math.sin(t0)],
-        [x,headC+headR*Math.cos(t1),z+headR*Math.sin(t1)],col)}
-  push([x,shoulder-.02*h,z],[x-.16*h,y+.42*h,z],col);
-  push([x,shoulder-.02*h,z],[x+.16*h,y+.42*h,z],col);
-  push([x,hip,z],[x-.10*h,y,z],col);push([x,hip,z],[x+.10*h,y,z],col)}
+ // 复用缓冲对象只重填数据:已启用的顶点属性若指向被删除的缓冲,
+ // 整帧 drawArrays 会报 INVALID_OPERATION(含全景),故绝不删除缓冲。
+ const refill=(target,key,data)=>{
+  if(!target[key])target[key]=gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER,target[key]);
+  gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(data),gl.DYNAMIC_DRAW)};
+ function upload(target){
+  refill(target,"lit",LIT);target.litCount=LIT.length/13;
+  refill(target,"shadow",SHADOW);target.shadowCount=SHADOW.length/4;
+  refill(target,"lines",L);target.lineCount=L.length/6;
+  if("pts" in target){refill(target,"pts",PT);target.ptCount=PT.length/6}}
+ return {L,PT,LIT,SHADOW,push,litVertex,tri,face,addBox,addRound,
+         shadowEllipse,upload}}
+// ---- 语义预制件:按名称与类别把包围盒长成可辨认的国风陈设 ----
+function addScenePrefab(kit,prefab,name,x,y,z,width,height,depth,yaw,m,edges){
+ const {addBox,addRound,push}=kit,
+       type=String((prefab&&prefab.type)||"generic_object"),
+       label=String(name||""),
+       rng=seedRng(label+"@"+x.toFixed(2)+","+z.toFixed(2)),
+       radians=yaw*Math.PI/180,co=Math.cos(radians),si=Math.sin(radians),
+       local=(lx,ly,lz)=>[x+lx*co+lz*si,y+ly,z-lx*si+lz*co],
+       part=(lx,ly,lz,w,h,d,turn=0,mat=m)=>
+        addBox(local(lx,ly,lz),Math.max(.015,w),Math.max(.015,h),
+               Math.max(.015,d),yaw+turn,mat,edges),
+       round=(lx,ly,lz,w,h,d,scale=1,mat=m,sides=18)=>
+        addRound(local(lx,ly,lz),Math.max(.02,w),Math.max(.02,h),
+                 Math.max(.02,d),yaw,mat,scale,sides),
+       tone=f=>({...m,color:m.color.map(c=>Math.min(1,c*f))}),
+       vary=(mat,f)=>({...mat,color:mat.color.map(c=>Math.min(1,c*f))}),
+       dark=tone(.70),deep=tone(.55),light=tone(1.20),
+       paperMat={color:hex("#d6c8a6"),specular:.06,gloss:.12,
+                 panoBlend:.15,emissive:0},
+       metalMat={color:hex("#8a744b"),specular:.6,gloss:.72,
+                 panoBlend:.2,emissive:0},
+       stoneMat={color:hex("#7d7668"),specular:.08,gloss:.2,
+                 panoBlend:.2,emissive:0};
+ if(type==="table"){
+  const slab=clamp(height*.10,.05,.12),apron=clamp(height*.10,.04,.10),
+        leg=Math.max(.05,Math.min(width,depth)*.07),
+        an=label.includes("案"),inset=an?width*.16:leg*.9,
+        ix=Math.max(leg,width/2-inset),iz=Math.max(leg,depth/2-leg*.9);
+  part(0,height-slab,0,width,slab,depth,0,vary(light,.98+rng()*.06));
+  part(0,height-slab*1.45,0,width*.985,slab*.5,depth*.985,0,dark);
+  part(0,height-slab-apron,0,ix*2-leg,apron,depth*.86,0,tone(.86));
+  for(const lx of [-ix,ix])for(const lz of [-iz,iz])
+   part(lx,0,lz,leg,height-slab,leg,0,vary(dark,.94+rng()*.1));
+  for(const lx of [-ix,ix])
+   part(lx,height*.16,0,leg*.6,leg*.55,iz*2,0,deep);
+  if(!an)for(const lz of [-iz,iz])
+   part(0,height*.16,lz,ix*2,leg*.55,leg*.6,0,deep);
+  return}
+ if(type==="cabinet"){
+  const frame=Math.max(.04,Math.min(width,depth)*.09),
+        drawers=/抽屉|药/.test(label),
+        open=/架|书|卷/.test(label)&&!drawers;
+  part(0,0,depth/2-frame*.35,width,height,frame*.7,0,deep);
+  part(-width/2+frame/2,0,0,frame,height,depth);
+  part(width/2-frame/2,0,0,frame,height,depth);
+  part(0,0,0,width,frame,depth,0,dark);
+  part(0,height-frame,0,width,frame,depth,0,dark);
+  part(0,height-frame*.5,0,width*1.05,frame*.55,depth*1.06,0,dark);
+  part(0,0,0,width*1.04,frame*.5,depth*1.05,0,deep);
+  if(drawers){
+   const rows=clamp(Math.round(height/.30),3,7),
+         cols=clamp(Math.round(width/.28),2,5),
+         cw=(width-frame*2)/cols,ch=(height-frame*2)/rows;
+   for(let r=0;r<rows;r++)for(let c=0;c<cols;c++){
+    const lx=-width/2+frame+cw*(c+.5),ly=frame+ch*r;
+    part(lx,ly+ch*.07,-depth/2-.008,cw*.86,ch*.80,.03,0,
+         vary(m,.9+rng()*.2));
+    part(lx,ly+ch*.46,-depth/2-.026,cw*.16,ch*.13,.02,0,metalMat)}
+  }else if(open){
+   const shelves=clamp(Math.round(height/.42),2,5),
+         inner=width-frame*2,sh=(height-frame*2)/shelves,
+         inks=["#3d4a5c","#233026","#6e5335","#5c5c54","#54402e"];
+   for(let i=1;i<shelves;i++)
+    part(0,frame+sh*i,0,inner,frame*.5,depth*.92,0,light);
+   for(let s=0;s<shelves;s++){
+    let cx=-inner/2+.04;const ly=frame+sh*s+frame*.3;
+    while(cx<inner/2-.14){
+     const runW=.12+rng()*.2,runH=Math.min(sh*.72,.2+rng()*.13),
+           ink={color:hex(inks[(rng()*inks.length)|0]),specular:.08,
+                gloss:.2,panoBlend:.1,emissive:0};
+     if(rng()<.24)part(cx+runW/2,ly,0,runW*.9,.05+rng()*.03,
+      depth*.62,0,vary(paperMat,.9+rng()*.16));
+     else part(cx+runW/2,ly,0,runW,runH,depth*.6,rng()<.14?6:0,ink);
+     cx+=runW+.025}}
+  }else{
+   for(const s of [-1,1])part(s*width*.24,frame,-depth/2-.006,
+    width*.44,height-frame*2.6,.03,0,vary(m,.94+rng()*.1));
+   part(0,height*.46,-depth/2-.02,width*.07,height*.09,.018,0,metalMat)}
+  return}
+ if(type==="lattice"){
+  const frame=Math.max(.04,Math.min(width,height)*.06),front=-depth*.12,
+        glow={...paperMat,panoBlend:0,emissive:.20};
+  part(0,-.02,0,width*1.05,.05,depth*1.3,0,dark);
+  part(0,0,front,width,frame,depth,0,dark);
+  part(0,height-frame,front,width,frame,depth,0,dark);
+  part(-width/2+frame/2,0,front,frame,height,depth,0,dark);
+  part(width/2-frame/2,0,front,frame,height,depth,0,dark);
+  part(0,frame,front+depth*.30,width-frame*1.6,height-frame*2,.02,0,glow);
+  const cols=clamp(Math.round(width/.15),4,14),
+        rows=clamp(Math.round(height/.34),2,6),bar=Math.max(.016,frame*.34);
+  for(let i=1;i<cols;i++)part(-width/2+width*i/cols,frame,front,
+   bar,height-frame*2,depth*.5,0,tone(.9));
+  for(let i=1;i<rows;i++)part(0,height*i/rows,front,width-frame*2,
+   bar,depth*.5,0,tone(.9));
+  return}
+ if(type==="door"||type==="doorway"||type==="architectural_frame"){
+  const frame=Math.max(.05,Math.min(width,height)*.07);
+  part(-width/2+frame/2,0,0,frame,height,depth,0,dark);
+  part(width/2-frame/2,0,0,frame,height,depth,0,dark);
+  part(0,height-frame,0,width,frame,depth,0,dark);
+  part(0,height-frame*.4,0,width*1.08,frame*.5,depth*1.15,0,deep);
+  part(0,0,0,width,frame*.8,depth*1.1,0,deep);
+  if(type==="door"){
+   const inner=width-frame*2,planks=clamp(Math.round(inner/.18),3,7),
+         pw=inner/planks;
+   for(let i=0;i<planks;i++)
+    part(-inner/2+pw*(i+.5),frame*.8,0,pw*.94,height-frame*1.9,
+         Math.max(.04,depth*.5),0,vary(m,.9+rng()*.16));
+   for(const fy of [.30,.62])part(0,height*fy,-depth*.30,inner*.94,
+    frame*.5,.025,0,dark);
+   round(-inner*.22,height*.46,-depth*.34,.07,.02,.07,1,metalMat,10);
+   round(-inner*.22,height*.42,-depth*.36,.05,.05,.02,1,metalMat,10)}
+  return}
+ if(type==="curtain"||type==="decor_panel"){
+  const folds=clamp(Math.round(width/.15),6,20),foldW=width/folds,
+        phase=rng()*6.28;
+  part(0,height-.045,0,width*1.08,.045,Math.max(.05,depth*.4),0,dark);
+  round(-width*.54,height-.05,0,.05,.05,.05,1,deep,8);
+  round(width*.54,height-.05,0,.05,.05,.05,1,deep,8);
+  for(let i=0;i<folds;i++){
+   const sway=Math.sin(i*1.9+phase),drop=height*(.955+rng()*.042);
+   part(-width/2+foldW*(i+.5),height-.05-drop,
+        sway*Math.max(.02,depth*.28),foldW*.88,drop,
+        Math.max(.02,depth*.4),sway*3,i%2?vary(m,1.05):vary(m,.82))}
+  return}
+ if(type==="column"){
+  const square=label.includes("方");
+  round(0,0,0,width*1.5,.07,depth*1.5,1.12,stoneMat,14);
+  round(0,.07,0,width*1.28,.09,depth*1.28,.82,vary(stoneMat,1.1),14);
+  if(square){part(0,.16,0,width,height-.34,depth);
+   part(0,height-.21,0,width*1.3,.09,depth*1.3,0,dark)}
+  else{round(0,.16,0,width,height-.34,depth,.93);
+   round(0,height-.21,0,width*1.06,.05,depth*1.06,1.18,dark)}
+  part(0,height-.13,0,width*1.45,.13,depth*1.45,0,vary(dark,1.05));
+  return}
+ if(type==="chair"){
+  const drum=/墩|鼓/.test(label),stool=/凳/.test(label);
+  if(drum){
+   round(0,0,0,width*.72,height*.16,depth*.72,1.3,dark,14);
+   round(0,height*.16,0,width*.94,height*.44,depth*.94,1.06,m,14);
+   round(0,height*.60,0,width*.99,height*.24,depth*.99,.74,
+         vary(m,.92),14);
+   round(0,height*.84,0,width*.74,height*.16,depth*.74,.98,light,14);
+   return}
+  const seatY=Math.max(height*.40,.24),slab=Math.max(.04,height*.06),
+        leg=Math.max(.035,Math.min(width,depth)*.085),
+        ix=width/2-leg*.7,iz=depth/2-leg*.7;
+  part(0,seatY,0,width,slab,depth,0,light);
+  part(0,seatY-slab*.9,0,width*.9,slab*.8,depth*.9,0,tone(.84));
+  for(const lx of [-ix,ix])for(const lz of [-iz,iz])
+   part(lx,0,lz,leg,seatY,leg,0,vary(dark,.94+rng()*.08));
+  part(0,seatY*.32,-iz,ix*2,leg*.5,leg*.55,0,deep);
+  for(const lx of [-ix,ix])part(lx,seatY*.45,0,leg*.5,leg*.55,iz*2,0,deep);
+  if(!stool){
+   const backH=Math.max(.12,height-seatY-slab);
+   for(const lx of [-ix,ix])part(lx,seatY+slab,iz,leg*.8,backH,leg*.8,0,dark);
+   part(0,height-leg*1.2,iz,width,leg*1.2,leg*.9,0,m);
+   part(0,seatY+slab+backH*.10,iz,width*.30,backH*.68,leg*.5,0,
+        vary(m,1.08))}
+  return}
+ if(type==="bed"){
+  const base=Math.max(.14,height*.26),mat=Math.max(.10,height*.16),
+        rail=Math.max(.05,height*.07),legH=Math.max(.09,height*.12);
+  part(0,legH,0,width,base,depth,0,dark);
+  for(const lx of [-width/2+.09,width/2-.09])
+   for(const lz of [-depth/2+.09,depth/2-.09])
+    part(lx,0,lz,.13,legH,.13,0,deep);
+  part(0,legH+base,0,width*.97,mat,depth*.97,0,
+       {color:hex("#a89274"),specular:.05,gloss:.1,panoBlend:.2,
+        emissive:0});
+  const top=legH+base+mat,backH=Math.max(.12,height-top);
+  part(0,top,depth/2-rail*.5,width,backH,rail,0,m);
+  for(const s of [-1,1])part(s*(width/2-rail*.5),top,0,rail,
+   backH*.78,depth*.94,0,tone(.9));
+  part(width*.30,top,depth*.10,width*.26,mat*.9,depth*.5,0,
+       {color:hex("#7e6a52"),specular:.05,gloss:.1,panoBlend:0,
+        emissive:0});
+  part(-width*.34,top,depth*.14,width*.2,mat*.6,depth*.3,0,
+       {color:hex("#9d8a6b"),specular:.05,gloss:.1,panoBlend:0,
+        emissive:0});
+  return}
+ if(type==="screen"){
+  const panels=clamp(Math.round(width/.55),2,6),panelW=width/panels,
+        frame=Math.max(.03,panelW*.07);
+  for(let i=0;i<panels;i++){
+   const lx=-width/2+panelW*(i+.5),turn=(i-(panels-1)/2)*7,
+         pd=Math.max(.03,depth*.5);
+   part(lx,0,0,panelW*.96,frame*1.6,pd,turn,dark);
+   part(lx,height-frame,0,panelW*.96,frame,pd,turn,dark);
+   part(lx-panelW*.44,frame,0,frame,height-frame*2,pd,turn,dark);
+   part(lx+panelW*.44,frame,0,frame,height-frame*2,pd,turn,dark);
+   part(lx,frame*1.6,0,panelW*.82,height-frame*3.2,pd*.4,turn,
+        vary(m,1.10+(i%2?0:.07)));
+   part(lx,0,0,panelW*.30,frame*.9,pd*2.6,turn,deep)}
+  return}
+ if(type==="lantern"){
+  const floorLamp=height>1.1,
+        bodyH=floorLamp?height*.30:height*.58,
+        bodyY=floorLamp?height*.60:height*.18,
+        bodyW=Math.max(width*(floorLamp?.9:.85),.1),
+        glow={color:hex("#f4d9a0"),specular:.1,gloss:.3,panoBlend:0,
+              emissive:.75},
+        tassel={color:hex("#a63b30"),specular:.1,gloss:.3,panoBlend:0,
+                emissive:0};
+  if(floorLamp){
+   round(0,0,0,width*.9,.05,depth*.9,1.1,deep,10);
+   round(0,.05,0,width*.16,bodyY-.05,depth*.16,.9,dark,8)}
+  else round(0,0,0,width*.7,bodyY,depth*.7,.8,dark,8);
+  round(0,bodyY-.03,0,bodyW*1.04,.045,bodyW*1.04,1,dark,6);
+  round(0,bodyY,0,bodyW,bodyH,bodyW,1,glow,6);
+  round(0,bodyY+bodyH,0,bodyW*1.05,.05,bodyW*1.05,.62,dark,6);
+  round(0,bodyY+bodyH+.05,0,width*.16,.07,depth*.16,.4,dark,6);
+  part(0,bodyY-.16,0,.016,.16,.016,0,tassel);
+  round(0,bodyY-.24,0,.05,.09,.05,.5,tassel,8);
+  return}
+ if(type==="brazier"){
+  const open=/火盆|炭/.test(label),bodyY=height*.30,bodyH=height*.42;
+  for(let i=0;i<3;i++){const a=i*2.094+.5,
+   lx=Math.cos(a)*width*.30,lz=Math.sin(a)*width*.30;
+   round(lx,0,lz,width*.13,bodyY+.02,width*.13,.72,dark,8)}
+  round(0,bodyY,0,width*.86,bodyH*.5,depth*.86,1.14,m,16);
+  round(0,bodyY+bodyH*.5,0,width*.98,bodyH*.5,depth*.98,.82,m,16);
+  for(const s of [-1,1])part(s*width*.5,bodyY+bodyH*.55,0,
+   width*.1,height*.16,width*.1,0,dark);
+  if(open)round(0,bodyY+bodyH*.9,0,width*.6,.04,depth*.6,.9,
+   {color:hex("#e07a3a"),specular:.1,gloss:.2,panoBlend:0,
+    emissive:.65},10);
+  else{round(0,bodyY+bodyH,0,width*.8,height*.14,depth*.8,.4,dark,16);
+   round(0,bodyY+bodyH+height*.14,0,width*.12,height*.07,depth*.12,.6,
+    metalMat,8)}
+  return}
+ if(type==="vessel"){
+  round(0,0,0,width*.46,Math.max(.015,height*.14),depth*.46,.9,dark,12);
+  round(0,Math.max(.015,height*.14),0,width*.7,
+        Math.max(.02,height*.86),depth*.7,1.3,
+        {...m,specular:Math.max(.3,m.specular),
+         gloss:Math.max(.5,m.gloss)},12);
+  return}
+ if(type==="paper"){
+  const thin=Math.max(.01,Math.min(.03,height*.3));
+  if(label.includes("竹简")){
+   const slats=clamp(Math.round(width/.05),6,12),sw=width/slats;
+   for(let i=0;i<slats;i++)part(-width/2+sw*(i+.5),0,0,sw*.8,thin,
+    depth,0,vary(m,.86+rng()*.2));
+   return}
+  for(let i=0;i<3;i++)part((rng()-.5)*width*.16,thin*i,
+   (rng()-.5)*depth*.2,width*(1-.08*i),thin,depth*(1-.06*i),
+   (rng()-.5)*10,vary(m,.94+rng()*.1));
+  if(label.includes("卷"))part(width*.36,thin*2,0,.09,.09,depth*.66,0,
+   vary(m,.8));
+  return}
+ if(type==="rug"){
+  if(/蒲团/.test(label)){
+   round(0,0,0,width,Math.max(.05,height),depth,.88,m,14);
+   round(0,Math.max(.05,height),0,width*.9,.015,depth*.9,1,light,14);
+   return}
+  part(0,0,0,width,.014,depth,0,m);
+  part(0,.014,0,width*.86,.006,depth*.82,0,vary(m,1.14));
+  const bw=Math.min(width,depth)*.05;
+  part(0,.012,-depth/2+bw/2,width,.008,bw,0,deep);
+  part(0,.012,depth/2-bw/2,width,.008,bw,0,deep);
+  part(-width/2+bw/2,.012,0,bw,.008,depth,0,deep);
+  part(width/2-bw/2,.012,0,bw,.008,depth,0,deep);
+  return}
+ if(type==="plant"){
+  const potH=Math.min(.32,height*.3),
+        leaf={color:hex("#55673f"),specular:.1,gloss:.25,panoBlend:.1,
+              emissive:0},
+        pot={...m,color:hex("#6f5340")};
+  round(0,0,0,width*.62,potH,depth*.62,1.22,pot,12);
+  round(0,potH,0,width*.55,.03,depth*.55,.9,deep,10);
+  if(/竹/.test(label)){
+   for(let i=0;i<3;i++){const lx=(rng()-.5)*width*.3,
+    lz=(rng()-.5)*depth*.3;
+    round(lx,potH,lz,.035,height-potH,.035,.85,
+     {...leaf,color:hex("#6b7c4a")},6);
+    for(let k=1;k<4;k++)part(lx+.05,potH+(height-potH)*k/4,lz,
+     .16+rng()*.1,.02,.05,rng()*90,leaf)}
+   return}
+  round(0,potH,0,width*.14,height*.30,depth*.14,.8,
+        {...pot,color:hex("#5a4632")},8);
+  for(let i=0;i<4;i++)
+   round((rng()-.5)*width*.4,potH+height*(.30+.15*i),
+    (rng()-.5)*depth*.4,width*(.72-.12*i),height*.22,
+    depth*(.72-.12*i),.5,vary(leaf,.85+rng()*.3),10);
+  return}
+ if(type==="instrument"){
+  const feet=Math.min(.05,height*.3),bodyH=Math.max(.025,height-feet),
+        lacquer={...m,specular:Math.max(.45,m.specular),
+                 gloss:Math.max(.7,m.gloss)};
+  for(const lz of [-depth*.28,depth*.28])
+   part(width*.30,0,lz,.05,feet,.06,0,dark);
+  part(-width*.44,0,0,.06,feet,depth*.8,0,dark);
+  part(-width*.05,feet,0,width*.9,bodyH,depth,0,lacquer);
+  part(width*.445,feet,0,width*.11,bodyH*.85,depth*.84,0,
+       vary(lacquer,.88));
+  part(-width*.43,feet+bodyH,0,.02,bodyH*.6,depth*.88,0,light);
+  for(let s=0;s<7;s++){const lz=-depth*.34+depth*.68*s/6;
+   push(local(-width*.43,feet+bodyH*1.5,lz),
+        local(width*.47,feet+bodyH*1.2,lz),[.85,.74,.5])}
+  return}
+ addBox([x,y,z],width,height,depth,yaw,m,edges)}
 
+// 无全景母版时的中性写实房壳:板条地面/裙墙/梁檩天花,布景不再悬浮黑底。
+// 地板与角柱进常驻布景;四墙与天花按"内表面朝向相机"逐面剖切,
+// 与全景房间盒同一判据——屋外俯瞰自动让开,进入机位六面齐全。
+function addFallbackRoom(kit,fw,fd,h){
+ const {addBox,addRound}=kit,rng=seedRng("room:"+fw+"x"+fd+"x"+h),
+       x=fw/2,z=fd/2,
+       wood=c=>({color:hex(c),specular:.09,gloss:.22,panoBlend:0,
+                 emissive:0});
+ addBox([0,-.075,0],fw+.1,.03,fd+.1,0,wood("#241a12"));
+ let px=-x;
+ while(px<x-.01){
+  const pw=Math.min(.5+rng()*.22,x-px),plank=wood("#6d4d33"),
+        f=.86+rng()*.24;
+  plank.color=plank.color.map(c=>Math.min(1,c*f));
+  addBox([px+pw/2,-.05,0],pw-.016,.05,fd,0,plank);px+=pw}
+ for(const cx of [-x+.32,x-.32])for(const cz of [-z+.32,z-.32])
+  addRound([cx,0,cz],.34,h-.3,.34,0,wood("#553d28"),.94,12)}
+
+let shellFaces=[];        // 房壳可剖切面:{geo:{lit,litCount},center,inward}
+function buildShellFaces(active,fw,fd,h){
+ const x=fw/2,z=fd/2,dadoH=.95,
+       wood=c=>({color:hex(c),specular:.09,gloss:.22,panoBlend:0,
+                 emissive:0}),
+       plaster={color:hex("#8d7d67"),specular:.04,gloss:.1,panoBlend:0,
+                emissive:0},
+       dado=wood("#4e3a28"),trim=wood("#3c2d1e");
+ const specs=[
+  {center:[0,h/2,z],inward:[0,0,-1],
+   build:kit=>wall(kit,0,z+.04,fw+.16,0)},
+  {center:[0,h/2,-z],inward:[0,0,1],
+   build:kit=>wall(kit,0,-z-.04,fw+.16,0)},
+  {center:[x,h/2,0],inward:[-1,0,0],
+   build:kit=>wall(kit,x+.04,0,fd+.16,90)},
+  {center:[-x,h/2,0],inward:[1,0,0],
+   build:kit=>wall(kit,-x-.04,0,fd+.16,90)},
+  {center:[0,h,0],inward:[0,-1,0],build:kit=>{
+   kit.addBox([0,h,0],fw+.2,.06,fd+.2,0,wood("#33261a"));
+   const beams=clamp(Math.round(fw/2.4),2,5);
+   for(let i=0;i<beams;i++)
+    kit.addBox([-x+fw*(i+.5)/beams,h-.30,0],.24,.30,fd,0,
+               wood("#42301f"));
+   kit.addBox([0,h-.52,0],fw,.22,.26,0,wood("#3a2a1b"))}},
+ ];
+ function wall(kit,wx,wz,len,turn){
+  kit.addBox([wx,0,wz],len,dadoH,.07,turn,dado);
+  kit.addBox([wx,dadoH,wz],len,h-dadoH,.07,turn,plaster);
+  kit.addBox([wx,dadoH-.025,wz],len,.05,.10,turn,trim)}
+ specs.forEach((spec,i)=>{
+  const slot=shellFaces[i]||(shellFaces[i]={geo:{lit:null,litCount:0,
+   shadow:null,shadowCount:0,lines:null,lineCount:0}});
+  const kit=meshKit();
+  if(active)spec.build(kit);
+  kit.upload(slot.geo);
+  slot.center=spec.center;slot.inward=spec.inward});
+ shellFaces.length=specs.length}
+
+// 人物实体:袍服人形(下裳圆台/垂袖/发髻),移动朝移动方向,静止朝机位。
+function addActorSolid(kit,x,y,z,h,col,yawDeg){
+ const {addBox,addRound}=kit,yaw=(yawDeg||0)*Math.PI/180,
+       co=Math.cos(yaw),si=Math.sin(yaw),
+       local=(lx,ly,lz)=>[x+lx*co+lz*si,y+ly,z-lx*si+lz*co],
+       cloth={color:col.map(v=>v*.80),specular:.10,gloss:.18,
+              panoBlend:0,emissive:0},
+       clothDark={...cloth,color:col.map(v=>v*.58)},
+       sash={...cloth,color:col.map(v=>Math.min(1,v*1.3))},
+       skin={color:[.86,.70,.56],specular:.16,gloss:.3,panoBlend:0,
+             emissive:0},
+       hair={color:[.15,.12,.11],specular:.3,gloss:.5,panoBlend:0,
+             emissive:0};
+ addRound(local(0,.01,0),.40*h,.50*h,.36*h,yawDeg,cloth,.52,12);
+ addRound(local(0,.50*h,0),.225*h,.30*h,.19*h,yawDeg,cloth,.86,12);
+ addRound(local(0,.485*h,0),.235*h,.035*h,.20*h,yawDeg,sash,1,12);
+ for(const s of [-1,1])
+  addRound(local(s*.155*h,.44*h,0),.10*h,.34*h,.09*h,yawDeg,
+           clothDark,.55,10);
+ addRound(local(0,.78*h,0),.075*h,.05*h,.07*h,yawDeg,skin,.9,10);
+ addRound(local(0,.82*h,0),.135*h,.115*h,.125*h,yawDeg,skin,.72,12);
+ addRound(local(0,.925*h,0),.115*h,.03*h,.105*h,yawDeg,hair,.5,10);
+ addRound(local(0,.95*h,-.01*h),.05*h,.045*h,.05*h,yawDeg,hair,.7,8);
+ addBox(local(0,.855*h,.068*h),.02*h,.028*h,.02*h,yawDeg,skin)}
+
+function stickman(kit,x,y,z,h,col){
+ const push=kit.push,hip=y+.50*h,shoulder=y+.80*h,
+       headC=y+.90*h,headR=.09*h;
+ push([x,hip,z],[x,shoulder,z],col);
+ for(let i=0;i<14;i++){const t0=i/14*Math.PI*2,t1=(i+1)/14*Math.PI*2;
+  push([x+headR*Math.sin(t0),headC+headR*Math.cos(t0),z],
+       [x+headR*Math.sin(t1),headC+headR*Math.cos(t1),z],col);
+  push([x,headC+headR*Math.cos(t0),z+headR*Math.sin(t0)],
+       [x,headC+headR*Math.cos(t1),z+headR*Math.sin(t1)],col)}
+ push([x,shoulder-.02*h,z],[x-.16*h,y+.42*h,z],col);
+ push([x,shoulder-.02*h,z],[x+.16*h,y+.42*h,z],col);
+ push([x,hip,z],[x-.10*h,y,z],col);push([x,hip,z],[x+.10*h,y,z],col)}
+
+// 静态布景:只在换场景/换显示模式/全景就绪时重建。
+function buildSceneGeometry(){
+ const kit=meshKit(),{push,shadowEllipse}=kit;
  const model=activeSceneModel(),modelRoom=model.room||{},
        w=Object.assign({},modelRoom,(SCENE&&SCENE.world)||{}),
        fw=finite(w.floor_width_m,10),fd=finite(w.floor_depth_m,7),
+       fh=finite(w.ceiling_height_m??w.wall_height_m,4.2),
        structure=displayMode==="structure",light=lightingFor();
+ const shellActive=!structure&&!panoReady;
  if(structure){const grid=[.22,.19,.16],gridMain=[.34,.29,.23];
   for(let x=-fw/2;x<=fw/2+1e-6;x+=1)
    push([x,.002,-fd/2],[x,.002,fd/2],Math.abs(x)<1e-6?gridMain:grid);
   for(let z=-fd/2;z<=fd/2+1e-6;z+=1)
    push([-fw/2,.002,z],[fw/2,.002,z],Math.abs(z)<1e-6?gridMain:grid)}
+ else if(shellActive)addFallbackRoom(kit,fw,fd,fh);
+ buildShellFaces(shellActive,fw,fd,fh);
  renderStats={objects:0,invalid:0,defaultMaterials:0,
               semanticPrefabs:0,fallbackPrefabs:0};
  for(const obj of model.objects||[]){
@@ -644,15 +959,24 @@ function buildGeometry(silent){
   renderStats.objects++;if(material.usedDefault)renderStats.defaultMaterials++;
   if(prefab.source==="category_fallback")renderStats.fallbackPrefabs++;
   else renderStats.semanticPrefabs++;
-  addScenePrefab(prefab,obj.name||"",x,y,z,width,height,depth,yaw,material,structure);
-  if(!structure){const sy=Math.max(.24,Math.abs(light.direction[1])),
+  addScenePrefab(kit,prefab,obj.name||"",x,y,z,width,height,depth,yaw,
+                 material,structure);
+  // 台面道具(y 抬高)不投地面影,避免隔着桌板出现悬空黑斑。
+  if(!structure&&y<.4){const sy=Math.max(.24,Math.abs(light.direction[1])),
     offX=-light.direction[0]/sy*Math.min(.55,height*.16),
     offZ=-light.direction[2]/sy*Math.min(.55,height*.16);
-   shadowEllipse(x,z,width*.60,depth*.62,offX,offZ,.13);
-   shadowEllipse(x,z,width*.48,depth*.48,0,0,.24)}}
- if(!SHOT){finish();if(!silent)updateSceneStatus();return geo}
+   shadowEllipse(x,z,width*.60,depth*.62,offX,offZ,.13,yaw);
+   shadowEllipse(x,z,width*.48,depth*.48,0,0,.22,yaw)}}
+ kit.upload(sceneGeo)}
+
+// 动态层:人物/路线/机位/视锥,预演播放时逐帧重建。
+function buildGeometry(silent){
+ const kit=meshKit(),{push,PT,shadowEllipse}=kit,
+       structure=displayMode==="structure";
+ if(!SHOT){kit.upload(geo);if(!silent)updateSceneStatus();return geo}
  const cam=SHOT.camera||{},acts=SHOT.actors||[];
  const uMove=PV.active?easeInOut(PV.u):0;
+ const camEye=P(cam.start_3d,1.55);
  if(show.control&&show.axis&&SHOT.axis&&SHOT.axis.a_3d&&SHOT.axis.b_3d){
   const a=P(SHOT.axis.a_3d),b=P(SHOT.axis.b_3d),c=[.55,.42,.2];
   for(let t=0;t<1;t+=.05){const p=V.add(a,V.scale(V.sub(b,a),t)),
@@ -665,16 +989,20 @@ function buildGeometry(silent){
   // 预演播放:人物沿起终点连线随时间插值(缓入缓出),身高同步过渡
   const s=PV.active?lerp3(s0,e,uMove):s0,
         h0=PV.active?startH+(endH-startH)*uMove:startH;
-  if(structure)stickman(s[0],s[1],s[2],h0,col);
-  else{addActorSolid(s[0],s[1],s[2],h0,col);
-   shadowEllipse(s[0]+.04*h0,s[2],.15*h0,.10*h0,0,0,.27)}
+  // 朝向:移动时朝移动方向,静止时面向机位(演员向镜头打开)。
+  const move=V.sub(e,s0),
+        yawA=V.len(move)>.05?Math.atan2(move[0],move[2])*180/Math.PI:
+             Math.atan2(camEye[0]-s[0],camEye[2]-s[2])*180/Math.PI;
+  if(structure)stickman(kit,s[0],s[1],s[2],h0,col);
+  else{addActorSolid(kit,s[0],s[1],s[2],h0,col,yawA);
+   shadowEllipse(s[0],s[2],.17*h0,.13*h0,.03,.02,.26)}
   if(show.control)PT.push(s[0],s[1]+.9*h0,s[2],col[0],col[1],col[2]);
   if(show.control&&show.path&&!PV.active&&(a.moving||V.len(V.sub(e,s0))>.05)){
    const dim=V.scale(col,.62);push([s[0],s[1]+.05,s[2]],[e[0],e[1]+.05,e[2]],dim);
    for(let i=0;i<12;i++){const t0=i/12*Math.PI*2,t1=(i+1)/12*Math.PI*2;
     push([e[0]+.18*Math.cos(t0),e[1]+.03,e[2]+.18*Math.sin(t0)],
          [e[0]+.18*Math.cos(t1),e[1]+.03,e[2]+.18*Math.sin(t1)],dim)}
-   stickman(e[0],e[1],e[2],endH,dim)}});
+   stickman(kit,e[0],e[1],e[2],endH,dim)}});
  if(show.control){
   const cs0=P(cam.start_3d,1.55),
         ce=P(cam.end_3d||cam.start_3d,1.55),
@@ -700,13 +1028,8 @@ function buildGeometry(silent){
     q=V.add(cs,V.scale(V.sub(tg,cs),Math.min(1,t+.045)));
     push(p,q,V.scale(camCol,.4))}}
   PT.push(cs[0],cs[1],cs[2],camCol[0],camCol[1],camCol[2])}
- finish();if(!silent)updateSceneStatus();return geo;
- function finish(){
-  for(const old of [geo.lit,geo.shadow,geo.lines,geo.pts])if(old)gl.deleteBuffer(old);
-  geo.lit=buffer(LIT);geo.litCount=LIT.length/12;
-  geo.shadow=buffer(SHADOW);geo.shadowCount=SHADOW.length/4;
-  geo.lines=buffer(L);geo.lineCount=L.length/6;
-  geo.pts=buffer(PT);geo.ptCount=PT.length/6}}
+ kit.upload(geo);
+ if(!silent)updateSceneStatus();return geo}
 
 function shotCam(asp){
  // 本镜相机:预演播放时按 PV.u 在起终机位/瞄准点之间插值——运镜的
@@ -789,15 +1112,16 @@ function renderScene(view,proj,eye){
    if(V.dot(f.inward,toEye)<=0.02)continue;
    bindAttr(pPano,"pos",f.buf,3,3,0);
    gl.drawArrays(gl.TRIANGLES,0,f.count)}}
- if(displayMode==="realistic"&&geo.shadowCount){
+ if(displayMode==="realistic"&&(sceneGeo.shadowCount||geo.shadowCount)){
   gl.useProgram(pAlpha);
   gl.uniformMatrix4fv(gl.getUniformLocation(pAlpha,"mvp"),false,new Float32Array(mvp));
   gl.uniform3fv(gl.getUniformLocation(pAlpha,"color"),new Float32Array([.025,.02,.016]));
-  bindAttr(pAlpha,"pos",geo.shadow,3,4,0);bindAttr(pAlpha,"opa",geo.shadow,1,4,3);
   gl.depthMask(false);gl.depthFunc(gl.LEQUAL);
-  gl.drawArrays(gl.TRIANGLES,0,geo.shadowCount);
+  for(const g of [sceneGeo,geo])if(g.shadowCount){
+   bindAttr(pAlpha,"pos",g.shadow,3,4,0);bindAttr(pAlpha,"opa",g.shadow,1,4,3);
+   gl.drawArrays(gl.TRIANGLES,0,g.shadowCount)}
   gl.depthMask(true);gl.depthFunc(gl.LESS)}
- if(geo.litCount){const light=lightingFor();
+ if(sceneGeo.litCount||geo.litCount){const light=lightingFor();
   gl.useProgram(pLit);
   gl.uniformMatrix4fv(gl.getUniformLocation(pLit,"mvp"),false,new Float32Array(mvp));
   gl.uniform3fv(gl.getUniformLocation(pLit,"eye"),new Float32Array(eye));
@@ -816,18 +1140,25 @@ function renderScene(view,proj,eye){
   gl.uniform3fv(gl.getUniformLocation(pLit,"panoEye0"),new Float32Array(CAPTURE));
   gl.uniform1f(gl.getUniformLocation(pLit,"panoAvailable"),
                displayMode==="realistic"&&panoReady?1:0);
-  bindAttr(pLit,"pos",geo.lit,3,12,0);bindAttr(pLit,"nor",geo.lit,3,12,3);
-  bindAttr(pLit,"col",geo.lit,3,12,6);bindAttr(pLit,"mat",geo.lit,3,12,9);
   gl.enable(gl.POLYGON_OFFSET_FILL);gl.polygonOffset(1,1);
-  gl.drawArrays(gl.TRIANGLES,0,geo.litCount);
+  const litGeos=[sceneGeo];
+  for(const f of shellFaces)
+   if(f.geo.litCount&&V.dot(f.inward,V.sub(eye,f.center))>0.02)
+    litGeos.push(f.geo);
+  litGeos.push(geo);
+  for(const g of litGeos)if(g.litCount){
+   bindAttr(pLit,"pos",g.lit,3,13,0);bindAttr(pLit,"nor",g.lit,3,13,3);
+   bindAttr(pLit,"col",g.lit,3,13,6);bindAttr(pLit,"mat",g.lit,4,13,9);
+   gl.drawArrays(gl.TRIANGLES,0,g.litCount)}
   gl.disable(gl.POLYGON_OFFSET_FILL)}
- if(geo.lineCount){
+ if(sceneGeo.lineCount||geo.lineCount){
   gl.useProgram(pLine);
   gl.uniformMatrix4fv(gl.getUniformLocation(pLine,"mvp"),false,new Float32Array(mvp));
   gl.uniform1f(gl.getUniformLocation(pLine,"alpha"),0.95);
-  bindAttr(pLine,"pos",geo.lines,3,6,0);bindAttr(pLine,"col",geo.lines,3,6,3);
   gl.depthFunc(gl.LEQUAL);
-  gl.drawArrays(gl.LINES,0,geo.lineCount);
+  for(const g of [sceneGeo,geo])if(g.lineCount){
+   bindAttr(pLine,"pos",g.lines,3,6,0);bindAttr(pLine,"col",g.lines,3,6,3);
+   gl.drawArrays(gl.LINES,0,g.lineCount)}
   gl.depthFunc(gl.LESS);
   if(geo.ptCount){bindAttr(pLine,"pos",geo.pts,3,6,0);
    bindAttr(pLine,"col",geo.pts,3,6,3);
@@ -1046,7 +1377,7 @@ function setDisplayMode(next){
  displayMode=next==="structure"?"structure":"realistic";
  // 写实默认是干净导演视图；控制信息仍可由用户显式重新打开。
  if(displayMode==="realistic")show.control=false;
- syncDisplayControls();buildGeometry()}
+ syncDisplayControls();buildSceneGeometry();buildGeometry()}
 document.getElementById("modeReal").onclick=()=>setDisplayMode("realistic");
 document.getElementById("modeStructure").onclick=()=>setDisplayMode("structure");
 [["tPano","pano"],["tPath","path"],["tFrus","frus"],["tAxis","axis"]]
@@ -1063,7 +1394,7 @@ async function exportCleanPng(){
  button.disabled=true;button.textContent="正在导出…";
  try{
   displayMode="realistic";show.control=false;show.path=false;show.frus=false;
-  show.axis=false;syncDisplayControls();buildGeometry();
+  show.axis=false;syncDisplayControls();buildSceneGeometry();buildGeometry();
   // WebGL 使用 preserveDrawingBuffer；仍等待至少一帧，确保新几何已绘制。
   await new Promise(resolve=>requestAnimationFrame(()=>resolve()));
   const blob=await new Promise((resolve,reject)=>cv.toBlob(
@@ -1081,7 +1412,8 @@ async function exportCleanPng(){
    (error&&error.message?error.message:String(error))
  }finally{
   displayMode=saved.displayMode;show.control=previousControl;show.path=saved.path;
-  show.frus=saved.frus;show.axis=saved.axis;syncDisplayControls();buildGeometry();
+  show.frus=saved.frus;show.axis=saved.axis;syncDisplayControls();
+  buildSceneGeometry();buildGeometry();
   button.disabled=false;button.textContent="导出效果图";
   if(exportError)warn(exportError,true)}}
 document.getElementById("exportPng").onclick=exportCleanPng;
@@ -1093,7 +1425,11 @@ function selectShot(no){
  SCENE=((DATA.blocking||{}).scenes||[]).find(
    s=>Number(s.scene_no)===Number(SHOT&&SHOT.scene_no))||
    ((DATA.blocking||{}).scenes||[])[0]||null;
+ const w=Object.assign({},activeSceneModel().room||{},(SCENE&&SCENE.world)||{});
+ buildRoomBox(Number(w.floor_width_m)||10,Number(w.floor_depth_m)||7,
+              Number(w.ceiling_height_m)||4.2);
  loadPano(SCENE&&SCENE.location);
+ buildSceneGeometry();
  buildGeometry();
  document.querySelectorAll("#shots button").forEach(b=>
   b.classList.toggle("on",b.dataset.no===String(no)));
@@ -1101,9 +1437,6 @@ function selectShot(no){
  document.getElementById("meta").textContent =
   `${DATA.project_title} 第${DATA.episode_number}集 · 镜${no}` +
   (act.camera?` · ${act.camera}`:"") + (act.action?` — ${act.action}`:"");
- const w=Object.assign({},activeSceneModel().room||{},(SCENE&&SCENE.world)||{});
- buildRoomBox(Number(w.floor_width_m)||10,Number(w.floor_depth_m)||7,
-              Number(w.ceiling_height_m)||4.2);
  if(SHOT){const cam=SHOT.camera||{},t=P(cam.target_3d,1.2);
   orbit.target=[t[0],1.0,t[2]]}}
 
@@ -1117,11 +1450,14 @@ function loadPano(location){
  img.onload=()=>{gl.bindTexture(gl.TEXTURE_2D,panoTex);
   gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,0);  // 采样公式已含垂直方向,再翻转=天地颠倒
   gl.texImage2D(gl.TEXTURE_2D,0,gl.RGB,gl.RGB,gl.UNSIGNED_BYTE,img);
-  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.REPEAT);
+  // WebGL1 非 2 的幂纹理禁用 REPEAT,否则采样恒黑(整间房变纯黑)。
+  const pot=v=>(v&(v-1))===0,potOk=pot(img.width)&&pot(img.height);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,
+                   potOk?gl.REPEAT:gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
-  panoReady=true;updateSceneStatus()};
- img.onerror=()=>{panoReady=false;
+  panoReady=true;buildSceneGeometry();updateSceneStatus()};
+ img.onerror=()=>{panoReady=false;buildSceneGeometry();
   updateSceneStatus(["全景母版加载失败："+(info.url||"地址为空")])};
  img.src=info.url+(info.version?("?v="+info.version):"")}
 
