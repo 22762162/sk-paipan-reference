@@ -1806,7 +1806,13 @@ class Director:
         later dispatch contract sees a missing prompt-review record and
         incorrectly blocks before any image provider is called.
         """
-        autonomy = self._director_autonomy_enabled()
+        preview_bypass = bool(
+            self._preview_qc_bypass_enabled()
+            and not self._prompt_review_enabled())
+        autonomy = bool(
+            not preview_bypass
+            and (payload.get("director_autonomy_mode")
+                 or self._director_autonomy_enabled()))
         payload["director_autonomy_mode"] = True
         prompt = str(
             payload.get("prompt_compact") or payload.get("prompt") or "")
@@ -11520,10 +11526,13 @@ class Director:
                 payload["previous_prompt_review"] = previous_review
             payload.pop("prompt_review", None)
             payload.pop("_prompt_review_frozen_input_hash", None)
-            if self._preview_qc_bypass_enabled():
-                # No new AI review is expected in this mode.  Re-freeze the
-                # newly compiled spatial input so dispatch cannot mistake a
-                # legitimate blocking refresh for an unaudited prompt.
+            if (payload.get("director_autonomy_mode")
+                    or self._preview_qc_bypass_enabled()):
+                # Director-autonomy and one-click bypass are explicit review
+                # decisions.  Re-freeze the newly compiled spatial input so
+                # dispatch cannot mistake a legitimate blocking refresh for
+                # an unaudited prompt.  Ordinary reviewed tasks stay cleared
+                # and are reviewed again below before any provider call.
                 self._mark_prompt_review_not_applicable(payload)
             self._attach_reference_manifest(payload)
             payload["_base_shot_content_hash"] = semantic_content_hash
@@ -11655,11 +11664,53 @@ class Director:
             if not tasks:
                 return ({}, list(blocked))
         # Prompt review may have repaired camera/description after the normal
-        # blocking stage.  Collect all such repairs, rebuild blocking once,
-        # and replace affected payloads before acceleration contracts or image
-        # workers can observe a stale spatial reference.
-        tasks = self._refresh_repaired_image_tasks_before_dispatch(
-            ctx, tasks, existing_tasks_only=preserve_task_scope)
+        # blocking stage.  Rebuilding blocking invalidates the old review for
+        # this shot and every refreshed downstream shot in the same scene.
+        # Review those rebuilt payloads again before dispatch.  The former
+        # one-pass order (review -> refresh -> dispatch) silently discarded
+        # valid reviews and stopped whole continuity chains at the image gate.
+        # Three rounds are enough for normal repair convergence; if a provider
+        # keeps proposing another spatial edit, freeze only the still-missing
+        # rebuilt reviews under director autonomy instead of blocking output.
+        for _review_round in range(3):
+            had_spatial_repairs = bool(
+                ctx.get("_blocked_prompt_spatial_repairs"))
+            tasks = self._refresh_repaired_image_tasks_before_dispatch(
+                ctx, tasks, existing_tasks_only=preserve_task_scope)
+            if not had_spatial_repairs:
+                break
+            self._assign_codex_profiles(tasks)
+            refreshed_blocked = self._review_image_tasks(
+                ctx, tasks, continue_on_block=continue_on_qc_failure)
+            if refreshed_blocked:
+                blocked.extend(refreshed_blocked)
+                blocked_ids = {
+                    id(task) for task, _exc in refreshed_blocked}
+                tasks = [
+                    task for task in tasks if id(task) not in blocked_ids]
+                if not tasks:
+                    return ({}, list(blocked))
+        else:
+            if ctx.get("_blocked_prompt_spatial_repairs"):
+                tasks = self._refresh_repaired_image_tasks_before_dispatch(
+                    ctx, tasks, existing_tasks_only=preserve_task_scope)
+                fallback_count = 0
+                for task in tasks:
+                    payload = task.get("payload")
+                    if (not isinstance(payload, dict)
+                            or payload.get("prompt_review")):
+                        continue
+                    payload["director_autonomy_mode"] = True
+                    payload.setdefault(
+                        "nonblocking_contract_risk", []).append(
+                            "提示词空间修订超过3轮，使用最新重建合同继续生成")
+                    self._mark_prompt_review_not_applicable(payload)
+                    fallback_count += 1
+                if fallback_count:
+                    self.log.warn(
+                        "director",
+                        f"提示词空间修订达到收敛上限；已冻结最新合同并继续"
+                        f"生成 {fallback_count} 个镜头，不阻断连续性链")
         self._assign_codex_profiles(tasks)
         self._prepare_dispatch_contracts(ctx, tasks)
         tasks = sorted(tasks, key=lambda task: (

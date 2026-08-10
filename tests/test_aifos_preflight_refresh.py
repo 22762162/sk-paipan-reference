@@ -411,6 +411,7 @@ def test_prompt_repairs_batch_refresh_task_spatial_payload_and_hash(
             "approved": True, "status": "approved",
             "optimized_prompt": "旧空间参考下的优化稿",
         }
+        task_payload["director_autonomy_mode"] = True
         task_payload["_prompt_review_frozen_input_hash"] = "old-input"
         tasks = [{
             "item_id": "shot:1", "capability": "image",
@@ -428,9 +429,10 @@ def test_prompt_repairs_batch_refresh_task_spatial_payload_and_hash(
         assert by_shot[1]["payload"]["spatial_ref"] != old_ref
         assert by_shot[1]["payload"]["previous_prompt_review"][
             "optimized_prompt"] == "旧空间参考下的优化稿"
-        assert "prompt_review" not in by_shot[1]["payload"]
-        assert "_prompt_review_frozen_input_hash" not in \
-            by_shot[1]["payload"]
+        assert by_shot[1]["payload"]["prompt_review"]["status"] == \
+            "not_applicable_director_autonomy"
+        assert by_shot[1]["payload"]["_prompt_review_frozen_input_hash"]
+        assert "prompt_review" not in by_shot[2]["payload"]
         assert by_shot[1]["payload"]["spatial_blocking"] == \
             ctx["blocking"]["shot_index"]["1"]
         assert by_shot[2]["payload"]["spatial_blocking"] == \
@@ -447,6 +449,71 @@ def test_prompt_repairs_batch_refresh_task_spatial_payload_and_hash(
             assert plan_by_id[f"shot:{shot_no}"][
                 "spatial_contract_refreshed"] is True
         assert plan_by_id["shot:3"].get("spatial_contract_refreshed") is not True
+    finally:
+        app.close()
+
+
+def test_parallel_rereviews_tasks_invalidated_by_spatial_refresh(
+        tmp_path, monkeypatch):
+    """A blocking rebuild must not dispatch tasks with erased reviews."""
+    app = App(tmp_path / "workspace")
+    try:
+        project, _ = app.projects.get_or_create_project("提示词复审收敛")
+        episode, _ = app.projects.get_or_create_episode(project["id"], 1)
+        ctx = {
+            "project": dict(project), "episode": dict(episode),
+            "out_root": tmp_path / "artifacts",
+        }
+        ctx["out_root"].mkdir()
+        tasks = [{
+            "item_id": f"shot:{shot_no}", "capability": "image",
+            "payload": {"prompt": f"镜头{shot_no}"},
+            "sub_dir": "images", "tag": shot_no, "priority": 1,
+        } for shot_no in (1, 2)]
+        review_calls = []
+
+        def review(_ctx, current_tasks, continue_on_block=False):
+            review_calls.append([task["tag"] for task in current_tasks])
+            for task in current_tasks:
+                task["payload"]["prompt_review"] = {
+                    "approved": True, "status": "approved",
+                }
+            if len(review_calls) == 1:
+                _ctx["_blocked_prompt_spatial_repairs"] = {1}
+            return []
+
+        refresh_calls = []
+
+        def refresh(_ctx, current_tasks, **_kwargs):
+            repaired = _ctx.pop("_blocked_prompt_spatial_repairs", set())
+            refresh_calls.append(bool(repaired))
+            if repaired:
+                for task in current_tasks:
+                    task["payload"].pop("prompt_review", None)
+            return current_tasks
+
+        monkeypatch.setattr(app.director, "_review_image_tasks", review)
+        monkeypatch.setattr(
+            app.director, "_refresh_repaired_image_tasks_before_dispatch",
+            refresh)
+        monkeypatch.setattr(
+            app.director, "_prepare_dispatch_contracts",
+            lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(app.director, "_total_image_workers", lambda: 1)
+        monkeypatch.setattr(
+            app.director, "_shot_candidate_count", lambda: 1)
+
+        def run_one(_ctx, task, **_kwargs):
+            assert task["payload"]["prompt_review"]["approved"] is True
+            return f"done-{task['tag']}"
+
+        monkeypatch.setattr(app.director, "_run_one_task", run_one)
+
+        results = app.director._run_parallel(ctx, tasks)
+
+        assert results == {1: "done-1", 2: "done-2"}
+        assert review_calls == [[1, 2], [1, 2]]
+        assert refresh_calls == [True, False]
     finally:
         app.close()
 
