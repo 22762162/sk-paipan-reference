@@ -148,6 +148,10 @@ def test_category_defaults_are_visible_but_never_claimed_as_measurements():
     ("白瓷茶盏", "prop", "vessel"),
     ("桌上灯笼", "light", "lantern"),
     ("案上宣纸", "prop", "paper"),
+    ("案角古琴", "prop", "instrument"),
+    ("墙边琴案", "furniture", "table"),
+    ("中央地毯", "decor", "rug"),
+    ("角落盆栽", "decor", "plant"),
 ))
 def test_named_scene_objects_receive_recognisable_render_prefabs(
         name, category, expected):
@@ -396,11 +400,35 @@ def test_scene3d_uses_semantic_prefabs_without_rewriting_collision_boxes():
     for prefab in (
             "table", "cabinet", "lattice", "doorway", "curtain",
             "column", "chair", "bed", "lantern", "brazier", "vessel",
-            "paper"):
+            "paper", "rug", "plant", "instrument"):
         assert f'type==="{prefab}"' in source
     # The WebGL stage consumes render-only placement.  The scene model and
     # blocking collision code remain untouched and auditable.
     assert "rawPos=renderPlacementFor(obj)" in source
+
+
+def test_scene3d_detail_renderer_keeps_stability_and_fallback_contracts():
+    """细化布景渲染的四个不可回退承诺。
+
+    1) 材质通道为 vec4(镜面/光泽/全景混合/自发光),宫灯窗纸炭火可发光;
+    2) 布景细节使用种子化随机,预演逐帧重建时家具不得抖动;
+    3) 静态布景(sceneGeo)与动态人物(geo)分离,播放不重建整个房间;
+    4) 无全景母版时生成中性写实房壳,而不是黑色虚空;
+       非 2 的幂全景禁用 REPEAT,否则整间房被采成纯黑。
+    """
+    source, _page = _page_source_and_inventory()
+
+    assert "attribute vec4 mat" in source
+    assert "emissive" in source
+    assert "seedRng(" in source
+    assert "Math.random" not in source
+    assert "function buildSceneGeometry(" in source
+    assert "sceneGeo" in source
+    assert "addFallbackRoom(" in source
+    assert "CLAMP_TO_EDGE" in source
+    # 重建几何必须复用缓冲:deleteBuffer 会让已启用的顶点属性指向
+    # 已删除缓冲,整帧 drawArrays 报 INVALID_OPERATION(含全景层)。
+    assert "gl.deleteBuffer" not in _extract_js_function(source, "meshKit")
 
 
 def test_scene3d_can_open_the_requested_shot_from_episode_overlay():
