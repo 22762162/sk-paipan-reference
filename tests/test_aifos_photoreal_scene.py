@@ -136,6 +136,79 @@ def test_category_defaults_are_visible_but_never_claimed_as_measurements():
     )
 
 
+@pytest.mark.parametrize(("name", "category", "expected"), (
+    ("中央条案(书案)", "furniture", "table"),
+    ("左侧药柜书架（带格栅门）", "furniture", "cabinet"),
+    ("正中书卷柜(带抽屉与柜门)", "furniture", "cabinet"),
+    ("右侧靠背矮栏椅", "furniture", "chair"),
+    ("支摘格心窗", "opening", "lattice"),
+    ("门内垂挂布帘", "decor", "curtain"),
+    ("中央方柱", "furniture", "column"),
+    ("铜香炉", "prop", "brazier"),
+    ("白瓷茶盏", "prop", "vessel"),
+    ("桌上灯笼", "light", "lantern"),
+    ("案上宣纸", "prop", "paper"),
+))
+def test_named_scene_objects_receive_recognisable_render_prefabs(
+        name, category, expected):
+    obj = _measured_desk()
+    obj.update({"name": name, "category": category})
+
+    contract = build_scene_render_contract(
+        _scene_model(objects=[obj]),
+        {"url": "/artifacts/old-study-pano.png"},
+    )
+
+    prefab = contract["objects"][0]["render_prefab"]
+    assert prefab["type"] == expected
+    assert prefab["source"] == "semantic_name"
+    assert prefab["confidence"]["level"] == "high"
+
+
+def test_explicit_tabletop_prop_uses_render_only_supported_position():
+    table = _measured_desk()
+    table.update({
+        "name": "书案（大画案）",
+        "position_3d": {"x": 0.0, "y": 0.0, "z": 0.0},
+        "width_m": 2.0,
+        "height_m": 1.0,
+        "depth_m": 1.0,
+        "rotation_y_deg": 0.0,
+    })
+    paper = {
+        "name": "案上宣纸",
+        "category": "prop",
+        # The panorama floor ray landed outside the tabletop.  Rendering may
+        # honour the explicit support label without corrupting that evidence.
+        "position_3d": {"x": 3.0, "y": 0.0, "z": 2.0},
+        "width_m": 0.4,
+        "height_m": 0.02,
+        "depth_m": 0.3,
+        "rotation_y_deg": 0.0,
+        "geometry_sources": {
+            "position": "panorama_floor_intersection",
+            "width": "panorama_angular_span",
+            "height": "panorama_vertical_ray",
+            "depth": "visual_annotation",
+            "rotation": "visual_annotation",
+        },
+    }
+
+    contract = build_scene_render_contract(
+        _scene_model(objects=[table, paper]),
+        {"url": "/artifacts/old-study-pano.png"},
+    )
+    rendered = contract["objects"][1]
+
+    assert rendered["position"] == {"x": 3.0, "y": 0.0, "z": 2.0}
+    assert rendered["render_transform"]["position"]["y"] == pytest.approx(1.0)
+    assert abs(rendered["render_transform"]["position"]["x"]) <= 0.8
+    assert abs(rendered["render_transform"]["position"]["z"]) <= 0.32
+    assert rendered["render_transform"]["support"]["name"] == "书案（大画案）"
+    assert rendered["render_transform"]["source"] == "explicit_name_support"
+    assert "render_support_inference" in _warning_codes(contract)
+
+
 def test_missing_room_dimensions_use_labelled_viewer_defaults_with_warnings():
     contract = build_scene_render_contract(
         _scene_model(room={}),
@@ -294,7 +367,8 @@ def test_scene3d_page_has_realistic_structure_and_control_modes():
 
     for behavior in (
             "activeSceneModel", "activeRenderContract", "materialFor",
-            "lightingFor", "setDisplayMode", "updateSceneStatus"):
+            "prefabFor", "renderPlacementFor", "lightingFor",
+            "setDisplayMode", "updateSceneStatus"):
         assert f"function {behavior}(" in source
     assert "render_contracts" in source
     assert "show.control" in source
@@ -308,8 +382,32 @@ def test_scene3d_page_consumes_real_boxes_lighting_and_shadows():
     for field in ("position", "width", "height", "depth", "rotation"):
         assert field in source
     for render_primitive in (
-            "pLit", "pAlpha", "geo.lit", "geo.shadow", "lightingFor("):
+            "pLit", "pAlpha", "geo.lit", "geo.shadow", "lightingFor(",
+            "addScenePrefab(", "addRound(", "semanticPrefabs"):
         assert render_primitive in source
+
+
+def test_scene3d_uses_semantic_prefabs_without_rewriting_collision_boxes():
+    source, _page = _page_source_and_inventory()
+
+    assert "render_prefab" in source
+    assert "render_transform" in source
+    assert "prefab.source===\"category_fallback\"" in source
+    for prefab in (
+            "table", "cabinet", "lattice", "doorway", "curtain",
+            "column", "chair", "bed", "lantern", "brazier", "vessel",
+            "paper"):
+        assert f'type==="{prefab}"' in source
+    # The WebGL stage consumes render-only placement.  The scene model and
+    # blocking collision code remain untouched and auditable.
+    assert "rawPos=renderPlacementFor(obj)" in source
+
+
+def test_scene3d_can_open_the_requested_shot_from_episode_overlay():
+    source, _page = _page_source_and_inventory()
+
+    assert 'const requestedShot=Number(qs.get("shot"))' in source
+    assert "nos.includes(requestedShot)?requestedShot:nos[0]" in source
 
 
 def test_scene3d_error_surfaces_do_not_interpret_remote_error_as_html():

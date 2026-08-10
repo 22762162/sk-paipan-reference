@@ -7461,8 +7461,11 @@ function blockingLegendHtml(scene, blocking) {
   </div>`;
 }
 
-function blocking3dSceneHtml(scene, sceneIndex) {
+function blocking3dSceneHtml(scene, sceneIndex, episodeId) {
   const shots = scene.shots || [];
+  const firstShot = shots[0]?.shot_no;
+  const realisticUrl = `/scene3d?episode=${encodeURIComponent(episodeId)}`
+    + (firstShot == null ? "" : `&shot=${encodeURIComponent(firstShot)}`);
   return `<div class="blocking-3d-stage" data-blocking-scene="${sceneIndex}">
     <div class="blocking-3d-toolbar">
       <div class="blocking-3d-shot-tabs" role="tablist" aria-label="选择镜头">
@@ -7477,6 +7480,8 @@ function blocking3dSceneHtml(scene, sceneIndex) {
         <button type="button" data-view="reset" aria-label="重置3D视角">重置</button>
         <button type="button" class="active" data-view="pano"
           aria-pressed="true" aria-label="切换720全景房间底图">全景</button>
+        <a class="blocking-real-stage-link" href="${esc(realisticUrl)}"
+          target="_blank" rel="noopener" aria-label="打开真实布景渲染器">真实布景</a>
       </div>
     </div>
     <canvas class="blocking-3d-canvas" tabindex="0" role="img"
@@ -8206,7 +8211,7 @@ async function showBlockingOverlay(episodeId) {
         </li>`).join("")}</ul>
       </details>` : ""}
       ${blockingLegendHtml(scene, blocking)}
-      ${blocking3dSceneHtml(scene, sceneIndex)}
+      ${blocking3dSceneHtml(scene, sceneIndex, episodeId)}
       ${svgUrl
         ? `<details class="blocking-fixed-reference"><summary>查看给关键帧 / Seedance 使用的固定 3D 参考图</summary>
           <div class="blocking-map-scroll"><button class="blocking-map-btn" data-map="${esc(svgUrl)}" data-label="第${scene.scene_no}场固定3D空间参考图"><img src="${esc(svgUrl)}" loading="lazy" alt="第${scene.scene_no}场固定3D空间参考图，点击放大"></button></div>
