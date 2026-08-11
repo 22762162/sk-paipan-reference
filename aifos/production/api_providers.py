@@ -828,7 +828,11 @@ class ClaudeApiProvider(Provider):
         try:
             if capability == "scene_annotate":
                 from ..adapters.claude_script import validate_scene_annotation
-                error = validate_scene_annotation(data)
+                error = validate_scene_annotation(
+                    data,
+                    appearance_only=bool(payload.get("appearance_only")),
+                    expected_object_names=payload.get("object_names"),
+                )
                 if error:
                     raise ProviderError(f"场景标注无效: {error}")
             elif capability == "image_qc":
