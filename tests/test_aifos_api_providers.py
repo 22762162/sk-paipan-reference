@@ -205,6 +205,56 @@ def test_claude_api_storyboard_and_errors(fake_api, tmp_path):
                                      "episode_number": 1}, tmp_path)
 
 
+def test_claude_api_scene_appearance_uses_appearance_only_validator(
+        fake_api, tmp_path):
+    endpoint, fake = fake_api
+    panorama = tmp_path / "panorama.png"
+    panorama.write_bytes(PNG_1PX)
+    appearance = {
+        "objects": [{
+            "name": "书案",
+            "material": {
+                "verified": True,
+                "name": "深褐色哑光木材",
+                "base_color": "#5A3C29",
+                "roughness": 0.72,
+                "metalness": 0.02,
+                "emissive_intensity": 0,
+                "evidence": "可见木纹与暖色低光高光",
+            },
+        }],
+        "lighting": {
+            "verified": True,
+            "ambient_intensity": 0.42,
+            "key_intensity": 1.15,
+            "color_temperature_k": 4300,
+            "direction": {"x": -0.7, "y": -0.5, "z": 0.3},
+            "evidence": "右侧格窗光形成向左投影",
+        },
+    }
+    fake.routes[("POST", "/v1/messages")] = lambda body: {
+        "content": [{"type": "text", "text": json.dumps(
+            appearance, ensure_ascii=False)}]}
+    conf = _claude_conf(endpoint)
+    conf["capabilities"].append("scene_annotate")
+    provider = ClaudeApiProvider("claude_api", conf)
+
+    result = provider.generate("scene_annotate", {
+        "location": "都察院东值房",
+        "appearance_only": True,
+        "object_names": ["书案"],
+        "image_uri": str(panorama),
+        "reference_manifest": [],
+    }, tmp_path)
+
+    assert result.data == appearance
+    prompt_blocks = fake.calls[-1]["body"]["messages"][0]["content"]
+    prompt = prompt_blocks[-1]["text"]
+    assert "只补齐既有三维搭景" in prompt
+    assert "书案" in prompt
+    assert "base_u" not in prompt
+
+
 def test_claude_api_requires_key(tmp_path):
     conf = _claude_conf("http://127.0.0.1:1")
     conf["api_key"] = ""
