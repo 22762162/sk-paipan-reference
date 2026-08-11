@@ -83,3 +83,32 @@ def test_quality_is_split_and_issues_can_locate_objects():
     assert "` · 真实物件 ${renderStats.semanticPrefabs}/${renderStats.objects}`" not in html
     assert '!["unverified","default","fallback","category_render_default"]' in html
     assert "opaque luminous backing turned a large lattice window" in html
+
+
+def test_material_lighting_issues_are_grouped_and_have_safe_refresh_action():
+    html = source()
+
+    assert 'id="analyzeAppearance"' in html
+    assert 'id="appearanceStatus"' in html
+    assert '"/api/scene3d/appearance?episode="' in html
+    assert "读取全景可见材质与主光，不会改物体位置和尺寸" in html
+    assert "function warn(" in html
+    for label in ("材质", "灯光", "空间关系", "几何"):
+        assert f'return "{label}"' in html
+    assert "groupSummary" in html
+    assert 'raw.verified!==true' in html
+
+
+def test_actor_stature_is_separate_from_pose_envelope():
+    html = source()
+
+    assert "function actorStature(" in html
+    assert '"start_stature_m"' in html
+    assert 'actor.stature_m' in html
+    assert 'ratios={sitting:1.22/1.68' in html
+    assert "function addActorSolid(kit,x,y,z,envelope,stature" in html
+    assert 'actorPose==="sitting"||actorPose==="leaning_seated"' in html
+    assert 'actorPose==="lying"' in html
+    assert "startStature=actorStature(" in html
+    assert "endStature=actorStature(" in html
+    assert "addActorSolid(kit,s[0],s[1]+bob,s[2],h0,stature0" in html

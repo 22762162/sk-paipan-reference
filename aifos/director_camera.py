@@ -50,6 +50,7 @@ MIN_CAMERA_HEIGHT_M = 0.35
 MAX_CAMERA_HEIGHT_M = 4.6
 # 相邻镜方位变化的「无效剪辑」下限:小于此值又同景别,剪起来像跳帧
 MIN_MEANINGFUL_AZIMUTH_DELTA_DEG = 12.0
+GROUP_FRAMING_TOKENS = ("双人", "两人", "二人", "同框", "群像", "建立镜")
 
 
 def _text(value):
@@ -104,6 +105,21 @@ def declared_position(shot):
         if token:
             return token
     return ""
+
+
+def declared_group_framing(shot):
+    """True only when the director explicitly asks to hold several people."""
+    design = ((shot or {}).get("five_dimensions") or {}).get(
+        "camera_design") or {}
+    values = [
+        (shot or {}).get("camera"),
+        (shot or {}).get("description"),
+        design.get("composition"),
+        design.get("camera_position"),
+        design.get("coverage"),
+    ]
+    text = " ".join(_text(value) for value in values)
+    return any(token in text for token in GROUP_FRAMING_TOKENS)
 
 
 def _xyz(point, default_y=0.0):
@@ -189,10 +205,49 @@ def solve_camera(shot, actors, *, axis_side=1, scene_center=(0.0, 0.0),
     position = declared_position(shot)
     offset = POSITION_AZIMUTH_DEG.get(position, 0.0)
 
-    facing = subject_facing_yaw(actor, actors, scene_center)
-    # 机位在主体正前方 = 与朝向相反;机位词只决定绕主体转多少度,
-    # 转向哪一侧由本场轴线锁定(axis_side),保证同场不越轴。
-    yaw = _wrap180(facing + 180.0 + offset * (1 if axis_side >= 0 else -1))
+    positioned = [row for row in (actors or []) if isinstance(row, dict)
+                  and isinstance(row.get("start_3d"), dict)]
+    group_mode = bool(len(positioned) >= 2 and declared_group_framing(shot))
+    group_span = 0.0
+    if group_mode:
+        points = [_xyz(row.get("start_3d")) for row in positioned]
+        sx = sum(point[0] for point in points) / len(points)
+        sz = sum(point[2] for point in points) / len(points)
+        eyes = []
+        for row in positioned:
+            try:
+                envelope = float(row.get("height_m") or 1.68)
+            except (TypeError, ValueError):
+                envelope = 1.68
+            eyes.append(envelope * (SUBJECT_EYE_HEIGHT_M / 1.68))
+        eye = sum(eyes) / len(eyes)
+        # The widest pair defines the interaction axis.  The camera sits on its
+        # perpendicular bisector so neither performer is artificially shrunk by
+        # foreground/background depth.  Pull back enough for a 35mm portrait
+        # frame to contain the pair; this is composition, not actor scaling.
+        pair = max(
+            ((a, b) for index, a in enumerate(points)
+             for b in points[index + 1:]),
+            key=lambda row: math.hypot(
+                row[1][0] - row[0][0], row[1][2] - row[0][2]))
+        dx, dz = pair[1][0] - pair[0][0], pair[1][2] - pair[0][2]
+        group_span = math.hypot(dx, dz)
+        if group_span > 0.05:
+            normal_x, normal_z = dz / group_span, -dx / group_span
+            if axis_side < 0:
+                normal_x, normal_z = -normal_x, -normal_z
+            yaw = _wrap180(math.degrees(math.atan2(normal_x, normal_z)))
+            distance = max(distance, group_span * 1.05)
+        else:
+            facing = subject_facing_yaw(actor, actors, scene_center)
+            yaw = _wrap180(
+                facing + 180.0 + offset * (1 if axis_side >= 0 else -1))
+    else:
+        facing = subject_facing_yaw(actor, actors, scene_center)
+        # 机位在主体正前方 = 与朝向相反;机位词只决定绕主体转多少度,
+        # 转向哪一侧由本场轴线锁定(axis_side),保证同场不越轴。
+        yaw = _wrap180(
+            facing + 180.0 + offset * (1 if axis_side >= 0 else -1))
 
     horizontal = distance * math.cos(math.radians(pitch))
     height = eye + distance * math.sin(math.radians(pitch))
@@ -228,6 +283,10 @@ def solve_camera(shot, actors, *, axis_side=1, scene_center=(0.0, 0.0),
         "declared": {"shot_size": size, "angle": angle,
                      "position": position},
         "subject_actor_id": _text(actor.get("actor_id")),
+        "subject_actor_ids": [_text(row.get("actor_id")) for row in positioned]
+                             if group_mode else [_text(actor.get("actor_id"))],
+        "target_mode": "group_midpoint" if group_mode else "primary_actor",
+        "group_span_m": round(group_span, 2) if group_mode else 0.0,
         "wall_clamped": clamped,
     }
 

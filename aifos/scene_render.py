@@ -253,6 +253,10 @@ def _material_contract(obj, category):
         base_color = None
     declared_name = _text(obj.get("material_name") or obj.get("material"))
     has_explicit = bool(explicit or declared_name)
+    verified = bool(has_explicit and explicit.get("verified") is True)
+    source = (
+        _text(explicit.get("source") or obj.get("material_source"))
+        if verified else "")
     contract = {
         "model": "pbr-metallic-roughness",
         "preset": preset_name,
@@ -265,14 +269,18 @@ def _material_contract(obj, category):
             else preset["emissive_intensity"]),
         "base_color": base_color,
         "declared_name": declared_name or None,
-        "source": ("declared_with_category_fallback" if has_explicit
-                   else "category_render_default"),
+        "verified": verified,
+        "evidence": _text(explicit.get("evidence")) or None,
+        "source": (source or "panorama_visual_annotation" if verified
+                   else ("visual_annotation_unverified" if has_explicit
+                         else "category_render_default")),
     }
     confidence = {
-        "score": 0.75 if has_explicit else 0.3,
-        "level": "medium" if has_explicit else "low",
-        "basis": (["scene_model.material"] if has_explicit else
-                  ["category_render_default_not_observed"]),
+        "score": 0.8 if verified else 0.3,
+        "level": "high" if verified else "low",
+        "basis": (["panorama_visible_material_evidence"] if verified else
+                  (["visual_annotation_marked_unverified"] if has_explicit else
+                   ["category_render_default_not_observed"])),
     }
     return contract, confidence
 
@@ -329,10 +337,10 @@ def _object_contract(raw, index):
                 object_name=name))
     material, material_confidence = _material_contract(obj, category)
     render_prefab = _render_prefab(name, category, semantic_type)
-    if material["source"] == "category_render_default":
+    if not material["verified"]:
         warnings.append(_warning(
             "unverified_material", "material",
-            f"「{name}」没有已验证材质，当前 PBR 参数仅为分类渲染预设",
+            f"「{name}」没有已验证材质，当前 PBR 参数仅供预览",
             object_name=name))
 
     return {
@@ -553,13 +561,19 @@ def _lighting_contract(scene_model, room):
     if direction is not None and all(value is None for value in
                                      direction.values()):
         direction = None
+    verified = bool(source and source.get("verified") is True)
     return {
         "ambient_intensity": ambient,
         "key_intensity": key_intensity,
         "color_temperature_k": color_temperature,
         "direction": direction,
-        "source": "scene_model" if source else "unverified",
-        "confidence": _confidence(len(known), 3, known),
+        "verified": verified,
+        "evidence": _text(source.get("evidence")) or None,
+        "source": (_text(source.get("source")) or
+                   "panorama_visual_annotation") if verified else "unverified",
+        "confidence": (_confidence(len(known), 3, known) if verified else
+                       {"score": 0.0, "level": "low",
+                        "basis": ["not_verified"]}),
     }
 
 
@@ -623,7 +637,7 @@ def build_scene_render_contract(scene_model, panorama_info=None, *,
                 f"房间缺少 {field}；查看器使用明确标记的搭景默认值 "
                 f"{room[field]}m，该值不是场景事实"))
     lighting = _lighting_contract(model, room_source)
-    if lighting["source"] == "unverified":
+    if not lighting["verified"]:
         warnings.append(_warning(
             "missing_lighting", "lighting",
             "场景没有已验证灯光参数；合同不推断光源方向或强度"))

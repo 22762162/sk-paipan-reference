@@ -41,6 +41,9 @@ canvas.drag{cursor:grabbing}
 #notice.bad{border-color:#8b3f36;color:#f0aaa0;background:rgba(45,19,17,.92)}
 #noticePanel{border:0}#noticeSummary{cursor:pointer;font-weight:600;list-style-position:inside}
 #noticeDetails{max-height:180px;overflow:auto;margin-top:5px}
+.notice-group{margin-top:6px;border-top:1px solid rgba(217,164,65,.18);padding-top:4px}
+.notice-group-title{font-size:10px;color:var(--gold);letter-spacing:.08em;
+  padding:2px 3px}
 .notice-item{display:block;width:100%;text-align:left;margin-top:4px;padding:5px 7px;
   color:inherit;background:rgba(0,0,0,.16);border-color:rgba(217,164,65,.28)}
 .notice-item.locatable::after{content:" · 定位";color:var(--gold)}
@@ -131,6 +134,7 @@ button.ghost.on{color:var(--gold);background:transparent;
 .edit-field input:disabled,.edit-field select:disabled{opacity:.65}
 #inspectorHint{font-size:10px;color:var(--paper-dim);line-height:1.5;margin:7px 0}
 #saveStatus{font-size:10px;color:var(--paper-dim)}
+#appearanceStatus{font-size:10px;color:var(--paper-dim);max-width:210px}
 #footerToggle{display:none}
 @media(max-width:600px){
   #top{height:50px;flex-wrap:nowrap;padding:7px 10px;align-items:center}
@@ -265,7 +269,9 @@ button.ghost.on{color:var(--gold);background:transparent;
       <button id="tPath" class="ghost" disabled>路线</button>
       <button id="tFrus" class="ghost" disabled>视锥</button>
       <button id="tAxis" class="ghost" disabled>轴线</button>
+      <button id="analyzeAppearance">AI识别材质/灯光</button>
       <button id="exportPng">导出效果图</button>
+      <span id="appearanceStatus"></span>
     </div>
   </footer>
 </div>
@@ -331,17 +337,32 @@ function warn(messages,bad=false){
  const panel=document.createElement("details");panel.id="noticePanel";
  const summary=document.createElement("summary");summary.id="noticeSummary";
  const hasLocatable=rows.some(row=>row&&typeof row==="object"&&row.objectKey);
+ const groupLabel=row=>{const code=String(row&&row.code||"").toLowerCase(),
+  field=String(row&&row.field||"").toLowerCase();
+  if(code.includes("material")||field.includes("material"))return "材质";
+  if(code.includes("lighting")||field.includes("lighting"))return "灯光";
+  if(code.includes("support")||code.includes("overlap")||code.includes("bounds")||
+     field.includes("support")||field.includes("bounds"))return "空间关系";
+  if(code.includes("geometry")||code.includes("rotation")||code.includes("scale")||
+     field.includes("geometry")||field.includes("scale"))return "几何";
+  return "其他"};
+ const groups=new Map();rows.forEach(row=>{const label=groupLabel(row);
+  if(!groups.has(label))groups.set(label,[]);groups.get(label).push(row)});
+ const groupSummary=[...groups].map(([label,items])=>`${label}${items.length}`).join(" · ");
  summary.textContent=rows.length===1&&!hasLocatable?String(rows[0].message||rows[0]):
-  `${rows.length} 项场景问题（点击展开）`;
+  `${rows.length} 项场景问题 · ${groupSummary}（点击展开）`;
  panel.ontoggle=()=>notice.classList.toggle("expanded",panel.open);
  panel.appendChild(summary);notice.appendChild(panel);
  if(rows.length>1||hasLocatable){const details=document.createElement("div");details.id="noticeDetails";
-  rows.forEach(row=>{const item=document.createElement("button");
-   item.className="notice-item";item.textContent=String(row.message||row);
-   if(row&&typeof row==="object"&&row.objectKey){
-    item.classList.add("locatable");item.onclick=event=>{
-     event.stopPropagation();focusObject(row.objectKey)}}
-   details.appendChild(item)});panel.appendChild(details)}}
+  groups.forEach((groupRows,label)=>{const group=document.createElement("section");
+   group.className="notice-group";const title=document.createElement("div");
+   title.className="notice-group-title";title.textContent=`${label} · ${groupRows.length}项`;
+   group.appendChild(title);groupRows.forEach(row=>{const item=document.createElement("button");
+    item.className="notice-item";item.textContent=String(row.message||row);
+    if(row&&typeof row==="object"&&row.objectKey){
+     item.classList.add("locatable");item.onclick=event=>{
+      event.stopPropagation();focusObject(row.objectKey)}}
+    group.appendChild(item)});details.appendChild(group)});panel.appendChild(details)}}
 if(!gl){fail("此浏览器不支持 WebGL,无法显示 3D 空间。")}
 
 // ---- 着色器:控制线、受光实体、透明阴影、全景房间 ----
@@ -551,7 +572,8 @@ function materialFor(obj){
  const specular=clamp(raw.specular??own.specular??(.14+metallic*.58),0,1);
  const emissive=clamp(raw.emissive??own.emissive??0,0,1);
  return {color,roughness,metallic,gloss,specular,emissive,panoBlend:.68,
-         usedDefault:raw.source==="category_render_default"||
+         usedDefault:raw.verified!==true||raw.source==="category_render_default"||
+          raw.source==="visual_annotation_unverified"||
           !(Object.keys(raw).length||Object.keys(own).length)}}
 function renderContractObject(obj){
  return lookupContractObject(activeRenderContract(),obj)||{}}
@@ -628,7 +650,7 @@ function lightingIsVerified(){
  if(light.verified===true)return true;
  const source=String(light.source||"").trim().toLowerCase(),
        confidence=String((light.confidence||{}).level||"").toLowerCase();
- return Boolean(light.direction&&source&&
+ return Boolean(light.verified!==false&&light.direction&&source&&
   !["unverified","default","fallback","category_render_default"].includes(source)&&
   confidence!=="low")}
 function updateQualityBadges(){
@@ -660,10 +682,11 @@ function updateSceneStatus(extra=[]){
  const contractWarnings=renderEntry&&Array.isArray(renderEntry.warnings)?
   renderEntry.warnings.filter(item=>item&&item.message):[];
  if(contractWarnings.length){
-  contractWarnings.forEach(item=>rows.push({message:item.message,
+  contractWarnings.forEach(item=>rows.push({...item,message:item.message,
    objectKey:issueObjectKey(item,item.message)}))}
  if(renderStats.invalid)add(`已跳过 ${renderStats.invalid} 件坐标或尺寸无效的物体。`);
- if(renderStats.defaultMaterials&&renderEntry)
+ if(renderStats.defaultMaterials&&renderEntry&&
+    !contractWarnings.some(item=>item.code==="unverified_material"))
   add(`${renderStats.defaultMaterials} 件物体缺少材质，已使用分类默认值。`);
  if(renderStats.fallbackPrefabs)
   add(`${renderStats.fallbackPrefabs} 件未知物体仍使用低置信占位体；`+
@@ -1244,11 +1267,28 @@ function buildShellFaces(active,fw,fd,h){
   slot.center=spec.center;slot.inward=spec.inward});
  shellFaces.length=specs.length}
 
-// 人物实体:袍服人形(下裳圆台/垂袖/发髻),移动朝移动方向,静止朝机位。
-function addActorSolid(kit,x,y,z,h,col,yawDeg){
+// ``height_m`` 是当前姿态的垂直包络，而非人物真实身高。旧 blocking
+// 没有 stature_m 时，按各姿态的既有标准包络反推成人身高；这样旧集也
+// 不会把 1.22m 的“坐姿头顶高度”画成一个 1.22m 的缩小站立人。
+function actorStature(actor,pose,envelope,phase){
+ const key=phase==="end"?"end_stature_m":"start_stature_m",
+       direct=finite(actor&&(
+        actor[key]??actor.stature_m??actor.body_height_m??actor.full_height_m),0);
+ if(direct>=.8)return clamp(direct,.9,2.25);
+ const ratios={sitting:1.22/1.68,leaning_seated:1.05/1.68,
+  kneeling:1.12/1.68,crouching:.98/1.68,lying:.55/1.68};
+ const ratio=ratios[String(pose||"")];
+ return ratio?clamp(finite(envelope,1.68)/ratio,1.35,2.05):
+  clamp(finite(envelope,1.68),.9,2.25)}
+
+// 人物实体:真实身高控制体型，姿态包络控制头顶高度；坐、跪、蹲、卧
+// 改变关节和身体占地，不再整体缩放站立模型。
+function addActorSolid(kit,x,y,z,envelope,stature,col,yawDeg,pose){
  const {addBox,addRound}=kit,yaw=(yawDeg||0)*Math.PI/180,
        co=Math.cos(yaw),si=Math.sin(yaw),
        local=(lx,ly,lz)=>[x+lx*co+lz*si,y+ly,z-lx*si+lz*co],
+       H=Math.max(.45,finite(envelope,1.68)),
+       S=Math.max(.9,finite(stature,H)),actorPose=String(pose||"standing"),
        cloth={color:col.map(v=>v*.80),specular:.10,gloss:.18,
               panoBlend:0,emissive:0},
        clothDark={...cloth,color:col.map(v=>v*.58)},
@@ -1257,30 +1297,126 @@ function addActorSolid(kit,x,y,z,h,col,yawDeg){
              emissive:0},
        hair={color:[.15,.12,.11],specular:.3,gloss:.5,panoBlend:0,
              emissive:0};
- addRound(local(0,.01,0),.40*h,.50*h,.36*h,yawDeg,cloth,.52,12);
- addRound(local(0,.50*h,0),.225*h,.30*h,.19*h,yawDeg,cloth,.86,12);
- addRound(local(0,.485*h,0),.235*h,.035*h,.20*h,yawDeg,sash,1,12);
- for(const s of [-1,1])
-  addRound(local(s*.155*h,.44*h,0),.10*h,.34*h,.09*h,yawDeg,
-           clothDark,.55,10);
- addRound(local(0,.78*h,0),.075*h,.05*h,.07*h,yawDeg,skin,.9,10);
- addRound(local(0,.82*h,0),.135*h,.115*h,.125*h,yawDeg,skin,.72,12);
- addRound(local(0,.925*h,0),.115*h,.03*h,.105*h,yawDeg,hair,.5,10);
- addRound(local(0,.95*h,-.01*h),.05*h,.045*h,.05*h,yawDeg,hair,.7,8);
- addBox(local(0,.855*h,.068*h),.02*h,.028*h,.02*h,yawDeg,skin)}
+ const addHead=(baseY,forward=0)=>{
+  addRound(local(0,baseY,forward),.135*S,.115*S,.125*S,yawDeg,skin,.72,12);
+  addRound(local(0,baseY+.105*S,forward-.01*S),.115*S,.03*S,.105*S,
+           yawDeg,hair,.5,10);
+  addRound(local(0,baseY+.13*S,forward-.01*S),.05*S,.045*S,.05*S,
+           yawDeg,hair,.7,8);
+  addBox(local(0,baseY+.035*S,forward+.068*S),.02*S,.028*S,.02*S,
+         yawDeg,skin)};
+ if(actorPose==="lying"){
+  const bodyL=.72*S,bodyY=Math.max(.08,H*.22),headZ=-.48*S;
+  addBox(local(0,bodyY,0),.36*S,.22*S,bodyL,yawDeg,cloth);
+  addBox(local(0,bodyY-.035*S,.53*S),.28*S,.13*S,.42*S,yawDeg,clothDark);
+  for(const side of [-1,1])
+   addBox(local(side*.13*S,bodyY+.02*S,.03*S),.085*S,.10*S,.55*S,
+          yawDeg,clothDark);
+  addHead(Math.max(.06,H*.28),headZ);
+  return}
+ if(actorPose==="sitting"||actorPose==="leaning_seated"){
+  const lean=actorPose==="leaning_seated"?.12*S:0,
+        seatY=Math.min(.31*S,H*.43),torsoBase=seatY-.01*S,
+        headBase=Math.max(torsoBase+.29*S,H-.19*S);
+  // 大腿向前、胫部向下，完整占地仍来自 S；H 只决定坐姿头顶。
+  addRound(local(0,.08*S,.02*S),.36*S,Math.max(.18*S,seatY-.08*S),
+           .31*S,yawDeg,cloth,.62,12);
+  for(const side of [-1,1]){
+   addBox(local(side*.09*S,seatY-.055*S,.20*S),.13*S,.11*S,.42*S,
+          yawDeg,clothDark);
+   addBox(local(side*.09*S,.02*S,.38*S),.12*S,
+          Math.max(.12*S,seatY-.02*S),.12*S,yawDeg,clothDark);
+   addBox(local(side*.09*S,.01*S,.48*S),.13*S,.055*S,.23*S,
+          yawDeg,clothDark)}
+  addRound(local(0,torsoBase,lean*.55),.225*S,
+           Math.max(.27*S,headBase-torsoBase-.03*S),.19*S,
+           yawDeg,cloth,.86,12);
+  addRound(local(0,torsoBase-.015*S,0),.235*S,.035*S,.20*S,
+           yawDeg,sash,1,12);
+  for(const side of [-1,1])
+   addRound(local(side*.155*S,torsoBase-.04*S,lean*.7),.10*S,.30*S,
+            .09*S,yawDeg,clothDark,.55,10);
+  addRound(local(0,headBase-.04*S,lean),.075*S,.05*S,.07*S,
+           yawDeg,skin,.9,10);
+  addHead(headBase,lean);
+  return}
+ if(actorPose==="kneeling"||actorPose==="crouching"){
+  const crouch=actorPose==="crouching",hipY=crouch?.28*S:.22*S,
+        headBase=Math.max(hipY+.30*S,H-.19*S),forward=crouch?.10*S:.03*S;
+  addRound(local(0,.02*S,.08*S),.38*S,Math.max(.18*S,hipY),.34*S,
+           yawDeg,cloth,.58,12);
+  for(const side of [-1,1]){
+   addBox(local(side*.12*S,.015*S,.24*S),.14*S,.10*S,.42*S,
+          yawDeg,clothDark);
+   addBox(local(side*.12*S,.02*S,-.03*S),.13*S,.11*S,.30*S,
+          yawDeg,clothDark)}
+  addRound(local(0,hipY,forward*.5),.225*S,
+           Math.max(.25*S,headBase-hipY-.03*S),.19*S,
+           yawDeg,cloth,.86,12);
+  addRound(local(0,headBase-.04*S,forward),.075*S,.05*S,.07*S,
+           yawDeg,skin,.9,10);
+  addHead(headBase,forward);
+  return}
+ // 站姿保持旧造型，但体型尺度读真实身高而非姿态包络。
+ const bodyH=Math.max(H,S*.9);
+ addRound(local(0,.01,0),.40*S,.50*bodyH,.36*S,yawDeg,cloth,.52,12);
+ addRound(local(0,.50*bodyH,0),.225*S,.30*bodyH,.19*S,yawDeg,cloth,.86,12);
+ addRound(local(0,.485*bodyH,0),.235*S,.035*bodyH,.20*S,yawDeg,sash,1,12);
+ for(const side of [-1,1])
+  addRound(local(side*.155*S,.44*bodyH,0),.10*S,.34*bodyH,.09*S,
+           yawDeg,clothDark,.55,10);
+ addRound(local(0,.78*bodyH,0),.075*S,.05*S,.07*S,yawDeg,skin,.9,10);
+ addHead(.82*bodyH,0)}
 
-function stickman(kit,x,y,z,h,col){
- const push=kit.push,hip=y+.50*h,shoulder=y+.80*h,
-       headC=y+.90*h,headR=.09*h;
- push([x,hip,z],[x,shoulder,z],col);
+function stickman(kit,x,y,z,envelope,col,pose,stature,yawDeg){
+ const push=kit.push,H=Math.max(.45,finite(envelope,1.68)),
+       S=Math.max(.9,finite(stature,H)),actorPose=String(pose||"standing"),
+       yaw=(yawDeg||0)*Math.PI/180,co=Math.cos(yaw),si=Math.sin(yaw),
+       p=(lx,ly,lz)=>[x+lx*co+lz*si,y+ly,z-lx*si+lz*co];
+ let head,neck,shoulderL,shoulderR,hip,elbowL,elbowR,handL,handR,
+     kneeL,kneeR,footL,footR;
+ if(actorPose==="lying"){
+  head=p(0,H*.48,-.43*S);neck=p(0,H*.43,-.32*S);
+  shoulderL=p(-.115*S,H*.40,-.23*S);shoulderR=p(.115*S,H*.40,-.23*S);
+  hip=p(0,H*.34,.12*S);elbowL=p(-.17*S,H*.31,-.05*S);
+  elbowR=p(.17*S,H*.31,-.05*S);handL=p(-.19*S,H*.24,.12*S);
+  handR=p(.19*S,H*.24,.12*S);kneeL=p(-.05*S,H*.22,.32*S);
+  kneeR=p(.05*S,H*.22,.32*S);footL=p(-.08*S,H*.14,.51*S);
+  footR=p(.08*S,H*.14,.51*S)
+ }else if(actorPose==="sitting"||actorPose==="leaning_seated"){
+  const f=actorPose==="leaning_seated"?.12*S:0,seatY=Math.min(.31*S,H*.43);
+  head=p(0,H-.09*S,f);neck=p(0,H-.19*S,f*.8);
+  shoulderL=p(-.115*S,H-.25*S,f*.65);shoulderR=p(.115*S,H-.25*S,f*.65);
+  hip=p(0,seatY,0);elbowL=p(-.16*S,H-.39*S,f*.75);
+  elbowR=p(.16*S,H-.39*S,f*.75);handL=p(-.17*S,seatY+.05*S,.17*S);
+  handR=p(.17*S,seatY+.05*S,.17*S);kneeL=p(-.08*S,seatY*.88,.32*S);
+  kneeR=p(.08*S,seatY*.88,.32*S);footL=p(-.08*S,0,.45*S);
+  footR=p(.08*S,0,.45*S)
+ }else if(actorPose==="kneeling"||actorPose==="crouching"){
+  const f=actorPose==="crouching"?.10*S:.03*S,hipY=actorPose==="crouching"?.28*S:.22*S;
+  head=p(0,H-.09*S,f);neck=p(0,H-.19*S,f*.8);
+  shoulderL=p(-.115*S,H-.25*S,f*.6);shoulderR=p(.115*S,H-.25*S,f*.6);
+  hip=p(0,hipY,0);elbowL=p(-.16*S,H-.40*S,f);
+  elbowR=p(.16*S,H-.40*S,f);handL=p(-.17*S,hipY+.02*S,.18*S);
+  handR=p(.17*S,hipY+.02*S,.18*S);kneeL=p(-.11*S,.08*S,.25*S);
+  kneeR=p(.11*S,.08*S,.25*S);footL=p(-.10*S,.01*S,-.08*S);
+  footR=p(.10*S,.01*S,-.08*S)
+ }else{
+  head=p(0,.91*H,0);neck=p(0,.82*H,0);
+  shoulderL=p(-.115*S,.79*H,0);shoulderR=p(.115*S,.79*H,0);
+  hip=p(0,.50*H,0);elbowL=p(-.155*S,.62*H,0);
+  elbowR=p(.155*S,.62*H,0);handL=p(-.175*S,.42*H,0);
+  handR=p(.175*S,.42*H,0);kneeL=p(-.055*S,.285*H,0);
+  kneeR=p(.055*S,.285*H,0);footL=p(-.085*S,0,0);footR=p(.085*S,0,0)}
+ for(const [a,b] of [[neck,shoulderL],[neck,shoulderR],[neck,hip],
+  [shoulderL,elbowL],[elbowL,handL],[shoulderR,elbowR],[elbowR,handR],
+  [hip,kneeL],[kneeL,footL],[hip,kneeR],[kneeR,footR]])push(a,b,col);
+ const headR=.09*S;
  for(let i=0;i<14;i++){const t0=i/14*Math.PI*2,t1=(i+1)/14*Math.PI*2;
-  push([x+headR*Math.sin(t0),headC+headR*Math.cos(t0),z],
-       [x+headR*Math.sin(t1),headC+headR*Math.cos(t1),z],col);
-  push([x,headC+headR*Math.cos(t0),z+headR*Math.sin(t0)],
-       [x,headC+headR*Math.cos(t1),z+headR*Math.sin(t1)],col)}
- push([x,shoulder-.02*h,z],[x-.16*h,y+.42*h,z],col);
- push([x,shoulder-.02*h,z],[x+.16*h,y+.42*h,z],col);
- push([x,hip,z],[x-.10*h,y,z],col);push([x,hip,z],[x+.10*h,y,z],col)}
+  push([head[0]+headR*Math.sin(t0),head[1]+headR*Math.cos(t0),head[2]],
+       [head[0]+headR*Math.sin(t1),head[1]+headR*Math.cos(t1),head[2]],col);
+  push([head[0],head[1]+headR*Math.cos(t0),head[2]+headR*Math.sin(t0)],
+       [head[0],head[1]+headR*Math.cos(t1),head[2]+headR*Math.sin(t1)],col)}}
 
 // 静态布景:只在换场景/换显示模式/全景就绪时重建。
 function buildSceneGeometry(){
@@ -1372,9 +1508,13 @@ function buildGeometry(silent){
    q=V.add(a,V.scale(V.sub(b,a),Math.min(1,t+.028)));
    push([p[0],.02,p[2]],[q[0],.02,q[2]],c)}}
  acts.forEach((a,ai)=>{
-  const col=hex(a.color),s0=P(a.start_3d),e=P(a.end_3d),
+ const col=hex(a.color),s0=P(a.start_3d),e=P(a.end_3d),
         startH=Math.max(.7,finite(a.start_height_m??a.height_m,1.7)),
-        endH=Math.max(.7,finite(a.end_height_m??a.height_m,startH));
+        endH=Math.max(.7,finite(a.end_height_m??a.height_m,startH)),
+        startPose=String(a.pose_start||"standing"),
+        endPose=String(a.pose_end||startPose),
+        startStature=actorStature(a,startPose,startH,"start"),
+        endStature=actorStature(a,endPose,endH,"end");
   // 预演播放:人物沿绕行路径按弧长插值(缓入缓出),身高同步过渡;
   // 路径由通行导航算出,起终点仍是 blocking 数据原值。
   const nav=NAV.actors[ai],walking=nav&&nav.len>.05;
@@ -1382,6 +1522,8 @@ function buildGeometry(silent){
   if(walking){const pp=pathPoint(nav,uMove);s=pp.p;dir=pp.dir}
   else s=PV.active?lerp3(s0,e,uMove):s0;
   const h0=PV.active?startH+(endH-startH)*uMove:startH;
+  const stature0=PV.active?startStature+(endStature-startStature)*uMove:
+        startStature,pose0=PV.active&&uMove>=.5?endPose:startPose;
   // 行走起伏:按已走弧长起落,静止与到点后归零。
   const bob=(PV.active&&walking&&uMove>0&&uMove<1)?
    Math.abs(Math.sin(uMove*nav.len*3.4))*.012*h0:0;
@@ -1390,9 +1532,9 @@ function buildGeometry(silent){
    (dir&&Math.hypot(dir[0],dir[1])>.01?
     Math.atan2(dir[0],dir[1])*180/Math.PI:
     Math.atan2(camEye[0]-s[0],camEye[2]-s[2])*180/Math.PI);
-  if(structure)stickman(kit,s[0],s[1],s[2],h0,col);
-  else{addActorSolid(kit,s[0],s[1]+bob,s[2],h0,col,yawA);
-   shadowEllipse(s[0],s[2],.17*h0,.13*h0,.03,.02,.26)}
+  if(structure)stickman(kit,s[0],s[1],s[2],h0,col,pose0,stature0,yawA);
+  else{addActorSolid(kit,s[0],s[1]+bob,s[2],h0,stature0,col,yawA,pose0);
+   shadowEllipse(s[0],s[2],.17*stature0,.13*stature0,.03,.02,.26)}
   if(show.control)PT.push(s[0],s[1]+.9*h0,s[2],col[0],col[1],col[2]);
   if(show.control&&show.path&&!PV.active&&(a.moving||V.len(V.sub(e,s0))>.05)){
    const dim=V.scale(col,.62);
@@ -1403,7 +1545,7 @@ function buildGeometry(silent){
    for(let i=0;i<12;i++){const t0=i/12*Math.PI*2,t1=(i+1)/12*Math.PI*2;
     push([e[0]+.18*Math.cos(t0),e[1]+.03,e[2]+.18*Math.sin(t0)],
          [e[0]+.18*Math.cos(t1),e[1]+.03,e[2]+.18*Math.sin(t1)],dim)}
-   stickman(kit,e[0],e[1],e[2],endH,dim)}});
+   stickman(kit,e[0],e[1],e[2],endH,dim,endPose,endStature,yawA)}});
  if(show.control){
   const cs0=P(cam.start_3d,1.55),
         ce=P(cam.end_3d||cam.start_3d,1.55),
@@ -2046,6 +2188,29 @@ document.getElementById("saveEdits").onclick=async()=>{
  }catch(error){status.textContent="保存失败："+error.message;warn(
   [{message:"场景修复保存失败："+error.message,objectKey:editState.selectedKey}],true)
  }finally{editState.saving=false;syncEditButtons()}};
+document.getElementById("analyzeAppearance").onclick=async()=>{
+ const button=document.getElementById("analyzeAppearance"),
+       status=document.getElementById("appearanceStatus"),
+       location=String((SCENE&&SCENE.location)||""),
+       revision=sceneRevisionEntry(),shotNo=Number(SHOT&&SHOT.shot_no);
+ if(!location||button.disabled)return;
+ button.disabled=true;button.textContent="正在识别…";
+ status.textContent="读取全景可见材质与主光，不会改物体位置和尺寸";
+ try{
+  const response=await fetch("/api/scene3d/appearance?episode="+
+   encodeURIComponent(episode),{method:"POST",headers:{"Content-Type":"application/json"},
+   body:JSON.stringify({episode_id:Number(episode),scene_location:location,
+    physical_scene_id:revision.physical_scene_id||location})});
+  const textValue=await response.text();let data={};
+  try{data=textValue?JSON.parse(textValue):{}}catch(error){data={error:textValue}}
+  if(!response.ok)throw new Error(data.error||data.message||String(response.status));
+  DATA=data;selectShot(shotNo);const summary=data.appearance_refresh||{};
+  status.textContent=`已更新 v${summary.revision??"?"} · 材质 `+
+   `${summary.verified_materials??0}/${summary.objects??0} · `+
+   `灯光${summary.lighting_verified?"已验证":"仍需人工复核"}`;
+ }catch(error){status.textContent="识别失败："+error.message;
+  warn([{code:"appearance_refresh_failed",message:"材质/灯光识别失败："+error.message}],true)
+ }finally{button.disabled=false;button.textContent="AI识别材质/灯光"}};
 async function exportCleanPng(){
  const previousControl=show.control;
  const button=document.getElementById("exportPng"),saved={

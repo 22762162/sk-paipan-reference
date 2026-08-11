@@ -167,6 +167,26 @@ class AzimuthTest(unittest.TestCase):
         self.assertAlmostEqual(t["x"], 2.4, delta=0.01)
         self.assertAlmostEqual(t["z"], -0.3, delta=0.01)
 
+    def test_explicit_two_person_frame_uses_perpendicular_midpoint_camera(self):
+        left = _actor("顾明昭", x=-2.44, z=-0.3, hero=True)
+        right = _actor("沈砚舟", x=0.0, z=1.04, hero=False)
+        shot = _shot("双人平视斜侧中近景，35mm，以书案前缘横向分隔构图")
+
+        cam = solve_camera(
+            shot, [left, right],
+            world={"floor_width_m": 20, "floor_depth_m": 20})
+
+        self.assertEqual(cam["target_mode"], "group_midpoint")
+        self.assertEqual(cam["subject_actor_ids"], ["顾明昭", "沈砚舟"])
+        self.assertAlmostEqual(cam["target_3d"]["x"], -1.22, delta=0.01)
+        self.assertAlmostEqual(cam["target_3d"]["z"], 0.37, delta=0.01)
+        eye = (cam["position_3d"]["x"], cam["position_3d"]["z"])
+        left_distance = math.dist(eye, (-2.44, -0.3))
+        right_distance = math.dist(eye, (0.0, 1.04))
+        self.assertAlmostEqual(left_distance, right_distance, delta=0.03)
+        self.assertGreaterEqual(cam["desired_distance_m"],
+                                cam["group_span_m"])
+
 
 class SceneContinuityTest(unittest.TestCase):
     def test_flags_near_identical_consecutive_setups(self):

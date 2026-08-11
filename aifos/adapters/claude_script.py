@@ -2923,7 +2923,8 @@ def validate_shot_repair(data, payload):
 
 
 SCENE_ANNOTATE_PROMPT = """你在读一张 720° 等距圆柱全景图(equirectangular),
-它是场景「{location}」的几何真相。请标出画面里每一件**落在地面上的实体**。
+它是场景「{location}」的几何与可见外观真相。请标出画面里每一件实体，
+并从可见像素记录其主材质与整场主光；不得根据类别猜测被遮挡的背面。
 
 关键:你**不需要估计距离**。平台会用「物体底部在图里的位置」做地面射线
 求交,精确解出它的三维坐标——你只要把接触点标准。距离猜测反而会引入误差。
@@ -2947,43 +2948,149 @@ SCENE_ANNOTATE_PROMPT = """你在读一张 720° 等距圆柱全景图(equirecta
 category 取值:furniture(桌椅柜架床)、prop(炉瓶书卷等可移动物件)、
 opening(门窗)、light(灯具)、decor(帷幔挂画盆栽)。
 
+材质与灯光约定:
+- 每件物体的 material 记录**当前可见表面的主材质**。name 用具体中文，
+  base_color 必须是 #RRGGBB；roughness、metalness ∈ [0,1]；
+  emissive_intensity ∈ [0,10]。evidence 写明从图中看见的颜色、反光、
+  纹理或透光证据；verified 只有证据充分才为 true。看不清就设 false，
+  evidence 写“不可验证”，不要用类别常识补全。
+- lighting 记录这张全景实际呈现的整体入射光。ambient_intensity、
+  key_intensity ∈ [0,10]；color_temperature_k ∈ [1000,20000]；
+  direction 是主光从光源指向场景中心的单位方向向量，x/y/z ∈ [-1,1]，
+  三轴不能全为0；evidence 写明窗光、灯具、阴影或高光依据；verified
+  只有光源方向、强度和色温都有可见依据时才为 true。
+- 这不是精密仪器测光：参数是“全景可见外观标注”，不是物理实测。
+  但也不能用分类默认值冒充已观察结果。
+
 严格输出 JSON:
 {{"objects":[{{"name":"物体中文名","category":"furniture",
   "base_u":0.5,"base_v":0.78,"top_v":0.55,"width_u":0.12,
   "depth_m":0.8,"rotation_y_deg":0,
-  "note":"用于定位的接触点描述"}}]}}
+  "material":{{"verified":true,"name":"深褐色哑光木材","base_color":"#5A3C29",
+    "roughness":0.72,"metalness":0.02,"emissive_intensity":0,
+    "evidence":"可见木纹、低强度暖色高光"}},
+  "note":"用于定位的接触点描述"}}],
+ "lighting":{{"verified":true,"ambient_intensity":0.42,"key_intensity":1.15,
+   "color_temperature_k":4300,"direction":{{"x":-0.7,"y":-0.5,"z":0.3}},
+   "evidence":"右侧格窗暖光形成向左投影；室内有弱环境反射"}}}}
 只输出 JSON,不要额外说明。
 """
 
 
-def validate_scene_annotation(data):
+SCENE_APPEARANCE_PROMPT = """你在读场景「{location}」的 720° 等距圆柱全景图。
+本次只补齐既有三维搭景的**可见材质与整场灯光**，严禁修改、增删或重命名
+物体。物体清单如下，输出必须保持同样的名称、顺序和数量：
+{objects}
+
+每件物体输出 material：verified(bool)、name(具体中文)、base_color(#RRGGBB)、
+roughness/metalness(0~1)、emissive_intensity(0~10)、evidence(可见纹理、反光、
+颜色或透光依据)。看不清时 verified=false、evidence=“不可验证”，禁止靠类别
+常识补全。lighting 输出 verified、ambient_intensity/key_intensity(0~10)、
+color_temperature_k(1000~20000)、direction(x/y/z各-1~1且不全为0)、evidence。
+只有窗光、灯具、阴影或高光证据充分时 lighting.verified 才为 true。
+
+严格输出 JSON：
+{{"objects":[{{"name":"必须原样复制清单名称","material":{{"verified":true,
+"name":"深褐色哑光木材","base_color":"#5A3C29","roughness":0.72,
+"metalness":0.02,"emissive_intensity":0,"evidence":"可见木纹与暖色高光"}}}}],
+"lighting":{{"verified":true,"ambient_intensity":0.42,"key_intensity":1.15,
+"color_temperature_k":4300,"direction":{{"x":-0.7,"y":-0.5,"z":0.3}},
+"evidence":"右侧格窗光形成向左投影"}}}}
+只输出 JSON，不要额外说明。
+"""
+
+
+def validate_scene_annotation(data, *, appearance_only=False,
+                              expected_object_names=None):
     """场景标注结构校验:只收能解出落地点的条目。"""
     if not isinstance(data, dict):
         return "场景标注必须是 JSON 对象"
     objects = data.get("objects")
     if not isinstance(objects, list) or not objects:
         return "场景标注缺少 objects 数组"
+    if appearance_only and expected_object_names is not None:
+        actual_names = [str(item.get("name") or "").strip()
+                        if isinstance(item, dict) else "" for item in objects]
+        expected_names = [str(name or "").strip()
+                          for name in expected_object_names]
+        if actual_names != expected_names:
+            return "材质识别必须保持既有物体名称、顺序和数量不变"
     for index, item in enumerate(objects, 1):
         if not isinstance(item, dict):
             return f"objects[{index}] 必须是对象"
         if not str(item.get("name") or "").strip():
             return f"objects[{index}] 缺少 name"
-        for key in ("base_u", "base_v"):
+        if not appearance_only:
+            for key in ("base_u", "base_v"):
+                try:
+                    value = float(item[key])
+                except (KeyError, TypeError, ValueError):
+                    return f"objects[{index}] 的 {key} 缺失或非数字"
+                if not 0.0 <= value <= 1.0:
+                    return f"objects[{index}] 的 {key} 必须在 0~1 之间"
+            for key in ("depth_m", "rotation_y_deg"):
+                if item.get(key) is None:
+                    continue
+                try:
+                    value = float(item[key])
+                except (TypeError, ValueError):
+                    return f"objects[{index}] 的 {key} 必须是数字"
+                if key == "depth_m" and not 0.02 <= value <= 20.0:
+                    return f"objects[{index}] 的 depth_m 必须在 0.02~20 米之间"
+        material = item.get("material")
+        if not isinstance(material, dict):
+            return f"objects[{index}] 缺少 material 可见材质标注"
+        if not str(material.get("name") or "").strip():
+            return f"objects[{index}].material 缺少 name"
+        if not isinstance(material.get("verified"), bool):
+            return f"objects[{index}].material.verified 必须是布尔值"
+        color = str(material.get("base_color") or "").strip()
+        if not re.fullmatch(r"#[0-9A-Fa-f]{6}", color):
+            return f"objects[{index}].material.base_color 必须是 #RRGGBB"
+        for key, lower, upper in (
+                ("roughness", 0.0, 1.0),
+                ("metalness", 0.0, 1.0),
+                ("emissive_intensity", 0.0, 10.0)):
             try:
-                value = float(item[key])
+                value = float(material[key])
             except (KeyError, TypeError, ValueError):
-                return f"objects[{index}] 的 {key} 缺失或非数字"
-            if not 0.0 <= value <= 1.0:
-                return f"objects[{index}] 的 {key} 必须在 0~1 之间"
-        for key in ("depth_m", "rotation_y_deg"):
-            if item.get(key) is None:
-                continue
-            try:
-                value = float(item[key])
-            except (TypeError, ValueError):
-                return f"objects[{index}] 的 {key} 必须是数字"
-            if key == "depth_m" and not 0.02 <= value <= 20.0:
-                return f"objects[{index}] 的 depth_m 必须在 0.02~20 米之间"
+                return f"objects[{index}].material.{key} 缺失或非数字"
+            if not lower <= value <= upper:
+                return (f"objects[{index}].material.{key} 必须在 "
+                        f"{lower:g}~{upper:g} 之间")
+        if not str(material.get("evidence") or "").strip():
+            return f"objects[{index}].material 缺少 evidence"
+    lighting = data.get("lighting")
+    if not isinstance(lighting, dict):
+        return "场景标注缺少 lighting"
+    if not isinstance(lighting.get("verified"), bool):
+        return "lighting.verified 必须是布尔值"
+    for key, lower, upper in (
+            ("ambient_intensity", 0.0, 10.0),
+            ("key_intensity", 0.0, 10.0),
+            ("color_temperature_k", 1000.0, 20000.0)):
+        try:
+            value = float(lighting[key])
+        except (KeyError, TypeError, ValueError):
+            return f"lighting.{key} 缺失或非数字"
+        if not lower <= value <= upper:
+            return f"lighting.{key} 必须在 {lower:g}~{upper:g} 之间"
+    direction = lighting.get("direction")
+    if not isinstance(direction, dict):
+        return "lighting.direction 必须是对象"
+    direction_values = []
+    for axis in ("x", "y", "z"):
+        try:
+            value = float(direction[axis])
+        except (KeyError, TypeError, ValueError):
+            return f"lighting.direction.{axis} 缺失或非数字"
+        if not -1.0 <= value <= 1.0:
+            return f"lighting.direction.{axis} 必须在 -1~1 之间"
+        direction_values.append(value)
+    if sum(value * value for value in direction_values) < 1e-6:
+        return "lighting.direction 三轴不能全为0"
+    if not str(lighting.get("evidence") or "").strip():
+        return "lighting 缺少 evidence"
     return ""
 
 
@@ -3216,6 +3323,11 @@ def _build_prompt_body(capability, payload):
             return build_candidate_comparison_prompt(payload)
         return build_qc_prompt(payload)
     if capability == "scene_annotate":
+        if payload.get("appearance_only"):
+            return SCENE_APPEARANCE_PROMPT.format(
+                location=str(payload.get("location") or "该场景"),
+                objects=json.dumps(payload.get("object_names") or [],
+                                   ensure_ascii=False))
         return SCENE_ANNOTATE_PROMPT.format(
             location=str(payload.get("location") or "该场景"))
     raise ValueError(f"claude 编剧不支持能力: {capability}")
@@ -3439,7 +3551,9 @@ def _postprocess_and_validate(capability, payload, data):
         # shot/episode facts can never be widened by a model repair.
         reconcile_storyboard_prop_registry(data, source_script)
     if capability == "scene_annotate":
-        error = validate_scene_annotation(data)
+        error = validate_scene_annotation(
+            data, appearance_only=bool(payload.get("appearance_only")),
+            expected_object_names=payload.get("object_names"))
     elif capability == "image_qc" and payload.get("candidate_comparison"):
         error = validate_candidate_comparison(data, payload)
     elif capability == "image_qc":

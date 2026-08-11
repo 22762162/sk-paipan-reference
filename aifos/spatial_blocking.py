@@ -81,6 +81,11 @@ def _source_fingerprint(script, storyboard, continuity, scene_models=None):
     payload = {
         "blocking_schema": SCHEMA,
         "pose_contract_version": 2,
+        # v2: explicit two-person/group frames use the interaction-axis
+        # perpendicular bisector instead of targeting only the protagonist.
+        # This invalidates old blocking on the next safe resume without making
+        # users delete assets or manually rebuild the episode.
+        "camera_contract_version": 2,
         "script_version": script.get("script_version"),
         "scenes": script.get("scenes", []),
         "storyboard": blocking_shots,
@@ -1221,6 +1226,7 @@ def _pose_profile(state, action="", phase="start"):
         return {
             "pose": "standing", "pose_label": "站姿",
             "support": "双脚/地面", "height_m": DEFAULT_ACTOR_HEIGHT_M,
+            "stature_m": DEFAULT_ACTOR_HEIGHT_M,
             "target_height_m": 1.25,
         }
     if any(word in text for word in (
@@ -1230,32 +1236,38 @@ def _pose_profile(state, action="", phase="start"):
         return {
             "pose": "lying", "pose_label": "卧姿",
             "support": support, "height_m": .55, "target_height_m": .42,
+            "stature_m": DEFAULT_ACTOR_HEIGHT_M,
         }
     if any(word in text for word in ("伏案", "趴桌", "趴在", "趴向")):
         return {
             "pose": "leaning_seated", "pose_label": "伏案/前倾坐姿",
             "support": "座椅与桌面", "height_m": 1.05,
+            "stature_m": DEFAULT_ACTOR_HEIGHT_M,
             "target_height_m": .82,
         }
     if any(word in text for word in ("坐", "落座")):
         return {
             "pose": "sitting", "pose_label": "坐姿",
             "support": "座椅/已声明坐面", "height_m": 1.22,
+            "stature_m": DEFAULT_ACTOR_HEIGHT_M,
             "target_height_m": 1.0,
         }
     if any(word in text for word in ("跪", "半跪")):
         return {
             "pose": "kneeling", "pose_label": "跪姿",
             "support": "地面", "height_m": 1.12, "target_height_m": .9,
+            "stature_m": DEFAULT_ACTOR_HEIGHT_M,
         }
     if any(word in text for word in ("蹲", "蜷缩")):
         return {
             "pose": "crouching", "pose_label": "蹲姿",
             "support": "双脚/地面", "height_m": .98, "target_height_m": .78,
+            "stature_m": DEFAULT_ACTOR_HEIGHT_M,
         }
     return {
         "pose": "standing", "pose_label": "站姿",
         "support": "双脚/地面", "height_m": DEFAULT_ACTOR_HEIGHT_M,
+        "stature_m": DEFAULT_ACTOR_HEIGHT_M,
         "target_height_m": 1.25,
     }
 
@@ -1414,10 +1426,29 @@ def _apply_director_camera(camera, shot, positions, world=None):
     # 依据,也和 MOVEMENT_GEOMETRY 写死的几何对不上——提示词说「沿视线
     # 推近」,三维里可能是斜着平移。现在每个运镜词有确定的几何解。
     subject = primary_actor(positions) or {}
-    start_xz = (float((subject.get("start_3d") or {}).get("x", 0.0)),
-                float((subject.get("start_3d") or {}).get("z", 0.0)))
-    end_xz = (float((subject.get("end_3d") or {}).get("x", start_xz[0])),
-              float((subject.get("end_3d") or {}).get("z", start_xz[1])))
+    if solved.get("target_mode") == "group_midpoint":
+        rows = [row for row in positions
+                if isinstance(row, dict)
+                and isinstance(row.get("start_3d"), dict)]
+        start_xz = (
+            sum(float(row["start_3d"].get("x", 0.0)) for row in rows)
+            / len(rows),
+            sum(float(row["start_3d"].get("z", 0.0)) for row in rows)
+            / len(rows),
+        )
+        end_xz = (
+            sum(float((row.get("end_3d") or row["start_3d"]).get(
+                "x", row["start_3d"].get("x", 0.0))) for row in rows)
+            / len(rows),
+            sum(float((row.get("end_3d") or row["start_3d"]).get(
+                "z", row["start_3d"].get("z", 0.0))) for row in rows)
+            / len(rows),
+        )
+    else:
+        start_xz = (float((subject.get("start_3d") or {}).get("x", 0.0)),
+                    float((subject.get("start_3d") or {}).get("z", 0.0)))
+        end_xz = (float((subject.get("end_3d") or {}).get("x", start_xz[0])),
+                  float((subject.get("end_3d") or {}).get("z", start_xz[1])))
     solved = solve_camera_motion(
         solved, shot, subject_start=start_xz, subject_end=end_xz,
         world=world_dict)
@@ -1445,6 +1476,9 @@ def _apply_director_camera(camera, shot, positions, world=None):
         "yaw_deg": solved["yaw_deg"],
         "pitch_deg": solved["pitch_deg"],
         "declared": solved["declared"],
+        "target_mode": solved.get("target_mode", "primary_actor"),
+        "subject_actor_ids": solved.get("subject_actor_ids") or [],
+        "group_span_m": solved.get("group_span_m", 0.0),
         "wall_clamped": solved["wall_clamped"],
         "movement": solved.get("movement"),
         "movement_amount": solved.get("movement_amount"),
@@ -1942,6 +1976,13 @@ def build_spatial_plan(
                     "start_3d": start_3d, "end_3d": end_3d,
                     "route_3d": route_3d,
                     "height_m": end_pose["height_m"],
+                    # ``height_m`` is the pose's vertical envelope (a seated
+                    # adult is about 1.22m high), not the person's body size.
+                    # Keep the invariant stature separate so 3D renderers do
+                    # not turn sitting/kneeling/lying adults into miniatures.
+                    "stature_m": end_pose["stature_m"],
+                    "start_stature_m": start_pose["stature_m"],
+                    "end_stature_m": end_pose["stature_m"],
                     "start_height_m": start_pose["height_m"],
                     "end_height_m": end_pose["height_m"],
                     "target_start_height_m":
@@ -2083,6 +2124,7 @@ def build_spatial_plan(
         })
     plan = {
         "schema": SCHEMA,
+        "camera_contract_version": 2,
         "source_fingerprint": _source_fingerprint(
             script, storyboard, continuity, scene_models),
         "group_threshold": int(group_threshold or 3),

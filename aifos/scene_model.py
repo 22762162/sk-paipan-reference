@@ -506,6 +506,82 @@ def _clamp_room(x, z, room):
             inside)
 
 
+def _visual_material(value):
+    """Normalize visible-surface PBR evidence without inventing a material."""
+    if not isinstance(value, dict):
+        return None
+    color = str(value.get("base_color") or "").strip().upper()
+    name = str(value.get("name") or "").strip()
+    evidence = str(value.get("evidence") or "").strip()
+    if not name or not evidence or not re.fullmatch(r"#[0-9A-F]{6}", color):
+        return None
+    numbers = {}
+    for key, lower, upper in (
+            ("roughness", 0.0, 1.0),
+            ("metalness", 0.0, 1.0),
+            ("emissive_intensity", 0.0, 10.0)):
+        try:
+            number = float(value[key])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not math.isfinite(number) or not lower <= number <= upper:
+            return None
+        numbers[key] = round(number, 4)
+    return {
+        "verified": value.get("verified") is True,
+        "name": name,
+        "base_color": color,
+        **numbers,
+        "evidence": evidence,
+        "source": "panorama_visual_annotation",
+    }
+
+
+def _visual_lighting(value):
+    """Normalize panorama-observed lighting; incomplete evidence stays absent."""
+    if not isinstance(value, dict):
+        return None
+    numbers = {}
+    for key, lower, upper in (
+            ("ambient_intensity", 0.0, 10.0),
+            ("key_intensity", 0.0, 10.0),
+            ("color_temperature_k", 1000.0, 20000.0)):
+        try:
+            number = float(value[key])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not math.isfinite(number) or not lower <= number <= upper:
+            return None
+        numbers[key] = round(number, 4)
+    direction = value.get("direction")
+    if not isinstance(direction, dict):
+        return None
+    vector = {}
+    for axis in ("x", "y", "z"):
+        try:
+            number = float(direction[axis])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not math.isfinite(number) or not -1.0 <= number <= 1.0:
+            return None
+        vector[axis] = round(number, 4)
+    length = math.sqrt(sum(number * number for number in vector.values()))
+    if length < 1e-6:
+        return None
+    vector = {axis: round(number / length, 4)
+              for axis, number in vector.items()}
+    evidence = str(value.get("evidence") or "").strip()
+    if not evidence:
+        return None
+    return {
+        "verified": value.get("verified") is True,
+        **numbers,
+        "direction": vector,
+        "evidence": evidence,
+        "source": "panorama_visual_annotation",
+    }
+
+
 def build_object(annotation, *, capture_height=DEFAULT_CAPTURE_HEIGHT_M,
                  room=None):
     """一条视觉标注 → 一个带位置尺寸的三维物体。解不出来就返回 None。
@@ -542,6 +618,7 @@ def build_object(annotation, *, capture_height=DEFAULT_CAPTURE_HEIGHT_M,
     distance = math.hypot(x, z)
 
     category = str(annotation.get("category") or "furniture")
+    material = _visual_material(annotation.get("material"))
     semantic_type = str(annotation.get("semantic_type") or "").strip() \
         or semantic_type_for(name, category)
     support_id = _safe_explicit_object_id(annotation.get("support_id"))
@@ -644,7 +721,7 @@ def build_object(annotation, *, capture_height=DEFAULT_CAPTURE_HEIGHT_M,
     footprint = _object_footprint(
         x, z, final_width, final_depth, rotation_y)
 
-    return {
+    result = {
         "object_id": explicit_object_id or _derived_object_id(annotation),
         "name": name,
         "category": category,
@@ -682,6 +759,12 @@ def build_object(annotation, *, capture_height=DEFAULT_CAPTURE_HEIGHT_M,
                    "rotation_y_deg": annotated_rotation,
                    "measured_position_3d": measured_position},
     }
+    if material is not None:
+        result["material"] = material
+        result["material_name"] = material["name"]
+        result["material_source"] = material["source"]
+        result["source"]["material"] = copy.deepcopy(material)
+    return result
 
 
 def _unique_object_id(annotation, built, *, location, used_ids):
@@ -1028,7 +1111,7 @@ def validate_scene_model(scene_model):
 
 def build_scene_model(annotations, *, location="",
                       capture_height=DEFAULT_CAPTURE_HEIGHT_M, room=None,
-                      panorama_uri=""):
+                      panorama_uri="", lighting=None):
     """一组标注 → 场景物体表 + 自检问题清单。"""
     source_room = dict(room or {})
     effective_room, room_adjustments = _normalise_semantic_room(
@@ -1115,7 +1198,7 @@ def build_scene_model(annotations, *, location="",
         objects.append(built)
     _resolve_support_ids(objects, issues)
     issues.extend(overlap_issues(objects))
-    return {
+    result = {
         "schema": SCHEMA,
         "scale_policy": SCALE_POLICY,
         "location": location,
@@ -1127,6 +1210,54 @@ def build_scene_model(annotations, *, location="",
         "objects": objects,
         "issues": issues,
     }
+    observed_lighting = _visual_lighting(lighting)
+    if observed_lighting is not None:
+        result["lighting"] = observed_lighting
+    return result
+
+
+def apply_scene_appearance(scene_model, annotation):
+    """Apply material/light evidence without touching reconstructed geometry.
+
+    The appearance-only vision prompt is required to return the existing object
+    list in the same order.  Enforcing that contract here prevents a material
+    refresh from silently replacing positions, dimensions or manual edits.
+    """
+    if not isinstance(scene_model, dict) or not isinstance(annotation, dict):
+        raise ValueError("scene_model 与 appearance annotation 必须是对象")
+    model = copy.deepcopy(scene_model)
+    objects = model.get("objects")
+    incoming = annotation.get("objects")
+    if not isinstance(objects, list) or not isinstance(incoming, list):
+        raise ValueError("材质识别缺少物体表")
+    names = [str(obj.get("name") or "").strip()
+             if isinstance(obj, dict) else "" for obj in objects]
+    incoming_names = [str(obj.get("name") or "").strip()
+                      if isinstance(obj, dict) else "" for obj in incoming]
+    if names != incoming_names:
+        raise ValueError("材质识别结果改变了物体名称、顺序或数量")
+    verified_count = 0
+    for obj, appearance in zip(objects, incoming):
+        material = _visual_material(appearance.get("material"))
+        if material is None:
+            raise ValueError(f"「{obj.get('name')}」的材质结果无效")
+        obj["material"] = material
+        obj["material_name"] = material["name"]
+        obj["material_source"] = material["source"]
+        obj.setdefault("source", {})["material"] = copy.deepcopy(material)
+        if material["verified"]:
+            verified_count += 1
+    lighting = _visual_lighting(annotation.get("lighting"))
+    if lighting is None:
+        raise ValueError("灯光识别结果无效")
+    model["lighting"] = lighting
+    model["appearance_analysis"] = {
+        "source": "panorama_visual_annotation",
+        "objects": len(objects),
+        "verified_materials": verified_count,
+        "lighting_verified": lighting["verified"],
+    }
+    return model
 
 
 def overlap_issues(objects, min_gap_m=0.25):
