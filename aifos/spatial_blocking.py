@@ -81,11 +81,12 @@ def _source_fingerprint(script, storyboard, continuity, scene_models=None):
     payload = {
         "blocking_schema": SCHEMA,
         "pose_contract_version": 2,
-        # v2: explicit two-person/group frames use the interaction-axis
-        # perpendicular bisector instead of targeting only the protagonist.
+        # v3: explicit two-person/group frames use the interaction-axis
+        # midpoint and reject measured furniture/door occlusion before
+        # choosing the most depth-balanced visible angle.
         # This invalidates old blocking on the next safe resume without making
         # users delete assets or manually rebuild the episode.
-        "camera_contract_version": 2,
+        "camera_contract_version": 3,
         "script_version": script.get("script_version"),
         "scenes": script.get("scenes", []),
         "storyboard": blocking_shots,
@@ -173,7 +174,10 @@ def _world_from_scene_model(scene_model):
         scene_model.get("room")
         if isinstance(scene_model, dict) else {}) or {}
     width, depth = _world_dimensions(room)
-    return {
+    objects = (
+        scene_model.get("objects")
+        if isinstance(scene_model, dict) else []) or []
+    world = {
         "coordinate_system": "right-handed-y-up",
         "unit": "meter",
         "floor_width_m": width,
@@ -182,6 +186,23 @@ def _world_from_scene_model(scene_model):
         "default_actor_height_m": DEFAULT_ACTOR_HEIGHT_M,
         "default_camera_height_m": DEFAULT_CAMERA_HEIGHT_M,
     }
+    # Keep the legacy no-scene-model world byte-for-byte stable. Real scene
+    # boxes are added only when available.
+    obstacles = [
+        {
+            key: item.get(key)
+            for key in (
+                "name", "category", "position_3d", "width_m",
+                "depth_m", "height_m", "rotation_y_deg")
+        }
+        for item in objects if isinstance(item, dict)
+    ]
+    if obstacles:
+        # The camera solver needs the same measured opaque boxes used by the
+        # downstream collision gate; otherwise an equal-depth two-shot can be
+        # mathematically valid while a pillar or shelf hides one performer.
+        world["camera_obstacles"] = obstacles
+    return world
 
 
 def _scene_room_fingerprint(scene_models):
@@ -1479,6 +1500,8 @@ def _apply_director_camera(camera, shot, positions, world=None):
         "target_mode": solved.get("target_mode", "primary_actor"),
         "subject_actor_ids": solved.get("subject_actor_ids") or [],
         "group_span_m": solved.get("group_span_m", 0.0),
+        "visibility_adjusted": bool(solved.get("visibility_adjusted")),
+        "visibility_blockers": solved.get("visibility_blockers") or [],
         "wall_clamped": solved["wall_clamped"],
         "movement": solved.get("movement"),
         "movement_amount": solved.get("movement_amount"),
@@ -2124,7 +2147,7 @@ def build_spatial_plan(
         })
     plan = {
         "schema": SCHEMA,
-        "camera_contract_version": 2,
+        "camera_contract_version": 3,
         "source_fingerprint": _source_fingerprint(
             script, storyboard, continuity, scene_models),
         "group_threshold": int(group_threshold or 3),
