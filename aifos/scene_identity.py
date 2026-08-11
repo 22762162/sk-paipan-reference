@@ -21,6 +21,11 @@ ZONE_PREFIXES = (
     "床", "床侧", "床边", "床前", "床尾", "床头",
     "门", "门内", "门外", "门口", "入口", "出口",
     "窗", "窗边", "窗前", "桌", "桌边", "桌前",
+    # Period sets use several names for the same performance surface.  A
+    # narrower label such as ``都察院东值房书案前`` is a zone inside the
+    # already declared ``都察院东值房`` set, not a licence to regenerate a
+    # second room and a second panorama.
+    "书案", "书案前", "书案边", "案前", "案边", "案侧",
     "沙发", "座位", "角落", "内侧", "外侧", "里侧",
     "盥洗", "浴室", "卫生间", "洗手间", "衣帽间",
     "走廊", "通道", "楼梯", "电梯", "玄关", "阳台",

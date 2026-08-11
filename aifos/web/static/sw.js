@@ -1,6 +1,6 @@
 "use strict";
 
-const CACHE_NAME = "aifos-mobile-shell-v7";
+const CACHE_NAME = "aifos-mobile-shell-v8";
 const APP_SHELL = [
   "/",
   "/static/style.css",

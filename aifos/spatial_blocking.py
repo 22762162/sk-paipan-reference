@@ -495,6 +495,7 @@ def rebuild_actor_routes(actors, scene_model, world=None):
             })
         start = actor.get("start_3d")
         end = actor.get("end_3d") or start
+        previous_route = _canonical(actor.get("route_3d") or [])
         actor["start"] = canvas_from_world(start, world)
         actor["end"] = canvas_from_world(end, world)
         route_3d = _collision_free_actor_route(
@@ -504,6 +505,13 @@ def rebuild_actor_routes(actors, scene_model, world=None):
             dict(canvas_from_world(point, world), phase=point.get("phase"))
             for point in route_3d
         ]
+        if _canonical(route_3d) != previous_route:
+            adjustments.append({
+                "type": "actor_route_replanned",
+                "actor": str(actor.get("name") or actor.get("actor_id")),
+                "waypoints": max(0, len(route_3d) - 2),
+                "route_3d": route_3d,
+            })
         moving = len(route_3d) > 1
         actor["moving"] = moving
         if not moving:
@@ -515,6 +523,88 @@ def rebuild_actor_routes(actors, scene_model, world=None):
         actor["route_label"] = (
             f"起点→{len(route_3d) - 2}个避障点→终点，{direction}"
             if len(route_3d) > 2 else f"起点→终点，{direction}")
+    return adjustments
+
+
+def rebuild_camera_route(camera, scene_model, world=None):
+    """Deterministically re-plan one solved camera around real set boxes.
+
+    The previz viewer is not an authority and may interpolate any polyline it
+    receives.  Persisting the repaired route here makes the same safe geometry
+    feed validation, the viewer, clean panorama slicing and Seedance.
+    """
+    if not isinstance(camera, dict):
+        return []
+    start = camera.get("start_3d")
+    end = camera.get("end_3d") or start
+    if not (_point_3d_valid(start) and _point_3d_valid(end)):
+        return []
+    previous_route = _canonical(camera.get("route_3d") or [])
+    route_3d = _collision_free_actor_route(
+        start, end, scene_model, world)
+    camera["start"] = canvas_from_world(start, world)
+    camera["end"] = canvas_from_world(end, world)
+    camera["route_3d"] = route_3d
+    camera["route"] = [
+        dict(canvas_from_world(point, world), phase=point.get("phase"))
+        for point in route_3d
+    ]
+    camera["moving"] = len(route_3d) > 1 and any(
+        math.hypot(
+            float(right.get("x", 0)) - float(left.get("x", 0)),
+            float(right.get("z", 0)) - float(left.get("z", 0))) > .05
+        for left, right in zip(route_3d, route_3d[1:]))
+    if _canonical(route_3d) == previous_route:
+        return []
+    return [{
+        "type": "camera_route_replanned",
+        "waypoints": max(0, len(route_3d) - 2),
+        "route_3d": route_3d,
+    }]
+
+
+def repair_previz_routes(plan, scene_models):
+    """Repair actor/camera motion in-place and synchronize ``shot_index``.
+
+    This is the deterministic first response to a failed temporal previz
+    check.  It performs no LLM call and returns an auditable adjustment list;
+    callers must persist the plan and run previz validation again.
+    """
+    if not isinstance(plan, dict):
+        return []
+    models = scene_models if isinstance(scene_models, dict) else {}
+    index = plan.get("shot_index") or {}
+    adjustments = []
+    for scene in plan.get("scenes") or []:
+        if not isinstance(scene, dict):
+            continue
+        location = str(scene.get("location") or "").strip()
+        model = models.get(location)
+        if not isinstance(model, dict):
+            continue
+        world = scene.get("world")
+        for shot in scene.get("shots") or []:
+            if not isinstance(shot, dict):
+                continue
+            shot_no = int(shot.get("shot_no") or 0)
+            local = []
+            local.extend(rebuild_actor_routes(
+                shot.get("actors") or [], model, world))
+            local.extend(rebuild_camera_route(
+                shot.get("camera") or {}, model, world))
+            for item in local:
+                item.update({
+                    "scene_no": scene.get("scene_no"),
+                    "shot_no": shot_no,
+                    "location": location,
+                })
+            adjustments.extend(local)
+            indexed = index.get(str(shot_no))
+            if isinstance(indexed, dict) and indexed is not shot:
+                indexed["actors"] = json.loads(json.dumps(
+                    shot.get("actors") or [], ensure_ascii=False))
+                indexed["camera"] = json.loads(json.dumps(
+                    shot.get("camera") or {}, ensure_ascii=False))
     return adjustments
 
 
@@ -2777,6 +2867,140 @@ def _render_svg_png(svg_path, png_path):
     except OSError:
         valid = False
     return "" if valid else "空间图转 PNG 后文件无效"
+
+
+def _clean_scene_geometry_svg(scene_model, block, width=810, height=1440):
+    """Render authoritative set geometry without any previz annotations.
+
+    The projection is top-down but oriented to the shot camera: screen-up is
+    the camera's forward direction.  Thus furniture edits change actual
+    pixels, while a camera change rotates the same measured set coherently.
+    No people, labels, grids, arrows, coordinates or readable text are added.
+    """
+    room = (scene_model or {}).get("room") or {}
+    try:
+        room_width = max(.5, float(
+            room.get("width_m") or room.get("width") or WORLD_WIDTH_M))
+        room_depth = max(.5, float(
+            room.get("depth_m") or room.get("depth") or WORLD_DEPTH_M))
+    except (TypeError, ValueError):
+        room_width, room_depth = WORLD_WIDTH_M, WORLD_DEPTH_M
+    camera = (block or {}).get("camera") or {}
+    start = camera.get("start_3d") or {}
+    target = camera.get("target_3d") or camera.get("end_3d") or {}
+    try:
+        vx = float(target.get("x")) - float(start.get("x"))
+        vz = float(target.get("z")) - float(start.get("z"))
+    except (TypeError, ValueError):
+        vx, vz = 0.0, -1.0
+    magnitude = math.hypot(vx, vz)
+    if magnitude <= 1e-6:
+        vx, vz, magnitude = 0.0, -1.0, 1.0
+    forward = (vx / magnitude, vz / magnitude)
+    right = (forward[1], -forward[0])
+
+    def project(x, z):
+        return (x * right[0] + z * right[1],
+                x * forward[0] + z * forward[1])
+
+    room_corners = [
+        project(x, z)
+        for x, z in (
+            (-room_width / 2, -room_depth / 2),
+            (room_width / 2, -room_depth / 2),
+            (room_width / 2, room_depth / 2),
+            (-room_width / 2, room_depth / 2),
+        )
+    ]
+    min_x = min(point[0] for point in room_corners)
+    max_x = max(point[0] for point in room_corners)
+    min_y = min(point[1] for point in room_corners)
+    max_y = max(point[1] for point in room_corners)
+    margin = 54.0
+    scale = min(
+        (width - margin * 2) / max(.1, max_x - min_x),
+        (height - margin * 2) / max(.1, max_y - min_y))
+    centre_x = width / 2 - (min_x + max_x) * scale / 2
+    centre_y = height / 2 + (min_y + max_y) * scale / 2
+
+    def pixel(point):
+        px, py = project(float(point[0]), float(point[1]))
+        return (centre_x + px * scale, centre_y - py * scale)
+
+    def polygon_points(cx, cz, obj_width, obj_depth, yaw_deg=0.0):
+        yaw = math.radians(float(yaw_deg or 0.0))
+        cos_y, sin_y = math.cos(yaw), math.sin(yaw)
+        points = []
+        for local_x, local_z in (
+                (-obj_width / 2, -obj_depth / 2),
+                (obj_width / 2, -obj_depth / 2),
+                (obj_width / 2, obj_depth / 2),
+                (-obj_width / 2, obj_depth / 2)):
+            world_x = cx + local_x * cos_y + local_z * sin_y
+            world_z = cz - local_x * sin_y + local_z * cos_y
+            points.append(pixel((world_x, world_z)))
+        return " ".join(f"{x:.1f},{y:.1f}" for x, y in points)
+
+    floor_points = " ".join(
+        f"{x:.1f},{y:.1f}" for x, y in
+        (pixel((x, z)) for x, z in (
+            (-room_width / 2, -room_depth / 2),
+            (room_width / 2, -room_depth / 2),
+            (room_width / 2, room_depth / 2),
+            (-room_width / 2, room_depth / 2))))
+    shapes = [
+        f'<rect width="{width}" height="{height}" fill="#111318"/>',
+        f'<polygon points="{floor_points}" fill="#d9d0c2" '
+        'stroke="#f2eee7" stroke-width="10" stroke-linejoin="round"/>',
+    ]
+    palette = {
+        "opening": ("#8dc4d9", "#dff4ff"),
+        "structure": ("#776f66", "#b7ada1"),
+        "structural": ("#776f66", "#b7ada1"),
+        "prop": ("#af8d62", "#e5c79f"),
+        "decor": ("#899273", "#bec7a4"),
+        "light": ("#d0b56f", "#f5df9c"),
+        "furniture": ("#8a654b", "#c99b77"),
+    }
+    objects = []
+    for obj in (scene_model or {}).get("objects") or []:
+        if not isinstance(obj, dict) or not isinstance(
+                obj.get("position_3d"), dict):
+            continue
+        pos = obj["position_3d"]
+        try:
+            cx, cz = float(pos.get("x")), float(pos.get("z"))
+            obj_width = max(.04, float(obj.get("width_m") or .2))
+            obj_depth = max(.04, float(
+                obj.get("depth_m") or obj.get("width_m") or .2))
+            obj_height = max(0.0, float(obj.get("height_m") or 0.0))
+            yaw = float(obj.get("rotation_y_deg") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        objects.append((obj_height, str(obj.get("category") or "furniture")
+                        .strip().lower(), cx, cz, obj_width, obj_depth, yaw))
+    for _height_m, category, cx, cz, obj_width, obj_depth, yaw in sorted(
+            objects, key=lambda item: (item[0], item[2], item[3])):
+        fill, stroke = palette.get(category, palette["furniture"])
+        points = polygon_points(cx, cz, obj_width, obj_depth, yaw)
+        shapes.append(
+            f'<polygon points="{points}" fill="{fill}" fill-opacity="0.9" '
+            f'stroke="{stroke}" stroke-width="3" stroke-linejoin="round"/>')
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
+        f'height="{height}" viewBox="0 0 {width} {height}">'
+        + "".join(shapes) + "</svg>")
+
+
+def write_clean_scene_geometry_png(scene_model, block, png_path):
+    """Write a clean camera-oriented geometry reference and return its URI."""
+    png_path = Path(png_path)
+    png_path.parent.mkdir(parents=True, exist_ok=True)
+    svg_path = png_path.with_suffix(".svg")
+    svg_path.write_text(
+        _clean_scene_geometry_svg(scene_model, block), encoding="utf-8")
+    error = _render_svg_png(svg_path, png_path)
+    return "" if error else str(png_path.resolve())
 
 
 def write_spatial_reference_pngs(plan, out_dir):

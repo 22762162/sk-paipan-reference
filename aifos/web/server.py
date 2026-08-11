@@ -10,6 +10,7 @@ API:
   GET  /api/project/<id>/rules  项目跨集创作规则包
   GET  /api/episode/<id>/rules  本集临时创作规则包
   GET  /api/episode/<id>/rule-stack?shot_no=N 当前镜头生效规则栈
+  GET  /api/scene3d?episode=N  物理场景、分区、物体与 revision
   GET  /api/assets?project=T    项目资产列表
   GET  /api/logs?limit=N        最近日志
   GET  /api/jobs  /api/jobs/<id>后台制作任务
@@ -18,6 +19,7 @@ API:
   GET  /api/standards           当前制作标准 + 版本历史
   GET  /api/standards/export    导出不含密钥的制作标准包
   POST /api/produce             {"sentence": "开始制作《万妖图录》第15集"}
+  PATCH /api/scene3d            按 object_id 追加一版三维场景编辑
   POST /api/standards/save|activate|reset|import
 静态:
   GET  /                        控制台单页应用
@@ -30,6 +32,7 @@ import copy
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import re
 import shutil
@@ -65,6 +68,10 @@ from ..selection_mode import (
     build_selection_policy,
 )
 from ..prompt_review import build_episode_prompt_review
+from ..scene_identity import canonical_scene_location, scene_family_groups
+from ..scene_model import (MOUNT_TYPES, normalize_scene_model_contract,
+                           refresh_scene_model_geometry,
+                           validate_scene_model)
 from ..scene_render import build_scene_render_contract
 from ..smart_input import resolve_produce_target
 from ..standard_center import StandardConflictError, StandardValidationError
@@ -3455,6 +3462,353 @@ def _episode_status_payload(app, episode_id, jobs):
     return payload
 
 
+def _scene3d_bindings(blocking, script):
+    """Bind visible staging zones to one canonical physical scene."""
+    blocking_copy = copy.deepcopy(blocking) if isinstance(blocking, dict) \
+        else {}
+    scenes = blocking_copy.get("scenes")
+    if not isinstance(scenes, list):
+        scenes = []
+        blocking_copy["scenes"] = scenes
+    family_groups = scene_family_groups(script or {})
+    script_scenes = (script or {}).get("scenes") \
+        if isinstance(script, dict) else []
+    script_scenes = script_scenes if isinstance(script_scenes, list) else []
+    script_by_no = {}
+    for scene in script_scenes:
+        if not isinstance(scene, dict):
+            continue
+        try:
+            scene_no = int(scene.get("scene_no"))
+        except (TypeError, ValueError):
+            continue
+        script_by_no.setdefault(scene_no, []).append(scene)
+
+    bindings = []
+    zones_by_physical = {}
+    for index, scene in enumerate(scenes):
+        if not isinstance(scene, dict):
+            continue
+        visible = str(scene.get("location") or scene.get("name") or "").strip()
+        explicit = str(
+            scene.get("physical_scene_id") or scene.get("base_location")
+            or "").strip()
+        physical = explicit or canonical_scene_location(script or {}, visible)
+        if not physical:
+            physical = visible or f"第{index + 1}场"
+        zones = []
+        for value in family_groups.get(physical, []):
+            value = str(value or "").strip()
+            if value and value not in zones:
+                zones.append(value)
+        scene_zones = scene.get("zones")
+        if isinstance(scene_zones, list):
+            for value in scene_zones:
+                value = str(value or "").strip()
+                if value and value not in zones:
+                    zones.append(value)
+        if visible and visible != physical and visible not in zones:
+            zones.append(visible)
+        try:
+            matching_script = script_by_no.get(int(scene.get("scene_no")), [])
+        except (TypeError, ValueError):
+            matching_script = []
+        for scripted in matching_script:
+            scripted_location = str(scripted.get("location") or "").strip()
+            scripted_physical = str(
+                scripted.get("physical_scene_id")
+                or scripted.get("base_location") or "").strip() \
+                or canonical_scene_location(script or {}, scripted_location)
+            if (scripted_physical == physical and scripted_location
+                    and scripted_location not in zones):
+                zones.append(scripted_location)
+        scene["physical_scene_id"] = physical
+        scene["base_location"] = physical
+        scene["zones"] = zones
+        zones_by_physical.setdefault(physical, [])
+        for zone in zones:
+            if zone not in zones_by_physical[physical]:
+                zones_by_physical[physical].append(zone)
+        bindings.append({
+            "location": visible or physical,
+            "physical_scene_id": physical,
+            "zones": zones,
+            "scene_no": scene.get("scene_no"),
+        })
+    return blocking_copy, bindings, zones_by_physical
+
+
+def _latest_named_asset(app, project_id, kind, names):
+    for name in names:
+        name = str(name or "").strip()
+        if not name:
+            continue
+        row = app.assets.latest(project_id, kind, name)
+        if row is not None and row["uri"]:
+            return row, name
+    return None, ""
+
+
+def _scene_model_source(app, project_id, physical_scene_id, zones):
+    canonical = app.assets.latest(
+        project_id, "scene_model", physical_scene_id)
+    if canonical is not None and canonical["uri"]:
+        return canonical, physical_scene_id, canonical
+    aliases = [physical_scene_id, *(zones or [])]
+    source, source_name = _latest_named_asset(
+        app, project_id, "scene_model", aliases)
+    return source, source_name, canonical
+
+
+def _finite_scene3d_number(value, field):
+    if isinstance(value, bool):
+        raise AifosError(f"{field} 必须是有限数")
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise AifosError(f"{field} 必须是有限数") from exc
+    if not math.isfinite(result):
+        raise AifosError(f"{field} 必须是有限数")
+    return result
+
+
+def _apply_scene3d_updates(model, updates):
+    if not isinstance(updates, list) or not updates:
+        raise AifosError("updates 必须是非空数组")
+    objects = model.get("objects") if isinstance(model, dict) else None
+    if not isinstance(objects, list):
+        raise AifosError("场景模型缺少可编辑物体表")
+    by_id = {
+        str(obj.get("object_id")): obj for obj in objects
+        if isinstance(obj, dict) and str(obj.get("object_id") or "").strip()
+    }
+    allowed = {
+        "object_id", "position_3d", "position", "dimensions",
+        "width_m", "height_m", "depth_m", "rotation_y_deg",
+        "support_id", "mount_type",
+    }
+    changed = []
+    seen = set()
+    for index, raw in enumerate(updates, 1):
+        if not isinstance(raw, dict):
+            raise AifosError(f"第 {index} 项更新不是 JSON 对象")
+        unknown = sorted(set(raw) - allowed)
+        if unknown:
+            raise AifosError("不允许修改字段: " + "、".join(unknown))
+        object_id = str(raw.get("object_id") or "").strip()
+        if not object_id or object_id not in by_id:
+            raise AifosError(f"第 {index} 项缺少有效 object_id")
+        if object_id in seen:
+            raise AifosError(f"object_id={object_id} 在同一请求中重复")
+        seen.add(object_id)
+        obj = by_id[object_id]
+        fields = []
+        position_patch = raw.get("position_3d", raw.get("position"))
+        if position_patch is not None:
+            if not isinstance(position_patch, dict) or not position_patch:
+                raise AifosError("position_3d 必须是非空对象")
+            unknown_axes = sorted(set(position_patch) - {"x", "y", "z"})
+            if unknown_axes:
+                raise AifosError("position_3d 含未知坐标: "
+                                 + "、".join(unknown_axes))
+            position = dict(obj.get("position_3d") or {})
+            for axis, value in position_patch.items():
+                position[axis] = _finite_scene3d_number(
+                    value, f"position_3d.{axis}")
+            obj["position_3d"] = position
+            fields.append("position_3d")
+            obj.setdefault("geometry_sources", {})["position"] = \
+                "manual_scene3d_edit"
+        dimensions = raw.get("dimensions")
+        if dimensions is not None:
+            if not isinstance(dimensions, dict):
+                raise AifosError("dimensions 必须是对象")
+            unknown_dimensions = sorted(
+                set(dimensions) - {"width_m", "height_m", "depth_m"})
+            if unknown_dimensions:
+                raise AifosError("dimensions 含未知字段: "
+                                 + "、".join(unknown_dimensions))
+        else:
+            dimensions = {}
+        for field in ("width_m", "height_m", "depth_m"):
+            value = raw[field] if field in raw else dimensions.get(field)
+            if value is None:
+                continue
+            number = _finite_scene3d_number(value, field)
+            if number <= 0:
+                raise AifosError(f"{field} 必须大于 0")
+            obj[field] = number
+            fields.append(field)
+            obj.setdefault("geometry_sources", {})[
+                field.removesuffix("_m")] = "manual_scene3d_edit"
+        if "rotation_y_deg" in raw:
+            obj["rotation_y_deg"] = _finite_scene3d_number(
+                raw["rotation_y_deg"], "rotation_y_deg")
+            fields.append("rotation_y_deg")
+            obj.setdefault("geometry_sources", {})["rotation"] = \
+                "manual_scene3d_edit"
+        if "mount_type" in raw:
+            mount_type = str(raw.get("mount_type") or "").strip()
+            if mount_type not in MOUNT_TYPES:
+                raise AifosError(
+                    "mount_type 必须是 " + "/".join(sorted(MOUNT_TYPES)))
+            obj["mount_type"] = mount_type
+            fields.append("mount_type")
+        if "support_id" in raw:
+            support_value = raw.get("support_id")
+            support_id = (str(support_value).strip()
+                          if support_value is not None else "")
+            if support_id and support_id not in by_id:
+                raise AifosError(f"support_id={support_id} 不存在")
+            if support_id == object_id:
+                raise AifosError("物体不能承托自身")
+            obj["support_id"] = support_id or None
+            fields.append("support_id")
+        if not fields:
+            raise AifosError(f"object_id={object_id} 没有可保存的更改")
+        changed.append({"object_id": object_id, "fields": fields})
+    refresh_scene_model_geometry(model)
+    return changed
+
+
+def _scene3d_save_edits(app, episode_id, request):
+    """Create one immutable scene-model revision with optimistic locking."""
+    if not isinstance(request, dict):
+        raise AifosError("请求体必须是 JSON 对象")
+    episode = app.projects.get_episode(episode_id)
+    if episode is None:
+        return None
+    blocking, _blocking_v = app.projects.latest_document(
+        episode_id, "blocking")
+    script, _script_v = app.projects.latest_document(episode_id, "script")
+    if not isinstance(blocking, dict):
+        raise AifosError("本集尚未生成空间调度")
+    _blocking_view, bindings, zones_by_physical = _scene3d_bindings(
+        blocking, script)
+    requested = str(
+        request.get("physical_scene_id") or request.get("scene_location")
+        or request.get("location") or ""
+    ).strip()
+    if not requested:
+        raise AifosError("缺少 physical_scene_id")
+    binding_map = {
+        item["location"]: item["physical_scene_id"] for item in bindings}
+    physical_scene_id = binding_map.get(
+        requested, canonical_scene_location(script or {}, requested))
+    valid_physical = {
+        item["physical_scene_id"] for item in bindings}
+    if physical_scene_id not in valid_physical:
+        raise AifosError(f"本集不包含物理场景: {requested}")
+    expected = request.get(
+        "expected_revision", request.get("revision"))
+    if (isinstance(expected, bool) or not isinstance(expected, int)
+            or expected < 0):
+        raise AifosError("expected_revision 必须是非负整数")
+    project_id = int(episode["project_id"])
+    zones = zones_by_physical.get(physical_scene_id, [])
+    aliases = list(dict.fromkeys([physical_scene_id, *zones]))
+    out_dir = (app.workspace.artifacts_dir
+               / f"p{project_id:03d}" / "scenes")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    safe = re.sub(r"[^\w.-]+", "_", physical_scene_id,
+                  flags=re.UNICODE).strip("_")[:48] or "scene"
+    with app.db.transaction(immediate=True) as conn:
+        canonical_row = conn.execute(
+            "SELECT * FROM assets WHERE project_id=? AND kind='scene_model' "
+            "AND name=? ORDER BY version DESC LIMIT 1",
+            (project_id, physical_scene_id)).fetchone()
+        actual = int(canonical_row["version"] or 0) if canonical_row else 0
+        if actual != expected:
+            raise DocumentConflictError(
+                f"scene_model:{physical_scene_id}", expected, actual)
+        source_row = canonical_row
+        source_name = physical_scene_id if source_row is not None else ""
+        if source_row is None:
+            for alias in aliases:
+                row = conn.execute(
+                    "SELECT * FROM assets WHERE project_id=? "
+                    "AND kind='scene_model' AND name=? "
+                    "ORDER BY version DESC LIMIT 1",
+                    (project_id, alias)).fetchone()
+                if row is not None and row["uri"]:
+                    source_row, source_name = row, alias
+                    break
+        if source_row is None or not source_row["uri"]:
+            raise AifosError(f"物理场景「{physical_scene_id}」没有可编辑的 scene_model")
+        try:
+            source_model = json.loads(
+                Path(source_row["uri"]).read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError) as exc:
+            raise AifosError("当前 scene_model 文件损坏或不可读") from exc
+        if not isinstance(source_model, dict):
+            raise AifosError("当前 scene_model 不是 JSON 对象")
+        model = normalize_scene_model_contract(
+            source_model, location=physical_scene_id)
+        source_issues = copy.deepcopy(model.get("issues") or [])
+        model["physical_scene_id"] = physical_scene_id
+        model["zones"] = list(zones)
+        changed = _apply_scene3d_updates(
+            model, request.get("updates", request.get("edits")))
+        revision = actual + 1
+        model["asset_version"] = revision
+        model["revision"] = revision
+        model["edited_at"] = time.time()
+        model["edit_provenance"] = {
+            "source": "scene3d_manual_edit",
+            "parent_asset_id": int(source_row["id"]),
+            "parent_asset_name": source_name,
+            "parent_asset_version": int(source_row["version"] or 0),
+            "expected_revision": expected,
+            "changes": changed,
+        }
+        validation = validate_scene_model(model)
+        validation["source_issues"] = source_issues
+        model["source_issues"] = source_issues
+        model["validation"] = validation
+        model["issues"] = validation["issues"]
+        destination = out_dir / (
+            f"scene_model_{safe}_v{revision}_edit_{uuid.uuid4().hex[:8]}.json")
+        destination.write_text(json.dumps(
+            model, ensure_ascii=False, indent=1), encoding="utf-8")
+        meta = {
+            "objects": len(model.get("objects") or []),
+            "issues": len(validation["issues"]),
+            "validation_passed": validation["passed"],
+            "physical_scene_id": physical_scene_id,
+            "zones": zones,
+            "source": "scene3d_manual_edit",
+            "parent_asset_id": int(source_row["id"]),
+            "parent_asset_version": int(source_row["version"] or 0),
+            "real": True,
+        }
+        conn.execute(
+            "INSERT INTO assets(project_id, kind, name, version, uri, meta, "
+            "created_at) VALUES(?,?,?,?,?,?,?)",
+            (project_id, "scene_model", physical_scene_id, revision,
+             str(destination), json.dumps(meta, ensure_ascii=False),
+             time.time()))
+        saved_row = conn.execute(
+            "SELECT * FROM assets WHERE project_id=? AND kind='scene_model' "
+            "AND name=? AND version=?",
+            (project_id, physical_scene_id, revision)).fetchone()
+    if app.assets.on_registered is not None:
+        try:
+            app.assets.on_registered(saved_row)
+        except Exception:
+            pass
+    return {
+        "episode_id": episode_id,
+        "physical_scene_id": physical_scene_id,
+        "zones": zones,
+        "revision": revision,
+        "asset_id": int(saved_row["id"]),
+        "model": model,
+        "render_contract": build_scene_render_contract(
+            model, location=physical_scene_id),
+        "validation": validation,
+    }
+
+
 def _scene3d_payload(app, episode_id):
     """3D 空间查看器数据:blocking 三维调度 + 该场景的 720° 全景母版。
 
@@ -3469,53 +3823,104 @@ def _scene3d_payload(app, episode_id):
     if blocking is None:
         return {"episode_id": episode_id, "blocking": None,
                 "panoramas": {}, "scene_models": {},
+                "scene_model_contracts": {},
+                "scene_model_revisions": {}, "physical_scene_ids": {},
+                "scene_zones": {},
                 "render_contracts": {},
                 "message": "本集尚未生成空间调度"}
     project_id = episode["project_id"]
+    script, _script_v = app.projects.latest_document(episode_id, "script")
+    blocking_view, bindings, scene_zones = _scene3d_bindings(
+        blocking, script)
     artifacts = app.workspace.artifacts_dir.resolve()
     panoramas = {}
     scene_models = {}
-    raw_scenes = (blocking.get("scenes")
-                  if isinstance(blocking, dict) else [])
-    scenes = raw_scenes if isinstance(raw_scenes, list) else []
+    scene_model_contracts = {}
+    scene_model_revisions = {}
+    physical_scene_ids = {}
+    model_cache = {}
+    panorama_cache = {}
     locations = []
-    for scene in scenes:
-        if not isinstance(scene, dict):
-            continue
-        location = str(scene.get("location") or "").strip()
-        if not location:
-            continue
+    for binding in bindings:
+        location = binding["location"]
+        physical = binding["physical_scene_id"]
+        zones = binding["zones"]
         if location not in locations:
             locations.append(location)
-        if location not in scene_models:
-            model_row = app.assets.latest(
-                project_id, "scene_model", location)
-            if model_row is not None and model_row["uri"]:
+        physical_scene_ids[location] = physical
+        if physical not in model_cache:
+            source_row, source_name, canonical_row = _scene_model_source(
+                app, project_id, physical, zones)
+            raw_model = None
+            model = None
+            if source_row is not None and source_row["uri"]:
                 try:
-                    model = json.loads(
-                        Path(model_row["uri"]).read_text(encoding="utf-8"))
-                    if isinstance(model, dict):
-                        scene_models[location] = model
+                    loaded = json.loads(Path(source_row["uri"]).read_text(
+                        encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        raw_model = loaded
+                        model = normalize_scene_model_contract(
+                            loaded, location=physical)
+                        model["physical_scene_id"] = physical
+                        model["zones"] = list(zones)
                 except (OSError, ValueError, TypeError):
-                    pass
-        if location not in panoramas:
-            row = app.assets.latest(
-                project_id, "scene_art", f"{location}::view:panorama")
-            if row is None or not row["uri"]:
-                continue
-            uri = Path(row["uri"]).resolve()
-            try:
-                rel = uri.relative_to(artifacts)
-            except ValueError:
-                continue
-            panoramas[location] = {
-                "url": "/artifacts/" + str(rel),
-                "version": row["version"],
+                    model = None
+            model_cache[physical] = {
+                "model": model,
+                "raw_model": raw_model,
+                "source_row": source_row,
+                "source_name": source_name,
+                "canonical_row": canonical_row,
             }
+        cached = model_cache[physical]
+        if cached["raw_model"] is not None:
+            scene_models[location] = cached["raw_model"]
+        if cached["model"] is not None:
+            scene_model_contracts[location] = cached["model"]
+        canonical_row = cached["canonical_row"]
+        source_row = cached["source_row"]
+        scene_model_revisions[location] = {
+            "revision": (int(canonical_row["version"] or 0)
+                         if canonical_row is not None else 0),
+            "asset_id": (int(canonical_row["id"])
+                         if canonical_row is not None else None),
+            "physical_scene_id": physical,
+            "zones": list(zones),
+            "source_asset_id": (int(source_row["id"])
+                                if source_row is not None else None),
+            "source_asset_name": cached["source_name"],
+            "source_revision": (int(source_row["version"] or 0)
+                                if source_row is not None else 0),
+            "canonical_fork_required": bool(
+                source_row is not None and canonical_row is None),
+        }
+        if physical not in panorama_cache:
+            panorama_names = [
+                f"{name}::view:panorama"
+                for name in dict.fromkeys([physical, *zones])]
+            row, _row_name = _latest_named_asset(
+                app, project_id, "scene_art", panorama_names)
+            panorama = None
+            if row is not None and row["uri"]:
+                uri = Path(row["uri"]).resolve()
+                try:
+                    rel = uri.relative_to(artifacts)
+                except ValueError:
+                    pass
+                else:
+                    panorama = {
+                        "url": "/artifacts/" + str(rel),
+                        "version": row["version"],
+                        "physical_scene_id": physical,
+                        "zones": list(zones),
+                    }
+            panorama_cache[physical] = panorama
+        if panorama_cache[physical] is not None:
+            panoramas[location] = panorama_cache[physical]
     render_contracts = {
         location: build_scene_render_contract(
-            scene_models.get(location), panoramas.get(location),
-            location=location)
+            scene_model_contracts.get(location), panoramas.get(location),
+            location=physical_scene_ids.get(location, location))
         for location in locations
     }
     storyboard, _sv = app.projects.latest_document(episode_id, "storyboard")
@@ -3561,14 +3966,19 @@ def _scene3d_payload(app, episode_id):
         "project_title": (app.db.query_one(
             "SELECT title FROM projects WHERE id=?", (project_id,))
             or {"title": ""})["title"],
-        "blocking": blocking,
+        "blocking": blocking_view,
         "blocking_version": blocking_v,
         "panoramas": panoramas,
         "scene_models": scene_models,
+        "scene_model_contracts": scene_model_contracts,
+        "scene_model_revisions": scene_model_revisions,
+        "physical_scene_ids": physical_scene_ids,
+        "scene_zones": scene_zones,
         "render_contracts": render_contracts,
         "shot_actions": actions,
         # 时间维度连贯性:跨镜传送/中途碰撞/交叉相撞/相机穿模(warn级)
-        "previz_checks": previz_report(blocking, storyboard, scene_models),
+        "previz_checks": previz_report(
+            blocking_view, storyboard, scene_model_contracts),
     }
 
 
@@ -4390,6 +4800,8 @@ def make_handler(workspace, jobs):
                     return self._redo_mock()
                 if parsed.path == "/api/director-statement":
                     return self._director_statement_save()
+                if parsed.path == "/api/scene3d":
+                    return self._scene3d_save()
                 if parsed.path == "/api/qc_item":
                     return self._qc_item()
                 if parsed.path == "/api/qc_override":
@@ -4446,6 +4858,17 @@ def make_handler(workspace, jobs):
                     return self._standards_reset()
                 if parsed.path == "/api/standards/import":
                     return self._standards_import()
+                return self._error(404, "未知路径")
+            except BrokenPipeError:
+                pass
+            except Exception as exc:
+                self._error(500, str(exc))
+
+        def do_PATCH(self):
+            parsed = urlparse(self.path)
+            try:
+                if parsed.path == "/api/scene3d":
+                    return self._scene3d_save()
                 return self._error(404, "未知路径")
             except BrokenPipeError:
                 pass
@@ -5430,6 +5853,38 @@ def make_handler(workspace, jobs):
                     self.rfile.read(length).decode("utf-8")) if length else {}
             except ValueError:
                 return None
+
+        def _scene3d_save(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                query = parse_qs(urlparse(self.path).query)
+                episode_id = int(
+                    body.get("episode_id")
+                    or query.get("episode", [0])[0])
+            except (TypeError, ValueError):
+                return self._error(400, "缺少合法 episode_id")
+            try:
+                result = self._with_app(
+                    lambda app: _scene3d_save_edits(app, episode_id, body))
+            except DocumentConflictError as exc:
+                return self._json({
+                    "error": "三维场景已被其他操作更新",
+                    "message": str(exc),
+                    "physical_scene_id": str(
+                        body.get("physical_scene_id")
+                        or body.get("location") or ""),
+                    "expected_revision": exc.expected_version,
+                    "actual_revision": exc.actual_version,
+                    "expected": exc.expected_version,
+                    "actual": exc.actual_version,
+                }, status=409)
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            if result is None:
+                return self._error(404, "剧集不存在")
+            return self._json(result, status=201)
 
         @staticmethod
         def _expected_rule_version(body):

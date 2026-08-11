@@ -35,6 +35,19 @@ def test_similar_prefix_does_not_merge_unrelated_places():
     assert canonical_scene_location(script, "明代皇宫东市") == "明代皇宫东市"
 
 
+def test_period_desk_zone_reuses_declared_physical_room():
+    script = {"scenes": [
+        {"scene_no": 1, "location": "都察院东值房"},
+        {"scene_no": 2, "location": "都察院东值房书案前"},
+        {"scene_no": 3, "location": "都察院东值房"},
+    ]}
+    assert canonical_scene_location(
+        script, "都察院东值房书案前") == "都察院东值房"
+    assert scene_family_groups(script) == {
+        "都察院东值房": ["都察院东值房", "都察院东值房书案前"]
+    }
+
+
 def test_explicit_physical_scene_id_beats_legacy_inference():
     script = {"scenes": [{
         "location": "酒店房间走廊",
