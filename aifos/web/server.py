@@ -20,6 +20,7 @@ API:
   GET  /api/standards/export    导出不含密钥的制作标准包
   POST /api/produce             {"sentence": "开始制作《万妖图录》第15集"}
   PATCH /api/scene3d            按 object_id 追加一版三维场景编辑
+  POST /api/scene3d/appearance  从全景补齐材质/灯光，不改几何
   POST /api/standards/save|activate|reset|import
 静态:
   GET  /                        控制台单页应用
@@ -69,7 +70,8 @@ from ..selection_mode import (
 )
 from ..prompt_review import build_episode_prompt_review
 from ..scene_identity import canonical_scene_location, scene_family_groups
-from ..scene_model import (MOUNT_TYPES, normalize_scene_model_contract,
+from ..scene_model import (MOUNT_TYPES, apply_scene_appearance,
+                           normalize_scene_model_contract,
                            refresh_scene_model_geometry,
                            validate_scene_model)
 from ..scene_render import build_scene_render_contract
@@ -3809,6 +3811,142 @@ def _scene3d_save_edits(app, episode_id, request):
     }
 
 
+_SCENE3D_APPEARANCE_LOCK = threading.Lock()
+
+
+def _scene3d_refresh_appearance(app, episode_id, request):
+    """Annotate visible materials/light and append an appearance-only revision."""
+    if not isinstance(request, dict):
+        raise AifosError("请求体必须是 JSON 对象")
+    if not _SCENE3D_APPEARANCE_LOCK.acquire(blocking=False):
+        raise AifosError("另一场景正在识别材质与灯光，请稍候")
+    try:
+        episode = app.projects.get_episode(episode_id)
+        if episode is None:
+            return None
+        blocking, _blocking_v = app.projects.latest_document(
+            episode_id, "blocking")
+        script, _script_v = app.projects.latest_document(episode_id, "script")
+        if not isinstance(blocking, dict):
+            raise AifosError("本集尚未生成空间调度")
+        _view, bindings, zones_by_physical = _scene3d_bindings(
+            blocking, script)
+        requested = str(
+            request.get("physical_scene_id") or request.get("scene_location")
+            or request.get("location") or "").strip()
+        if not requested:
+            raise AifosError("缺少 physical_scene_id")
+        binding_map = {
+            item["location"]: item["physical_scene_id"] for item in bindings}
+        physical = binding_map.get(
+            requested, canonical_scene_location(script or {}, requested))
+        valid_physical = {item["physical_scene_id"] for item in bindings}
+        if physical not in valid_physical:
+            raise AifosError(f"本集不包含物理场景: {requested}")
+        zones = zones_by_physical.get(physical, [])
+        project_id = int(episode["project_id"])
+        source_row, _source_name, _canonical = _scene_model_source(
+            app, project_id, physical, zones)
+        if source_row is None or not source_row["uri"]:
+            raise AifosError(f"物理场景「{physical}」没有可补材质的 scene_model")
+        try:
+            model = json.loads(Path(source_row["uri"]).read_text(
+                encoding="utf-8"))
+        except (OSError, ValueError, TypeError) as exc:
+            raise AifosError("当前 scene_model 文件损坏或不可读") from exc
+        objects = model.get("objects") if isinstance(model, dict) else None
+        if not isinstance(objects, list) or not objects:
+            raise AifosError("当前 scene_model 没有可识别材质的物体")
+        object_names = [str(obj.get("name") or "").strip()
+                        if isinstance(obj, dict) else "" for obj in objects]
+        if not all(object_names):
+            raise AifosError("当前 scene_model 存在无名称物体，无法安全匹配材质")
+        panorama_location = ""
+        panorama_row = None
+        for candidate in dict.fromkeys([physical, *zones, requested]):
+            row = app.director._scene_view_row(
+                project_id, candidate, app.director.SCENE_PANORAMA_KEY)
+            if row is not None:
+                panorama_location, panorama_row = candidate, row
+                break
+        if panorama_row is None:
+            raise AifosError(f"场景「{physical}」没有可读取的 720° 全景母版")
+        out_dir = (app.workspace.artifacts_dir
+                   / f"p{project_id:03d}" / "scenes")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        result = app.director.router.call("scene_annotate", {
+            "location": physical,
+            "panorama_location": panorama_location,
+            "appearance_only": True,
+            "object_names": object_names,
+            "image_uri": str(panorama_row["uri"]),
+            "require_reference_images": True,
+            "reference_manifest": [{
+                "index": 1,
+                "uri": str(panorama_row["uri"]),
+                "label": f"{panorama_location} 720°全景母版",
+                "role": "scene",
+                "binding": "只识别既有物体的可见材质与整场灯光，不改几何",
+            }],
+        }, out_dir)
+        if getattr(result, "provider", "") == "mock":
+            raise AifosError("当前没有可读取全景图的真实视觉通道")
+        try:
+            refreshed = apply_scene_appearance(
+                model, getattr(result, "data", None) or {})
+        except ValueError as exc:
+            raise AifosError(str(exc)) from exc
+        previous = app.assets.latest(
+            project_id, "scene_model", physical, include_deleted=True)
+        revision = int(previous["version"] + 1) if previous else 1
+        refreshed["location"] = physical
+        refreshed["physical_scene_id"] = physical
+        refreshed["zones"] = list(zones)
+        refreshed["asset_version"] = revision
+        refreshed["revision"] = revision
+        refreshed["appearance_analyzed_at"] = time.time()
+        refreshed["appearance_analysis"].update({
+            "provider": getattr(result, "provider", ""),
+            "panorama_asset_id": int(panorama_row["id"]),
+            "panorama_location": panorama_location,
+            "parent_asset_id": int(source_row["id"]),
+            "parent_asset_version": int(source_row["version"] or 0),
+        })
+        safe = re.sub(r"[^\w.-]+", "_", physical,
+                      flags=re.UNICODE).strip("_")[:48] or "scene"
+        destination = out_dir / (
+            f"scene_model_{safe}_v{revision}_appearance_"
+            f"{uuid.uuid4().hex[:8]}.json")
+        destination.write_text(json.dumps(
+            refreshed, ensure_ascii=False, indent=1), encoding="utf-8")
+        row = app.assets.register(
+            project_id, "scene_model", physical, str(destination), meta={
+                "objects": len(objects),
+                "issues": len(refreshed.get("issues") or []),
+                "physical_scene_id": physical,
+                "zones": zones,
+                "source": "panorama_appearance_annotation",
+                "provider": getattr(result, "provider", ""),
+                "parent_asset_id": int(source_row["id"]),
+                "parent_asset_version": int(source_row["version"] or 0),
+                "verified_materials": refreshed["appearance_analysis"][
+                    "verified_materials"],
+                "lighting_verified": refreshed["appearance_analysis"][
+                    "lighting_verified"],
+                "real": True,
+            }, new_version=previous is not None)
+        payload = _scene3d_payload(app, episode_id)
+        payload["appearance_refresh"] = {
+            "physical_scene_id": physical,
+            "revision": int(row["version"]),
+            "asset_id": int(row["id"]),
+            **refreshed["appearance_analysis"],
+        }
+        return payload
+    finally:
+        _SCENE3D_APPEARANCE_LOCK.release()
+
+
 def _scene3d_payload(app, episode_id):
     """3D 空间查看器数据:blocking 三维调度 + 该场景的 720° 全景母版。
 
@@ -4800,6 +4938,8 @@ def make_handler(workspace, jobs):
                     return self._redo_mock()
                 if parsed.path == "/api/director-statement":
                     return self._director_statement_save()
+                if parsed.path == "/api/scene3d/appearance":
+                    return self._scene3d_appearance()
                 if parsed.path == "/api/scene3d":
                     return self._scene3d_save()
                 if parsed.path == "/api/qc_item":
@@ -5880,6 +6020,26 @@ def make_handler(workspace, jobs):
                     "expected": exc.expected_version,
                     "actual": exc.actual_version,
                 }, status=409)
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            if result is None:
+                return self._error(404, "剧集不存在")
+            return self._json(result, status=201)
+
+        def _scene3d_appearance(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                query = parse_qs(urlparse(self.path).query)
+                episode_id = int(
+                    body.get("episode_id")
+                    or query.get("episode", [0])[0])
+            except (TypeError, ValueError):
+                return self._error(400, "缺少合法 episode_id")
+            try:
+                result = self._with_app(lambda app:
+                    _scene3d_refresh_appearance(app, episode_id, body))
             except AifosError as exc:
                 return self._error(400, str(exc))
             if result is None:

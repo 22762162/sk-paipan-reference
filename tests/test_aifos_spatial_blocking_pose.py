@@ -137,6 +137,25 @@ def test_whole_shot_action_cannot_supply_or_contaminate_actor_pose():
     assert profile["pose"] == "standing"
 
 
+@pytest.mark.parametrize(
+    ("local_pose", "expected_pose", "expected_envelope"),
+    (
+        ("坐在书案后", "sitting", 1.22),
+        ("伏案查看卷宗", "leaning_seated", 1.05),
+        ("跪在堂下", "kneeling", 1.12),
+        ("蹲在墙边", "crouching", .98),
+        ("仰躺在床上", "lying", .55),
+    ),
+)
+def test_pose_envelope_never_replaces_adult_stature(
+        local_pose, expected_pose, expected_envelope):
+    profile = _pose_profile({"position": local_pose})
+
+    assert profile["pose"] == expected_pose
+    assert profile["height_m"] == expected_envelope
+    assert profile["stature_m"] == 1.68
+
+
 def test_two_actor_standing_and_lying_poses_remain_isolated_in_plan():
     shot = {
         "shot_no": 15,
@@ -196,10 +215,12 @@ def test_two_actor_standing_and_lying_poses_remain_isolated_in_plan():
     assert actors["虞寻歌"]["pose_end"] == "standing"
     assert actors["虞寻歌"]["start_height_m"] == 1.68
     assert actors["虞寻歌"]["end_height_m"] == 1.68
+    assert actors["虞寻歌"]["stature_m"] == 1.68
     assert actors["虞寻欢"]["pose_start"] == "lying"
     assert actors["虞寻欢"]["pose_end"] == "lying"
     assert actors["虞寻欢"]["start_height_m"] == .55
     assert actors["虞寻欢"]["end_height_m"] == .55
+    assert actors["虞寻欢"]["stature_m"] == 1.68
 
 
 @pytest.mark.parametrize(

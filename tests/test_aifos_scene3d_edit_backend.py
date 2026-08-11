@@ -4,6 +4,7 @@ import http.client
 import json
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,8 +14,8 @@ from aifos.scene_model import (build_scene_model, equirect_from_direction,
                                normalize_scene_model_contract,
                                validate_scene_model)
 from aifos.scene_render import build_scene_render_contract
-from aifos.web.server import (_scene3d_payload, _scene3d_save_edits,
-                              serve)
+from aifos.web.server import (_scene3d_payload, _scene3d_refresh_appearance,
+                              _scene3d_save_edits, serve)
 
 
 ROOM = {
@@ -250,6 +251,84 @@ def test_stale_revision_conflict_preserves_current_asset(tmp_path):
         history = app.assets.history(project["id"], "scene_model", "卧室")
         assert [row["version"] for row in history] == [1]
         assert history[0]["id"] == first["asset_id"]
+    finally:
+        app.close()
+
+
+def test_appearance_refresh_preserves_geometry_and_forks_canonical_scene(
+        tmp_path, monkeypatch):
+    app, project, episode, _legacy_path, _legacy_row = _editing_app(tmp_path)
+    try:
+        panorama = tmp_path / "bedroom-panorama.png"
+        panorama.write_bytes(b"panorama-appearance-test")
+        app.assets.register(
+            project["id"], "scene_art", "卧室::view:panorama", str(panorama),
+            meta={"provider": "claude_api", "real": True,
+                  "image_quality": "high"})
+        before = _scene3d_payload(app, episode["id"])
+        before_objects = before["scene_models"]["卧室床侧"]["objects"]
+        expected_geometry = [{
+            "object_id": obj.get("object_id"),
+            "position_3d": obj["position_3d"],
+            "width_m": obj["width_m"],
+            "height_m": obj["height_m"],
+            "depth_m": obj["depth_m"],
+        } for obj in before_objects]
+        calls = []
+
+        def appearance_call(capability, payload, out_dir):
+            calls.append((capability, payload, out_dir))
+            assert capability == "scene_annotate"
+            assert payload["appearance_only"] is True
+            return SimpleNamespace(provider="claude_api", data={
+                "objects": [{
+                    "name": name,
+                    "material": {
+                        "verified": True,
+                        "name": "深棕木材",
+                        "base_color": "#5A3C29",
+                        "roughness": 0.72,
+                        "metalness": 0.02,
+                        "emissive_intensity": 0.0,
+                        "evidence": "可见连续木纹与低强度暖色高光",
+                    },
+                } for name in payload["object_names"]],
+                "lighting": {
+                    "verified": True,
+                    "ambient_intensity": 0.4,
+                    "key_intensity": 1.2,
+                    "color_temperature_k": 4300,
+                    "direction": {"x": -0.7, "y": -0.5, "z": 0.3},
+                    "evidence": "右侧窗光与向左投影一致",
+                },
+            })
+
+        monkeypatch.setattr(app.director.router, "call", appearance_call)
+        payload = _scene3d_refresh_appearance(app, episode["id"], {
+            "physical_scene_id": "卧室",
+        })
+
+        assert len(calls) == 1
+        refresh = payload["appearance_refresh"]
+        assert refresh["revision"] == 1
+        assert refresh["verified_materials"] == 2
+        assert refresh["lighting_verified"] is True
+        after = payload["scene_models"]["卧室床侧"]
+        actual_geometry = [{
+            "object_id": obj.get("object_id"),
+            "position_3d": obj["position_3d"],
+            "width_m": obj["width_m"],
+            "height_m": obj["height_m"],
+            "depth_m": obj["depth_m"],
+        } for obj in after["objects"]]
+        assert actual_geometry == expected_geometry
+        assert all(obj["material"]["verified"] is True
+                   for obj in after["objects"])
+        render = payload["render_contracts"]["卧室床侧"]
+        codes = {warning["code"] for warning in render["warnings"]}
+        assert "unverified_material" not in codes
+        assert "missing_lighting" not in codes
+        assert render["lighting"]["verified"] is True
     finally:
         app.close()
 

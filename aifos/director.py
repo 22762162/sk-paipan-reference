@@ -3344,6 +3344,9 @@ class Director:
             annotation["name"] = name
             annotation["category"] = str(
                 obj.get("category") or "furniture")
+            if (not isinstance(annotation.get("material"), dict)
+                    and isinstance(obj.get("material"), dict)):
+                annotation["material"] = copy.deepcopy(obj["material"])
             annotations.append(annotation)
         if missing:
             raise AifosError(
@@ -3365,6 +3368,7 @@ class Director:
             "location": location,
             "room": source_room,
             "panorama_uri": str(pano["uri"]),
+            "lighting": copy.deepcopy(saved.get("lighting")),
         }
         capture = saved.get("capture")
         if isinstance(capture, dict):
@@ -3421,7 +3425,8 @@ class Director:
         return model
 
 
-    def build_scene_model(self, project_title, location, *, force=False):
+    def build_scene_model(self, project_title, location, *, force=False,
+                          panorama_location=None):
         """从本场 720° 全景反解出真实三维场景(物体位置/尺寸/落地点)。
 
         全景此前只当贴图用:看着像那间屋,但平台不知道「书案在哪、多大、
@@ -3434,11 +3439,12 @@ class Director:
         location = str(location or "").strip()
         if not location:
             raise AifosError("请指定场景名")
+        panorama_location = str(panorama_location or location).strip()
         pano = self._scene_view_row(
-            project["id"], location, self.SCENE_PANORAMA_KEY)
+            project["id"], panorama_location, self.SCENE_PANORAMA_KEY)
         if pano is None or not pano["uri"] or not Path(pano["uri"]).exists():
             raise AifosError(
-                f"场景「{location}」还没有 720° 全景母版;"
+                f"场景「{panorama_location}」还没有 720° 全景母版;"
                 "请先运行 expand_scene_views 再反解三维场景")
         pano_meta = self._asset_meta(pano)
         if (str(pano_meta.get("provider") or "") == "mock"
@@ -3474,12 +3480,13 @@ class Director:
         out_dir.mkdir(parents=True, exist_ok=True)
         payload = {
             "location": location,
+            "panorama_location": panorama_location,
             # 全景本身就是被分析的图(不是"参考图"),视觉通道按待检图上传
             "image_uri": str(pano["uri"]),
             "require_reference_images": True,
             "reference_manifest": [{
                 "index": 1, "uri": str(pano["uri"]),
-                "label": f"{location} 720°全景母版", "role": "scene",
+                "label": f"{panorama_location} 720°全景母版", "role": "scene",
                 "binding": "本场几何真相,按它标出每件落地实体的接触点",
             }],
         }
@@ -3494,7 +3501,8 @@ class Director:
             room={"floor_width_m": WORLD_WIDTH_M,
                   "floor_depth_m": WORLD_DEPTH_M,
                   "wall_height_m": 4.2},
-            panorama_uri=str(pano["uri"]))
+            panorama_uri=str(pano["uri"]),
+            lighting=data.get("lighting"))
         model["provider"] = getattr(result, "provider", "")
         model["panorama_version"] = pano["version"]
         model["panorama_asset_id"] = pano["id"]
