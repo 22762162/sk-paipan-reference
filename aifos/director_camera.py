@@ -142,6 +142,140 @@ def _wrap180(deg):
     return ((float(deg) + 180.0) % 360.0) - 180.0
 
 
+def _angle_delta(a, b):
+    return abs(_wrap180(float(a) - float(b)))
+
+
+def _world_camera_obstacles(world):
+    rows = []
+    for item in ((world or {}).get("camera_obstacles") or []):
+        if not (isinstance(item, dict)
+                and isinstance(item.get("position_3d"), dict)):
+            continue
+        category = str(item.get("category") or "")
+        name = str(item.get("name") or "")
+        # Doors and hanging screens are opaque set pieces in their measured
+        # state. Windows remain light openings unless explicitly a shutter.
+        opaque_opening = category == "opening" and any(
+            token in name for token in ("门", "板", "扇", "屏"))
+        if category in {"furniture", "prop", "decor"} or opaque_opening:
+            rows.append(item)
+    return rows
+
+
+def _segment_box_entry(start, end, obstacle):
+    """2D segment/rotated-box intersection entry parameter, or None."""
+    position = obstacle.get("position_3d") or {}
+    try:
+        ox = float(position.get("x", 0.0))
+        oz = float(position.get("z", 0.0))
+        width = max(0.02, float(obstacle.get("width_m") or 0.0))
+        depth = max(0.02, float(obstacle.get("depth_m") or 0.0))
+        yaw = math.radians(float(obstacle.get("rotation_y_deg") or 0.0))
+    except (TypeError, ValueError):
+        return None
+    cos_y, sin_y = math.cos(yaw), math.sin(yaw)
+
+    def local(point):
+        dx, dz = point[0] - ox, point[1] - oz
+        return (dx * cos_y - dz * sin_y,
+                dx * sin_y + dz * cos_y)
+
+    x0, z0 = local(start)
+    x1, z1 = local(end)
+    dx, dz = x1 - x0, z1 - z0
+    enter, leave = 0.0, 1.0
+    for p, q in (
+            (-dx, x0 + width / 2), (dx, width / 2 - x0),
+            (-dz, z0 + depth / 2), (dz, depth / 2 - z0)):
+        if abs(p) < 1e-9:
+            if q < 0:
+                return None
+            continue
+        value = q / p
+        if p < 0:
+            enter = max(enter, value)
+        else:
+            leave = min(leave, value)
+        if enter > leave:
+            return None
+    return enter if 0.02 < enter < 0.98 else None
+
+
+def _camera_candidate_blockers(cx, cy, cz, actors, obstacles):
+    """Return opaque set pieces intersecting camera-to-head sight lines."""
+    blockers = set()
+    for actor in actors:
+        ax, _ay, az = _xyz(actor.get("start_3d"))
+        try:
+            envelope = float(actor.get("height_m") or 1.68)
+        except (TypeError, ValueError):
+            envelope = 1.68
+        # Aim near the crown/eyes. A declared desk may hide a seated torso but
+        # must not be treated as hiding the performer's face.
+        actor_y = max(0.35, envelope - min(0.08, envelope * 0.04))
+        for obstacle in obstacles:
+            entry = _segment_box_entry((cx, cz), (ax, az), obstacle)
+            if entry is None:
+                continue
+            position = obstacle.get("position_3d") or {}
+            try:
+                top = (float(position.get("y") or 0.0)
+                       + float(obstacle.get("height_m") or 0.0))
+            except (TypeError, ValueError):
+                continue
+            ray_y = cy + entry * (actor_y - cy)
+            if top >= ray_y - 0.08:
+                blockers.add(str(obstacle.get("name") or "未命名布景"))
+    return sorted(blockers)
+
+
+def _group_camera_candidate(target, eye, distance, preferred_yaw,
+                            perpendicular_yaw, actors, world):
+    """Pick a group camera that can actually see every performer.
+
+    Equal depth is desirable, but never at the cost of placing the lens behind
+    a pillar, shelf or curtain. Search deterministic 10-degree candidates and
+    rank visibility before depth balance and declared-angle preference.
+    """
+    world = world if isinstance(world, dict) else {}
+    obstacles = _world_camera_obstacles(world)
+    if not obstacles:
+        return perpendicular_yaw, [], False
+    try:
+        half_w = float(world.get("floor_width_m") or 10.0) / 2 - 0.15
+        half_d = float(world.get("floor_depth_m") or 7.0) / 2 - 0.15
+    except (TypeError, ValueError):
+        half_w, half_d = 4.85, 3.35
+    yaws = [perpendicular_yaw, preferred_yaw]
+    yaws.extend(float(value) for value in range(-180, 180, 10))
+    unique = []
+    for value in yaws:
+        wrapped = _wrap180(value)
+        if not any(_angle_delta(wrapped, old) < 0.1 for old in unique):
+            unique.append(wrapped)
+    scored = []
+    tx, tz = target
+    actor_points = [_xyz(row.get("start_3d")) for row in actors]
+    for yaw in unique:
+        cx = tx + distance * math.sin(math.radians(yaw))
+        cz = tz + distance * math.cos(math.radians(yaw))
+        if abs(cx) > half_w or abs(cz) > half_d:
+            continue
+        blockers = _camera_candidate_blockers(
+            cx, eye, cz, actors, obstacles)
+        distances = [math.hypot(cx - point[0], cz - point[2])
+                     for point in actor_points]
+        depth_imbalance = max(distances) - min(distances)
+        scored.append((
+            len(blockers), round(depth_imbalance, 6),
+            round(_angle_delta(yaw, preferred_yaw), 6), yaw, blockers))
+    if not scored:
+        return perpendicular_yaw, [], False
+    _blocked, _imbalance, _declared_delta, yaw, blockers = min(scored)
+    return yaw, blockers, _angle_delta(yaw, perpendicular_yaw) >= 0.1
+
+
 def subject_facing_yaw(actor, actors, scene_center=(0.0, 0.0)):
     """主体面朝的方位角。
 
@@ -209,6 +343,8 @@ def solve_camera(shot, actors, *, axis_side=1, scene_center=(0.0, 0.0),
                   and isinstance(row.get("start_3d"), dict)]
     group_mode = bool(len(positioned) >= 2 and declared_group_framing(shot))
     group_span = 0.0
+    visibility_blockers = []
+    visibility_adjusted = False
     if group_mode:
         points = [_xyz(row.get("start_3d")) for row in positioned]
         sx = sum(point[0] for point in points) / len(points)
@@ -236,8 +372,16 @@ def solve_camera(shot, actors, *, axis_side=1, scene_center=(0.0, 0.0),
             normal_x, normal_z = dz / group_span, -dx / group_span
             if axis_side < 0:
                 normal_x, normal_z = -normal_x, -normal_z
-            yaw = _wrap180(math.degrees(math.atan2(normal_x, normal_z)))
+            perpendicular_yaw = _wrap180(
+                math.degrees(math.atan2(normal_x, normal_z)))
             distance = max(distance, group_span * 1.05)
+            facing = subject_facing_yaw(actor, positioned, scene_center)
+            preferred_yaw = _wrap180(
+                facing + 180.0 + offset * (1 if axis_side >= 0 else -1))
+            yaw, visibility_blockers, visibility_adjusted = (
+                _group_camera_candidate(
+                    (sx, sz), eye, distance, preferred_yaw,
+                    perpendicular_yaw, positioned, world))
         else:
             facing = subject_facing_yaw(actor, actors, scene_center)
             yaw = _wrap180(
@@ -287,6 +431,8 @@ def solve_camera(shot, actors, *, axis_side=1, scene_center=(0.0, 0.0),
                              if group_mode else [_text(actor.get("actor_id"))],
         "target_mode": "group_midpoint" if group_mode else "primary_actor",
         "group_span_m": round(group_span, 2) if group_mode else 0.0,
+        "visibility_adjusted": visibility_adjusted,
+        "visibility_blockers": visibility_blockers,
         "wall_clamped": clamped,
     }
 

@@ -187,6 +187,31 @@ class AzimuthTest(unittest.TestCase):
         self.assertGreaterEqual(cam["desired_distance_m"],
                                 cam["group_span_m"])
 
+    def test_group_camera_avoids_measured_set_occlusion(self):
+        left = _actor("顾明昭", x=-2.44, z=-0.3, hero=True)
+        right = _actor("沈砚舟", x=0.0, z=1.04, hero=False)
+        right["height_m"] = 1.22
+        shot = _shot("双人平视斜侧中近景，35mm，以书案前缘横向分隔构图")
+        world = {
+            "floor_width_m": 10,
+            "floor_depth_m": 7,
+            # The ideal equal-depth ray crosses this measured door. The
+            # solver must choose another clear in-room angle.
+            "camera_obstacles": [{
+                "name": "右侧板门", "category": "opening",
+                "position_3d": {"x": 0.08, "y": 0.0, "z": -1.17},
+                "width_m": 0.9, "depth_m": 0.08, "height_m": 2.95,
+                "rotation_y_deg": 90.0,
+            }],
+        }
+
+        cam = solve_camera(shot, [left, right], world=world)
+
+        self.assertEqual(cam["target_mode"], "group_midpoint")
+        self.assertTrue(cam["visibility_adjusted"])
+        self.assertEqual(cam["visibility_blockers"], [])
+        self.assertNotAlmostEqual(cam["yaw_deg"], 151.2, delta=0.2)
+
 
 class SceneContinuityTest(unittest.TestCase):
     def test_flags_near_identical_consecutive_setups(self):
