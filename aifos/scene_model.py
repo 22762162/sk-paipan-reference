@@ -18,15 +18,137 @@
 """
 from __future__ import annotations
 
+import copy
+import hashlib
+import json
 import math
+import re
 
-SCHEMA = "aifos.scene-model/v2"
+SCHEMA = "aifos.scene-model/v3"
 SCALE_POLICY = "semantic-realworld-scale/v1"
 DEFAULT_CAPTURE_HEIGHT_M = 1.55
 # 视线过于接近水平时,地面交点会跑到无穷远——超过这个距离一律判为
 # 「看不出落地点」,而不是给一个荒谬的坐标。
 MAX_FLOOR_DISTANCE_M = 30.0
 _MIN_DOWNWARD = 1e-3
+
+MOUNT_TYPES = frozenset({
+    "floor_contact", "wall_mount", "ceiling_mount", "support_surface",
+})
+
+# One semantic vocabulary is shared by reconstruction, editing and rendering.
+# It deliberately describes what an object *is*, not how a particular viewer
+# happens to draw it.
+_SEMANTIC_RULES = (
+    ("lantern", ("灯笼", "宫灯", "油灯", "烛台", "蜡烛", "壁灯", "吊灯")),
+    ("brazier", ("香炉", "熏炉", "火盆", "炉")),
+    ("vessel", ("茶盏", "茶杯", "酒杯", "水杯", "小碗", "瓷碗", "杯", "盏")),
+    ("cabinet", ("药柜", "书架", "书柜", "卷柜", "格柜", "抽屉", "柜")),
+    ("paper", ("宣纸", "信笺", "纸卷", "书卷", "卷册", "书册", "竹简", "文书")),
+    ("bed", ("床榻", "卧榻", "床", "榻")),
+    ("chair", ("椅", "凳", "坐墩")),
+    ("lattice", ("格心窗", "格栅", "隔扇", "花窗", "槛窗", "支摘窗", "窗")),
+    ("doorway", ("门洞", "门道", "入口", "出口")),
+    ("door", ("板门", "木门", "房门", "车门", "门扇")),
+    ("curtain", ("竹帘", "布帘", "纱帘", "垂帘", "帷幔", "纱帐", "帐幔")),
+    ("column", ("方柱", "圆柱", "檐柱", "立柱", "柱")),
+    ("screen", ("屏风", "屏障", "围屏")),
+    ("table", ("书案", "画案", "条案", "矮案", "琴案", "案几", "方几", "茶几",
+               "桌", "台几")),
+    ("instrument", ("古琴", "瑶琴", "琵琶", "琴")),
+    ("rug", ("地毯", "毛毯", "地衣", "草席", "凉席", "竹席", "蒲团")),
+    ("plant", ("盆栽", "盆景", "绿植", "翠竹", "竹丛", "兰草", "花木")),
+)
+
+_SUPPORT_MARKERS = (
+    ("案上", ("案", "桌", "几", "台")),
+    ("桌上", ("桌", "案", "几", "台")),
+    ("几上", ("几", "桌", "案", "台")),
+    ("台上", ("台", "几", "桌", "案")),
+    ("柜上", ("柜",)),
+    ("床上", ("床", "榻")),
+)
+
+
+def semantic_type_for(name, category=""):
+    """Return a stable semantic class independent of render implementation."""
+    text = str(name or "").strip().lower()
+    for semantic_type, words in _SEMANTIC_RULES:
+        if any(word.lower() in text for word in words):
+            return semantic_type
+    return {
+        "opening": "architectural_opening",
+        "light": "light_fixture",
+        "furniture": "generic_furniture",
+        "prop": "generic_prop",
+        "decor": "decor",
+        "structure": "structure",
+    }.get(str(category or "").strip().lower(), "generic_object")
+
+
+def mount_type_for(name, category="", semantic_type="", *, support_id="",
+                   explicit=""):
+    """Resolve an explicit mounting relation without guessing coordinates."""
+    explicit = str(explicit or "").strip()
+    if explicit in MOUNT_TYPES:
+        return explicit
+    text = str(name or "").strip()
+    if str(support_id or "").strip() or any(
+            marker in text for marker, _words in _SUPPORT_MARKERS):
+        return "support_surface"
+    if any(word in text for word in ("吊灯", "吊扇", "吸顶", "顶灯", "吊顶")):
+        return "ceiling_mount"
+    if (str(category or "").strip() == "opening"
+            or str(semantic_type or "") in {
+                "architectural_opening", "lattice", "doorway", "door"}
+            or any(word in text for word in (
+                "壁灯", "挂画", "墙饰", "墙上", "壁挂"))):
+        return "wall_mount"
+    return "floor_contact"
+
+
+def _safe_explicit_object_id(value):
+    value = str(value or "").strip()
+    if not value or len(value) > 96:
+        return ""
+    return value if re.fullmatch(r"[\w.:-]+", value, re.UNICODE) else ""
+
+
+def _derived_object_id(annotation, *, location="", occurrence=1):
+    source = annotation.get("source") if isinstance(annotation, dict) else {}
+    if not isinstance(source, dict):
+        source = {}
+    row = annotation if isinstance(annotation, dict) else {}
+    identity = {
+        "location": str(location or "").strip(),
+        "name": str(row.get("name") or "").strip(),
+        "category": str(row.get("category") or "").strip(),
+        "base_u": row.get("base_u", source.get("base_u")),
+        "base_v": row.get("base_v", source.get("base_v")),
+        "top_v": row.get("top_v", source.get("top_v")),
+        "width_u": row.get("width_u", source.get("width_u")),
+        # Legacy saved models no longer have the original flat annotation at
+        # the object root.  Their measured geometry disambiguates duplicate
+        # names without relying on list order.
+        "position_3d": row.get("position_3d"),
+        "width_m": row.get("width_m"),
+        "height_m": row.get("height_m"),
+        "depth_m": row.get("depth_m"),
+        "rotation_y_deg": row.get("rotation_y_deg"),
+        "occurrence": int(occurrence),
+    }
+    digest = hashlib.sha256(json.dumps(
+        identity, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), default=str).encode("utf-8")).hexdigest()[:16]
+    return f"obj-{digest}"
+
+
+def _support_words(name):
+    text = str(name or "")
+    for marker, words in _SUPPORT_MARKERS:
+        if marker in text:
+            return marker, words
+    return "", ()
 
 
 def direction_from_equirect(u, v):
@@ -405,6 +527,8 @@ def build_object(annotation, *, capture_height=DEFAULT_CAPTURE_HEIGHT_M,
     name = str(annotation.get("name") or "").strip()
     if not name:
         return None
+    explicit_object_id = _safe_explicit_object_id(
+        annotation.get("object_id") or annotation.get("id"))
     try:
         base_u = float(annotation["base_u"])
         base_v = float(annotation["base_v"])
@@ -418,6 +542,12 @@ def build_object(annotation, *, capture_height=DEFAULT_CAPTURE_HEIGHT_M,
     distance = math.hypot(x, z)
 
     category = str(annotation.get("category") or "furniture")
+    semantic_type = str(annotation.get("semantic_type") or "").strip() \
+        or semantic_type_for(name, category)
+    support_id = _safe_explicit_object_id(annotation.get("support_id"))
+    mount_type = mount_type_for(
+        name, category, semantic_type, support_id=support_id,
+        explicit=annotation.get("mount_type"))
     defaults = _DEFAULT_GEOMETRY.get(
         category, _DEFAULT_GEOMETRY["furniture"])
     height = None
@@ -515,8 +645,12 @@ def build_object(annotation, *, capture_height=DEFAULT_CAPTURE_HEIGHT_M,
         x, z, final_width, final_depth, rotation_y)
 
     return {
+        "object_id": explicit_object_id or _derived_object_id(annotation),
         "name": name,
         "category": category,
+        "semantic_type": semantic_type,
+        "mount_type": mount_type,
+        "support_id": support_id or None,
         # 毫米级保留是为了钳位后的盒体不因二位小数回舍再次越墙。
         "position_3d": {"x": round(x, 3), "y": 0.0, "z": round(z, 3)},
         "distance_m": round(distance, 2),
@@ -550,6 +684,348 @@ def build_object(annotation, *, capture_height=DEFAULT_CAPTURE_HEIGHT_M,
     }
 
 
+def _unique_object_id(annotation, built, *, location, used_ids):
+    explicit = _safe_explicit_object_id(
+        annotation.get("object_id") or annotation.get("id"))
+    occurrence = 1
+    candidate = explicit or _derived_object_id(
+        annotation, location=location, occurrence=occurrence)
+    while candidate in used_ids:
+        occurrence += 1
+        candidate = _derived_object_id(
+            annotation, location=location, occurrence=occurrence)
+    used_ids.add(candidate)
+    built["object_id"] = candidate
+    return explicit, occurrence
+
+
+def _nearest_named_support(obj, objects, words):
+    position = obj.get("position_3d") or {}
+    try:
+        x, z = float(position.get("x")), float(position.get("z"))
+    except (TypeError, ValueError):
+        return None
+    candidates = [
+        candidate for candidate in objects
+        if candidate is not obj
+        and any(word in str(candidate.get("name") or "") for word in words)
+        and candidate.get("mount_type") != "support_surface"
+    ]
+    if not candidates:
+        return None
+
+    def distance(candidate):
+        point = candidate.get("position_3d") or {}
+        try:
+            return math.hypot(
+                x - float(point.get("x")), z - float(point.get("z")))
+        except (TypeError, ValueError):
+            return float("inf")
+
+    support = min(candidates, key=distance)
+    return support if math.isfinite(distance(support)) else None
+
+
+def _resolve_support_ids(objects, issues):
+    """Resolve declared support names to IDs; never move either object."""
+    by_id = {
+        str(obj.get("object_id")): obj for obj in objects
+        if str(obj.get("object_id") or "").strip()
+    }
+    for obj in objects:
+        if obj.get("mount_type") != "support_surface":
+            continue
+        support_id = str(obj.get("support_id") or "").strip()
+        if support_id and support_id in by_id and by_id[support_id] is not obj:
+            continue
+        marker, words = _support_words(obj.get("name"))
+        support = _nearest_named_support(obj, objects, words) if words else None
+        if support is not None:
+            obj["support_id"] = support["object_id"]
+            if not support_id:
+                obj["support_source"] = "semantic_name_inference"
+                issues.append({
+                    "severity": "warning",
+                    "code": "support_inferred_from_name",
+                    "field": "support_id",
+                    "object": obj.get("name"),
+                    "object_id": obj.get("object_id"),
+                    "support_id": support.get("object_id"),
+                    "message": (
+                        f"「{obj.get('name')}」按名称中的「{marker}」关联到"
+                        f"「{support.get('name')}」；只记录承托关系，"
+                        "未自动移动物体"),
+                })
+        elif not support_id:
+            issues.append({
+                "severity": "warning",
+                "code": "missing_support_id",
+                "field": "support_id",
+                "object": obj.get("name"),
+                "object_id": obj.get("object_id"),
+                "message": (
+                    f"「{obj.get('name')}」声明放在承托面上，"
+                    "但尚未指定可确认的 support_id"),
+            })
+
+
+def _refresh_object_derived_geometry(obj, room):
+    """Recompute derived footprint flags without clamping authoritative data."""
+    position = obj.get("position_3d") or {}
+    try:
+        x = float(position.get("x"))
+        z = float(position.get("z"))
+        width = float(obj.get("width_m"))
+        depth = float(obj.get("depth_m"))
+        rotation = float(obj.get("rotation_y_deg") or 0.0)
+    except (TypeError, ValueError):
+        obj["footprint_3d"] = []
+        obj["inside_room"] = False
+        obj["footprint_inside_room"] = False
+        return
+    if not all(math.isfinite(value) for value in (
+            x, z, width, depth, rotation)) or width <= 0 or depth <= 0:
+        obj["footprint_3d"] = []
+        obj["inside_room"] = False
+        obj["footprint_inside_room"] = False
+        return
+    obj["footprint_3d"] = _object_footprint(
+        x, z, width, depth, rotation)
+    _cx, _cz, inside = _clamp_room(x, z, room)
+    obj["inside_room"] = inside
+    obj["footprint_inside_room"] = _footprint_inside_room(
+        obj["footprint_3d"], room)
+
+
+def refresh_scene_model_geometry(scene_model):
+    """Refresh derived footprints after explicit edits, in place.
+
+    This function never clamps, relocates or changes an object's authored
+    position, dimensions, rotation, mounting relation or support relation.
+    """
+    if not isinstance(scene_model, dict):
+        return scene_model
+    room = scene_model.get("room") \
+        if isinstance(scene_model.get("room"), dict) else {}
+    for obj in scene_model.get("objects") or []:
+        if isinstance(obj, dict):
+            _refresh_object_derived_geometry(obj, room)
+    return scene_model
+
+
+def normalize_scene_model_contract(scene_model, *, location=""):
+    """Return a v3 copy with stable identities and structured relations.
+
+    Saved legacy files are never rewritten by this function.  It is safe to
+    use on GET responses and as the immutable base of a later edited version.
+    """
+    model = copy.deepcopy(scene_model) if isinstance(scene_model, dict) else {}
+    resolved_location = str(location or model.get("location") or "").strip()
+    model["schema"] = SCHEMA
+    model["location"] = resolved_location
+    room = model.get("room") if isinstance(model.get("room"), dict) else {}
+    raw_objects = model.get("objects")
+    objects = raw_objects if isinstance(raw_objects, list) else []
+    normalized = []
+    identity_issues = []
+    used_ids = set()
+    for index, raw in enumerate(objects, 1):
+        if not isinstance(raw, dict):
+            identity_issues.append({
+                "severity": "block", "code": "invalid_object",
+                "field": "objects", "message": f"第 {index} 件物体不是 JSON 对象",
+            })
+            normalized.append(copy.deepcopy(raw))
+            continue
+        obj = copy.deepcopy(raw)
+        explicit = _safe_explicit_object_id(
+            obj.get("object_id") or obj.get("id"))
+        candidate = explicit or _derived_object_id(
+            obj, location=resolved_location)
+        occurrence = 1
+        while candidate in used_ids:
+            occurrence += 1
+            candidate = _derived_object_id(
+                obj, location=resolved_location, occurrence=occurrence)
+        if explicit and candidate != explicit:
+            identity_issues.append({
+                "severity": "block", "code": "duplicate_object_id",
+                "field": "object_id", "object": obj.get("name"),
+                "object_id": explicit,
+                "message": (
+                    f"「{obj.get('name') or index}」的 object_id={explicit} 重复；"
+                    f"本次读取临时标识为 {candidate}，旧文件未被改写"),
+            })
+        used_ids.add(candidate)
+        obj["object_id"] = candidate
+        category = str(obj.get("category") or "furniture").strip()
+        semantic_type = str(obj.get("semantic_type") or "").strip() \
+            or semantic_type_for(obj.get("name"), category)
+        obj["semantic_type"] = semantic_type
+        obj["mount_type"] = mount_type_for(
+            obj.get("name"), category, semantic_type,
+            support_id=obj.get("support_id"), explicit=obj.get("mount_type"))
+        support_id = _safe_explicit_object_id(obj.get("support_id"))
+        obj["support_id"] = support_id or None
+        _refresh_object_derived_geometry(obj, room)
+        normalized.append(obj)
+    _resolve_support_ids(normalized, identity_issues)
+    model["objects"] = normalized
+    existing_issues = model.get("issues")
+    model["issues"] = (
+        copy.deepcopy(existing_issues) if isinstance(existing_issues, list)
+        else []) + identity_issues
+    return model
+
+
+def validate_scene_model(scene_model):
+    """Validate an authoritative model without repairing or dropping data."""
+    model = scene_model if isinstance(scene_model, dict) else {}
+    room = model.get("room") if isinstance(model.get("room"), dict) else {}
+    objects = model.get("objects") if isinstance(model.get("objects"), list) \
+        else []
+    issues = []
+    seen_ids = set()
+    by_id = {}
+    for index, obj in enumerate(objects, 1):
+        if not isinstance(obj, dict):
+            issues.append({
+                "severity": "block", "code": "invalid_object",
+                "field": "objects", "message": f"第 {index} 件物体不是 JSON 对象",
+            })
+            continue
+        object_id = str(obj.get("object_id") or "").strip()
+        if not object_id:
+            issues.append({
+                "severity": "block", "code": "missing_object_id",
+                "field": "object_id", "object": obj.get("name"),
+                "message": f"「{obj.get('name') or index}」缺少 object_id",
+            })
+        elif object_id in seen_ids:
+            issues.append({
+                "severity": "block", "code": "duplicate_object_id",
+                "field": "object_id", "object": obj.get("name"),
+                "object_id": object_id,
+                "message": f"object_id={object_id} 在同一物理场景内重复",
+            })
+        else:
+            seen_ids.add(object_id)
+            by_id[object_id] = obj
+        position = obj.get("position_3d")
+        if not isinstance(position, dict):
+            issues.append({
+                "severity": "block", "code": "invalid_position",
+                "field": "position_3d", "object_id": object_id,
+                "object": obj.get("name"), "message": "物体缺少三维位置",
+            })
+        else:
+            for axis in ("x", "y", "z"):
+                try:
+                    value = float(position.get(axis))
+                except (TypeError, ValueError):
+                    value = float("nan")
+                if not math.isfinite(value):
+                    issues.append({
+                        "severity": "block", "code": "invalid_position",
+                        "field": f"position_3d.{axis}",
+                        "object_id": object_id, "object": obj.get("name"),
+                        "message": f"物体「{obj.get('name')}」的 {axis} 坐标无效",
+                    })
+        for field in ("width_m", "height_m", "depth_m"):
+            try:
+                value = float(obj.get(field))
+            except (TypeError, ValueError):
+                value = float("nan")
+            if not math.isfinite(value) or value <= 0:
+                issues.append({
+                    "severity": "block", "code": "invalid_dimension",
+                    "field": field, "object_id": object_id,
+                    "object": obj.get("name"),
+                    "message": f"物体「{obj.get('name')}」的 {field} 必须为正数",
+                })
+        try:
+            rotation = float(obj.get("rotation_y_deg") or 0.0)
+        except (TypeError, ValueError):
+            rotation = float("nan")
+        if not math.isfinite(rotation):
+            issues.append({
+                "severity": "block", "code": "invalid_rotation",
+                "field": "rotation_y_deg", "object_id": object_id,
+                "object": obj.get("name"), "message": "物体旋转角必须为有限数",
+            })
+        mount_type = str(obj.get("mount_type") or "")
+        if mount_type not in MOUNT_TYPES:
+            issues.append({
+                "severity": "block", "code": "invalid_mount_type",
+                "field": "mount_type", "object_id": object_id,
+                "object": obj.get("name"),
+                "message": f"物体「{obj.get('name')}」的 mount_type 无效",
+            })
+        if (obj.get("category") in ("furniture", "prop")
+                and not obj.get("footprint_inside_room")):
+            issues.append({
+                "severity": "block", "code": "footprint_outside_room",
+                "field": "position_3d", "object_id": object_id,
+                "object": obj.get("name"),
+                "message": f"「{obj.get('name')}」的占地超出房间边界，未自动钳回",
+            })
+    for obj in objects:
+        if not isinstance(obj, dict):
+            continue
+        object_id = str(obj.get("object_id") or "")
+        if obj.get("mount_type") != "support_surface":
+            if obj.get("support_id"):
+                issues.append({
+                    "severity": "warning", "code": "unused_support_id",
+                    "field": "support_id", "object_id": object_id,
+                    "object": obj.get("name"),
+                    "message": "support_id 已设置，但 mount_type 不是 support_surface",
+                })
+            continue
+        support_id = str(obj.get("support_id") or "").strip()
+        if not support_id:
+            issues.append({
+                "severity": "block", "code": "missing_support_id",
+                "field": "support_id", "object_id": object_id,
+                "object": obj.get("name"), "message": "承托面物体缺少 support_id",
+            })
+            continue
+        support = by_id.get(support_id)
+        if support is None or support is obj:
+            issues.append({
+                "severity": "block", "code": "invalid_support_id",
+                "field": "support_id", "object_id": object_id,
+                "object": obj.get("name"),
+                "message": f"承托物 {support_id} 不存在或指向自身",
+            })
+            continue
+        position = obj.get("position_3d") or {}
+        support_position = support.get("position_3d") or {}
+        try:
+            expected_y = (float(support_position.get("y"))
+                          + float(support.get("height_m")))
+            actual_y = float(position.get("y"))
+        except (TypeError, ValueError):
+            continue
+        if abs(actual_y - expected_y) > 0.08:
+            issues.append({
+                "severity": "warning", "code": "support_height_mismatch",
+                "field": "position_3d.y", "object_id": object_id,
+                "object": obj.get("name"), "support_id": support_id,
+                "message": (
+                    f"「{obj.get('name')}」已关联「{support.get('name')}」，"
+                    f"但 y={actual_y:.3f}m 与承托面 {expected_y:.3f}m 不一致；"
+                    "系统未自动移动"),
+            })
+    issues.extend(overlap_issues(objects))
+    return {
+        "passed": not any(item.get("severity") == "block" for item in issues),
+        "issues": issues,
+        "blocking_errors": [
+            item for item in issues if item.get("severity") == "block"],
+    }
+
+
 def build_scene_model(annotations, *, location="",
                       capture_height=DEFAULT_CAPTURE_HEIGHT_M, room=None,
                       panorama_uri=""):
@@ -558,6 +1034,7 @@ def build_scene_model(annotations, *, location="",
     effective_room, room_adjustments = _normalise_semantic_room(
         source_room, location)
     objects, issues = [], []
+    used_ids = set()
     for adjustment in room_adjustments:
         original = adjustment["original_m"]
         original_text = "缺失" if original is None else f"{original:.3f}m"
@@ -585,6 +1062,17 @@ def build_scene_model(annotations, *, location="",
                             "或视线未朝下),已跳过;该物体在三维场景里不存在"),
             })
             continue
+        explicit_id, occurrence = _unique_object_id(
+            annotation, built, location=location, used_ids=used_ids)
+        if explicit_id and occurrence > 1:
+            issues.append({
+                "severity": "block", "code": "duplicate_source_object_id",
+                "field": "object_id", "object": built["name"],
+                "object_id": explicit_id,
+                "message": (
+                    f"原始标注 object_id={explicit_id} 重复；"
+                    f"「{built['name']}」已临时分配 {built['object_id']}"),
+            })
         # 门窗帷幔壁灯本来就长在墙上,解到墙面附近是正确结果而不是异常;
         # 只有该待在屋里的家具/道具跑出去才值得报。
         if not built["inside_room"] and built["category"] in (
@@ -625,6 +1113,7 @@ def build_scene_model(annotations, *, location="",
                     "不再作为真实尺度"),
             })
         objects.append(built)
+    _resolve_support_ids(objects, issues)
     issues.extend(overlap_issues(objects))
     return {
         "schema": SCHEMA,
@@ -647,6 +1136,21 @@ def overlap_issues(objects, min_gap_m=0.25):
                  if o.get("category") in ("furniture", "prop")]
     for i, a in enumerate(furniture):
         for b in furniture[i + 1:]:
+            # A prop may intentionally occupy its declared support's X/Z
+            # footprint.  That is a vertical relation, not a collision.
+            if (str(a.get("support_id") or "") == str(b.get("object_id") or "")
+                    or str(b.get("support_id") or "")
+                    == str(a.get("object_id") or "")):
+                continue
+            try:
+                a_y = float((a.get("position_3d") or {}).get("y") or 0.0)
+                b_y = float((b.get("position_3d") or {}).get("y") or 0.0)
+                a_top = a_y + float(a.get("height_m") or 0.0)
+                b_top = b_y + float(b.get("height_m") or 0.0)
+            except (TypeError, ValueError):
+                a_y = b_y = a_top = b_top = 0.0
+            if a_top <= b_y + 0.01 or b_top <= a_y + 0.01:
+                continue
             gap = math.dist(
                 (a["position_3d"]["x"], a["position_3d"]["z"]),
                 (b["position_3d"]["x"], b["position_3d"]["z"]))
@@ -658,6 +1162,8 @@ def overlap_issues(objects, min_gap_m=0.25):
                 issues.append({
                     "severity": "warning", "field": "overlap",
                     "object": a["name"],
+                    "object_id": a.get("object_id"),
+                    "other_object_id": b.get("object_id"),
                     "message": (
                         f"「{a['name']}」与「{b['name']}」的真实盒体"
                         f"相交或间距小于 {min_gap_m:.2f}m"

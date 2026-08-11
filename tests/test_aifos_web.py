@@ -448,7 +448,7 @@ def test_index_and_static(server):
         "192x192", "512x512"}
     status, ctype, raw = _request(server["port"], "GET", "/sw.js")
     assert status == 200 and "javascript" in ctype
-    assert b"aifos-mobile-shell-v7" in raw
+    assert b"aifos-mobile-shell-v8" in raw
     assert b'/static/app.js' in raw and b'fetch(request)' in raw
 
 

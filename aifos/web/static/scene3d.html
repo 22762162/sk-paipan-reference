@@ -37,8 +37,13 @@ canvas.drag{cursor:grabbing}
 #notice{position:absolute;top:10px;left:12px;max-width:min(520px,calc(100% - 150px));
   display:none;padding:7px 10px;border:1px solid #7a5f2b;border-radius:4px;
   background:rgba(34,27,17,.9);color:#e8c77e;font-size:11px;line-height:1.55;
-  box-shadow:0 8px 26px rgba(0,0,0,.28);pointer-events:none}
+  box-shadow:0 8px 26px rgba(0,0,0,.28);pointer-events:auto;z-index:3}
 #notice.bad{border-color:#8b3f36;color:#f0aaa0;background:rgba(45,19,17,.92)}
+#noticePanel{border:0}#noticeSummary{cursor:pointer;font-weight:600;list-style-position:inside}
+#noticeDetails{max-height:180px;overflow:auto;margin-top:5px}
+.notice-item{display:block;width:100%;text-align:left;margin-top:4px;padding:5px 7px;
+  color:inherit;background:rgba(0,0,0,.16);border-color:rgba(217,164,65,.28)}
+.notice-item.locatable::after{content:" · 定位";color:var(--gold)}
 #err{position:absolute;inset:0;display:none;place-items:center;text-align:center;
   z-index:4;padding:24px;color:#f0aaa0;font-size:13px;line-height:1.8;
   background:rgba(16,14,12,.92)}
@@ -96,6 +101,69 @@ button.ghost.on{color:var(--gold);background:transparent;
   border-radius:3px;padding:5px 7px;resize:vertical;min-height:34px}
 .stmt-field textarea:focus{outline:none;border-color:var(--gold-dim)}
 #stmtStatus{font-size:11px;color:var(--paper-dim);margin-left:8px}
+#quality{position:absolute;left:12px;bottom:12px;z-index:2;display:flex;gap:5px;
+  flex-wrap:wrap;max-width:calc(100% - 24px);pointer-events:none}
+.quality-badge{font-size:10px;line-height:1;padding:5px 7px;border:1px solid var(--line);
+  border-radius:999px;background:rgba(16,14,12,.84);color:var(--paper-dim)}
+.quality-badge.ok{color:#87d7a3;border-color:#315d42}
+.quality-badge.warn{color:#e8c77e;border-color:#7a5f2b}
+#previewBadge{position:absolute;left:50%;top:10px;transform:translateX(-50%);
+  display:none;z-index:3;padding:6px 10px;border:1px solid #b36b2e;border-radius:4px;
+  background:rgba(55,28,10,.92);color:#ffd08a;font-size:11px;font-weight:700;
+  pointer-events:none}
+#viewTools{position:absolute;right:12px;top:50px;z-index:2;display:flex;
+  flex-direction:column;gap:6px}
+#viewTools button{width:44px;height:44px;padding:0;font-size:18px;
+  background:rgba(16,14,12,.82)}
+#inspector{position:absolute;right:12px;bottom:12px;z-index:5;display:none;
+  width:min(360px,calc(100% - 24px));max-height:calc(100% - 24px);overflow:auto;
+  padding:11px;border:1px solid var(--gold-dim);border-radius:6px;
+  background:rgba(20,17,14,.97);box-shadow:0 14px 40px rgba(0,0,0,.55)}
+#inspector.show{display:block}
+.inspector-head{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.inspector-head strong{color:var(--gold);flex:1;min-width:0;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.edit-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}
+.edit-field label{display:block;font-size:9px;color:var(--gold-dim);margin-bottom:2px}
+.edit-field input,.edit-field select{width:100%;min-width:0;font:inherit;font-size:12px;
+  color:var(--paper);background:#120f0d;border:1px solid var(--line);border-radius:3px;
+  padding:6px}
+.edit-field input:disabled,.edit-field select:disabled{opacity:.65}
+#inspectorHint{font-size:10px;color:var(--paper-dim);line-height:1.5;margin:7px 0}
+#saveStatus{font-size:10px;color:var(--paper-dim)}
+#footerToggle{display:none}
+@media(max-width:600px){
+  #top{height:50px;flex-wrap:nowrap;padding:7px 10px;align-items:center}
+  h1{font-size:15px;flex:none}.meta{white-space:nowrap;overflow:hidden;
+    text-overflow:ellipsis;min-width:0;flex:1}
+  #stmtBtn{min-width:44px;font-size:0;padding:0}#stmtBtn::after{content:"导";font-size:13px}
+  #view{min-height:55vh}
+  footer{max-height:calc(45vh - 50px);overflow:auto;padding:7px 8px 10px;gap:6px}
+  footer .row{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none}
+  footer .row::-webkit-scrollbar{display:none}
+  button,select{min-height:44px;min-width:44px;padding:7px 11px;flex:none}
+  .row-label{position:sticky;left:0;z-index:1;background:var(--panel);min-width:44px}
+  #shots{flex-wrap:nowrap!important;overflow-x:auto;min-width:0}
+  #pvScrub{min-width:170px;height:44px}#pvClock{min-width:92px}
+  #notice{top:8px;left:8px;right:62px;max-width:none;padding:7px 9px;
+    overflow:hidden;white-space:nowrap}
+  #notice:not(.expanded){max-height:38px}
+  #notice.expanded{max-height:min(42vh,280px);white-space:normal}
+  #noticeDetails{max-height:min(32vh,210px)}
+  #hud{top:auto;right:8px;bottom:8px;max-width:66%;overflow:hidden;
+    white-space:nowrap;text-overflow:ellipsis}
+  #quality{left:8px;bottom:8px;max-width:64%;gap:3px}
+  .quality-badge{font-size:9px;padding:4px 6px}
+  #viewTools{right:8px;top:54px}
+  #footerToggle{display:block;position:absolute;right:8px;bottom:8px;z-index:6;
+    width:44px;height:44px;padding:0;background:rgba(16,14,12,.88)}
+  body.footer-collapsed footer{display:none}
+  body.footer-collapsed #view{min-height:calc(100vh - 50px)}
+  #inspector{left:8px;right:8px;bottom:8px;width:auto;max-height:58%}
+  .edit-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
+  #previewBadge{top:auto;bottom:8px;max-width:58%;white-space:nowrap;overflow:hidden;
+    text-overflow:ellipsis}
+}
 </style>
 </head>
 <body>
@@ -110,6 +178,14 @@ button.ghost.on{color:var(--gold);background:transparent;
     <div id="labels"></div>
     <div id="hud"></div>
     <div id="notice" role="status" aria-live="polite"></div>
+    <div id="previewBadge">修复预览 · 不进入导出</div>
+    <div id="quality" aria-label="场景质量"></div>
+    <div id="viewTools" aria-label="视图控制">
+      <button id="zoomIn" title="放大" aria-label="放大">＋</button>
+      <button id="zoomOut" title="缩小" aria-label="缩小">－</button>
+      <button id="resetView" title="重置视图" aria-label="重置视图">⌂</button>
+    </div>
+    <button id="footerToggle" aria-label="显示或隐藏控制台">控</button>
     <div id="pvBadge"></div>
     <div id="pip"><span id="pipTag">镜头视窗</span></div>
     <div id="stmtPanel">
@@ -133,6 +209,26 @@ button.ghost.on{color:var(--gold);background:transparent;
         <span id="stmtStatus"></span>
       </div>
     </div>
+    <section id="inspector" aria-label="物体检查器">
+      <div class="inspector-head"><strong id="inspectorTitle">未选择物体</strong>
+        <button id="inspectorClose" aria-label="关闭检查器">×</button></div>
+      <div class="edit-grid">
+        <div class="edit-field"><label>X 米</label><input id="editX" type="number" step="0.1"></div>
+        <div class="edit-field"><label>Y 米</label><input id="editY" type="number" step="0.1"></div>
+        <div class="edit-field"><label>Z 米</label><input id="editZ" type="number" step="0.1"></div>
+        <div class="edit-field"><label>宽 米</label><input id="editW" type="number" min="0.01" step="0.1"></div>
+        <div class="edit-field"><label>高 米</label><input id="editH" type="number" min="0.01" step="0.1"></div>
+        <div class="edit-field"><label>深 米</label><input id="editD" type="number" min="0.01" step="0.1"></div>
+        <div class="edit-field"><label>朝向 °</label><input id="editYaw" type="number" step="5"></div>
+        <div class="edit-field"><label>安装方式</label><select id="editMount"><option value="">未声明</option><option value="floor">落地</option><option value="wall">墙装</option><option value="ceiling">吊装</option><option value="surface">台面</option></select></div>
+        <div class="edit-field"><label>支撑物</label><input id="editSupport" type="text" placeholder="地面/墙/物体ID"></div>
+      </div>
+      <p id="inspectorHint">真值模式只读；进入“修复预览”后才可编辑。未保存改动不会进入导出。</p>
+      <div class="row">
+        <button id="undoEdit" disabled>撤销</button><button id="redoEdit" disabled>重做</button>
+        <button id="saveEdits" disabled>保存修复</button><span id="saveStatus"></span>
+      </div>
+    </section>
     <div id="err"></div>
   </div>
   <footer>
@@ -160,6 +256,9 @@ button.ghost.on{color:var(--gold);background:transparent;
       <span class="row-label" style="margin-left:6px">模式</span>
       <button id="modeReal" class="on">写实</button>
       <button id="modeStructure">结构</button>
+      <span class="row-label" style="margin-left:6px">数据</span>
+      <button id="truthMode" class="on" aria-pressed="true">真值</button>
+      <button id="repairMode" class="ghost" aria-pressed="false">修复预览</button>
       <span class="row-label" style="margin-left:6px">显示</span>
       <button id="tPano" class="ghost on">全景</button>
       <button id="tControl" class="ghost" aria-pressed="false">控制标注</button>
@@ -180,6 +279,31 @@ const M4={
    for(let k=0;k<4;k++)s+=a[k*4+j]*b[i*4+k];o[i*4+j]=s}return o},
  persp:(fovy,asp,n,f)=>{const t=1/Math.tan(fovy/2);
   return [t/asp,0,0,0, 0,t,0,0, 0,0,(f+n)/(n-f),-1, 0,0,2*f*n/(n-f),0]},
+ inv:a=>{const o=new Array(16),
+  b00=a[0]*a[5]-a[1]*a[4],b01=a[0]*a[6]-a[2]*a[4],
+  b02=a[0]*a[7]-a[3]*a[4],b03=a[1]*a[6]-a[2]*a[5],
+  b04=a[1]*a[7]-a[3]*a[5],b05=a[2]*a[7]-a[3]*a[6],
+  b06=a[8]*a[13]-a[9]*a[12],b07=a[8]*a[14]-a[10]*a[12],
+  b08=a[8]*a[15]-a[11]*a[12],b09=a[9]*a[14]-a[10]*a[13],
+  b10=a[9]*a[15]-a[11]*a[13],b11=a[10]*a[15]-a[11]*a[14],
+  det=b00*b11-b01*b10+b02*b09+b03*b08-b04*b07+b05*b06;
+  if(!det)return null;const d=1/det;
+  o[0]=(a[5]*b11-a[6]*b10+a[7]*b09)*d;
+  o[1]=(-a[1]*b11+a[2]*b10-a[3]*b09)*d;
+  o[2]=(a[13]*b05-a[14]*b04+a[15]*b03)*d;
+  o[3]=(-a[9]*b05+a[10]*b04-a[11]*b03)*d;
+  o[4]=(-a[4]*b11+a[6]*b08-a[7]*b07)*d;
+  o[5]=(a[0]*b11-a[2]*b08+a[3]*b07)*d;
+  o[6]=(-a[12]*b05+a[14]*b02-a[15]*b01)*d;
+  o[7]=(a[8]*b05-a[10]*b02+a[11]*b01)*d;
+  o[8]=(a[4]*b10-a[5]*b08+a[7]*b06)*d;
+  o[9]=(-a[0]*b10+a[1]*b08-a[3]*b06)*d;
+  o[10]=(a[12]*b04-a[13]*b02+a[15]*b00)*d;
+  o[11]=(-a[8]*b04+a[9]*b02-a[11]*b00)*d;
+  o[12]=(-a[4]*b09+a[5]*b07-a[6]*b06)*d;
+  o[13]=(a[0]*b09-a[1]*b07+a[2]*b06)*d;
+  o[14]=(-a[12]*b03+a[13]*b01-a[14]*b00)*d;
+  o[15]=(a[8]*b03-a[9]*b01+a[10]*b00)*d;return o},
  look:(e,c,u)=>{const z=V.norm(V.sub(e,c)),x=V.norm(V.cross(u,z)),y=V.cross(z,x);
   return [x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0,
           -V.dot(x,e),-V.dot(y,e),-V.dot(z,e),1]}};
@@ -201,9 +325,23 @@ const gl=cv.getContext("webgl",{
 function fail(msg){errBox.style.display="grid";errBox.textContent=msg}
 function warn(messages,bad=false){
  const rows=(Array.isArray(messages)?messages:[messages]).filter(Boolean);
- notice.textContent=rows.join("\n");notice.style.whiteSpace="pre-line";
- notice.style.display=rows.length?"block":"none";
- notice.classList.toggle("bad",bad)}
+ notice.textContent="";notice.style.display=rows.length?"block":"none";
+ notice.classList.toggle("bad",bad);notice.classList.remove("expanded");
+ if(!rows.length)return;
+ const panel=document.createElement("details");panel.id="noticePanel";
+ const summary=document.createElement("summary");summary.id="noticeSummary";
+ const hasLocatable=rows.some(row=>row&&typeof row==="object"&&row.objectKey);
+ summary.textContent=rows.length===1&&!hasLocatable?String(rows[0].message||rows[0]):
+  `${rows.length} 项场景问题（点击展开）`;
+ panel.ontoggle=()=>notice.classList.toggle("expanded",panel.open);
+ panel.appendChild(summary);notice.appendChild(panel);
+ if(rows.length>1||hasLocatable){const details=document.createElement("div");details.id="noticeDetails";
+  rows.forEach(row=>{const item=document.createElement("button");
+   item.className="notice-item";item.textContent=String(row.message||row);
+   if(row&&typeof row==="object"&&row.objectKey){
+    item.classList.add("locatable");item.onclick=event=>{
+     event.stopPropagation();focusObject(row.objectKey)}}
+   details.appendChild(item)});panel.appendChild(details)}}
 if(!gl){fail("此浏览器不支持 WebGL,无法显示 3D 空间。")}
 
 // ---- 着色器:控制线、受光实体、透明阴影、全景房间 ----
@@ -316,7 +454,13 @@ function seedRng(key){let h=2166136261;const s=String(key);
 let DATA=null,SHOT=null,SCENE=null;
 let orbit={yaw:0.6,pitch:0.85,dist:11,target:[0,1,0]},mode="orbit";
 let displayMode="realistic";
+// 真值为默认且唯一可导出状态。repair 只在页面内预览显式修复；
+// A* 绕行、相机推出和贴脸家具剖切绝不污染原 blocking/scene_model。
+let previewMode="truth";
 const show={pano:true,path:true,frus:true,axis:true,control:false};
+const editState={selectedKey:"",location:"",edits:new Map(),undo:[],redo:[],revision:0,
+                 saving:false};
+let lastFrame=null;
 // 布景(sceneGeo)只在换场景/换模式时重建;人物与控制层(geo)逐帧重建。
 let sceneGeo={lit:null,litCount:0,shadow:null,shadowCount:0,
               lines:null,lineCount:0};
@@ -348,12 +492,31 @@ const finite=(value,fallback)=>Number.isFinite(Number(value))?Number(value):fall
 function locationEntry(group){
  const location=String((SCENE&&SCENE.location)||"");
  return ((DATA&&DATA[group])||{})[location]}
-function activeSceneModel(){
- const entry=locationEntry("scene_models");
+function sourceSceneModel(){
+ const normalized=locationEntry("scene_model_contracts"),
+       entry=normalized||locationEntry("scene_models");
  const model=entry&&(entry.model||entry.scene_model||entry.data||entry);
  if(model&&Array.isArray(model.objects))return model;
  const embedded=SCENE&&(SCENE.scene_model||SCENE.model);
  return embedded&&Array.isArray(embedded.objects)?embedded:{objects:[]}}
+function objectKey(obj,index=0){
+ return String(obj&&(
+  obj.object_id??obj.id??obj.name) || `scene-object-${index}`)}
+function previewObject(obj,index){
+ if(previewMode!=="repair"||editState.location!==String((SCENE&&SCENE.location)||""))
+  return obj;
+ const edit=editState.edits.get(objectKey(obj,index));
+ if(!edit)return obj;
+ return Object.assign({},obj,{
+  position_3d:Object.assign({},obj.position_3d||{},edit.position_3d||{}),
+  width_m:edit.width_m,height_m:edit.height_m,depth_m:edit.depth_m,
+  rotation_y_deg:edit.rotation_y_deg,mount_type:edit.mount_type,
+  support_id:edit.support_id,
+  __previewEdit:true})}
+function activeSceneModel(){
+ const model=sourceSceneModel();
+ if(previewMode!=="repair"||!editState.edits.size)return model;
+ return Object.assign({},model,{objects:(model.objects||[]).map(previewObject)})}
 function activeRenderContract(){
  const entry=locationEntry("render_contracts");
  return entry&&(entry.contract||entry.render_contract||entry.data||entry)||{}}
@@ -371,7 +534,7 @@ function materialFor(obj){
  const contract=activeRenderContract(),row=lookupContractObject(contract,obj);
  const raw=(row.material&&typeof row.material==="object"?row.material:row)||{};
  const own=(obj.material&&typeof obj.material==="object"?obj.material:{})||{};
- const category=String(obj.category||"furniture");
+ const category=String(obj.category||obj.semantic_category||"furniture");
  const defaults={
   furniture:{color:"#72543d",roughness:.66,metallic:.04},
   prop:{color:"#8b623d",roughness:.55,metallic:.12},
@@ -395,6 +558,12 @@ function renderContractObject(obj){
 function prefabFor(obj){
  const row=renderContractObject(obj),declared=row.render_prefab||obj.render_prefab;
  if(declared&&declared.type)return declared;
+ const semantic=String(obj.semantic_type||"").split(".").pop(),
+       semanticTypes=new Set(["table","cabinet","lattice","doorway","door",
+        "curtain","column","chair","bed","lantern","brazier","vessel",
+        "paper","rug","plant","instrument","screen"]);
+ if(semanticTypes.has(semantic))return {type:semantic,source:"scene_model_v3",
+  confidence:{level:"high"}};
  const text=String(obj.name||"").toLowerCase(),rules=[
   ["lantern",["灯笼","宫灯","油灯","烛台","蜡烛"]],
   ["brazier",["香炉","熏炉","火盆","炉"]],
@@ -417,9 +586,10 @@ function prefabFor(obj){
   return {type,source:"semantic_name",confidence:{level:"high"}};
  const fallback={opening:"architectural_frame",light:"lantern",
   furniture:"generic_furniture",prop:"generic_prop",decor:"decor_panel"};
- return {type:fallback[String(obj.category||"")]||"generic_object",
+ return {type:fallback[String(obj.category||obj.semantic_category||"")]||"generic_object",
   source:"category_fallback",confidence:{level:"low"}}}
 function renderPlacementFor(obj){
+ if(obj&&obj.__previewEdit&&obj.position_3d)return obj.position_3d;
  const row=renderContractObject(obj),render=row.render_transform||{},
        position=render.position;
  if(position&&[position.x,position.y,position.z].every(
@@ -443,31 +613,59 @@ function lightingFor(){
                   contract.key_intensity??.78,.15,1.5)}}
 let renderStats={objects:0,invalid:0,defaultMaterials:0,
                  semanticPrefabs:0,fallbackPrefabs:0};
+function issueObjectKey(item,message){
+ const direct=item&&(item.object_id??item.object??item.name);
+ if(direct)return String(direct);
+ const text=String(message||"");
+ const objects=(sourceSceneModel().objects||[]);
+ const found=objects.find((obj,index)=>text.includes(String(obj.name||""))||
+  text.includes(String(obj.object_id||obj.id||"")));
+ return found?objectKey(found,objects.indexOf(found)):""}
+function lightingIsVerified(){
+ const contract=activeRenderContract(),light=contract&&(contract.lighting||
+  contract.light||contract.directional_light);
+ return Boolean(light&&typeof light==="object"&&
+  (light.verified===true||light.source||light.direction))}
+function updateQualityBadges(){
+ const box=document.getElementById("quality"),total=(sourceSceneModel().objects||[]).length,
+       geometry=renderStats.objects,
+       material=Math.max(0,renderStats.objects-renderStats.defaultMaterials),
+       items=[
+        [`几何 ${geometry}/${total}`,geometry===total&&total>0],
+        [`语义 ${renderStats.semanticPrefabs}/${renderStats.objects}`,
+         renderStats.semanticPrefabs===renderStats.objects&&renderStats.objects>0],
+        [`材质 ${material}/${renderStats.objects}`,
+         material===renderStats.objects&&renderStats.objects>0],
+        [lightingIsVerified()?"灯光 已验证":"灯光 未验证",lightingIsVerified()]];
+ box.textContent="";items.forEach(([textValue,ok])=>{const badge=document.createElement("span");
+  badge.className="quality-badge "+(ok?"ok":"warn");badge.textContent=textValue;
+  box.appendChild(badge)})}
 function updateSceneStatus(extra=[]){
- const rows=[...extra],modelEntry=locationEntry("scene_models"),
+ const rows=[...extra].map(item=>typeof item==="object"?item:{message:String(item)}),
+       modelEntry=locationEntry("scene_model_contracts")||locationEntry("scene_models"),
        renderEntry=locationEntry("render_contracts"),model=activeSceneModel();
- if(!model.objects.length)rows.push(
+ const add=message=>rows.push({message});
+ if(!model.objects.length)add(
   "本场没有可用的三维场景模型：仅显示全景房间与人物，请先生成 scene_model。");
  if(modelEntry&&(modelEntry.error||modelEntry.message))
-  rows.push("三维模型失败："+(modelEntry.error||modelEntry.message));
- if(!renderEntry)rows.push("本场没有材质渲染合同，已使用安全默认材质与灯光。");
+  add("三维模型失败："+(modelEntry.error||modelEntry.message));
+ if(!renderEntry)add("本场没有材质渲染合同，已使用安全默认材质与灯光。");
  else if(renderEntry.error||renderEntry.message)
-  rows.push("写实渲染合同异常："+(renderEntry.error||renderEntry.message));
+  add("写实渲染合同异常："+(renderEntry.error||renderEntry.message));
  const contractWarnings=renderEntry&&Array.isArray(renderEntry.warnings)?
   renderEntry.warnings.filter(item=>item&&item.message):[];
  if(contractWarnings.length){
-  rows.push(`本场有 ${contractWarnings.length} 项搭景数据尚未验证。`);
-  contractWarnings.slice(0,2).forEach(item=>rows.push(item.message));
-  if(contractWarnings.length>2)rows.push("其余问题请回到场景模型中补充实测数据。");}
- if(renderStats.invalid)rows.push(`已跳过 ${renderStats.invalid} 件坐标或尺寸无效的物体。`);
+  contractWarnings.forEach(item=>rows.push({message:item.message,
+   objectKey:issueObjectKey(item,item.message)}))}
+ if(renderStats.invalid)add(`已跳过 ${renderStats.invalid} 件坐标或尺寸无效的物体。`);
  if(renderStats.defaultMaterials&&renderEntry)
-  rows.push(`${renderStats.defaultMaterials} 件物体缺少材质，已使用分类默认值。`);
+  add(`${renderStats.defaultMaterials} 件物体缺少材质，已使用分类默认值。`);
  if(renderStats.fallbackPrefabs)
-  rows.push(`${renderStats.fallbackPrefabs} 件未知物体仍使用低置信占位体；`+
-            "不会把占位形状当成真实物件提交给生成模型。");
+  add(`${renderStats.fallbackPrefabs} 件未知物体仍使用低置信占位体；`+
+      "不会把占位形状当成真实物件提交给生成模型。");
  const pano=((DATA&&DATA.panoramas)||{})[String((SCENE&&SCENE.location)||"")];
- if(!pano)rows.push("本场没有全景母版：已使用中性写实房壳作为背景。");
- warn(rows,Boolean(modelEntry&&modelEntry.error))}
+ if(!pano)add("本场没有全景母版：已使用中性写实房壳作为背景。");
+ updateQualityBadges();warn(rows,Boolean(modelEntry&&modelEntry.error))}
 
 // ---- 通行导航:人物与机位绕开实体布景 ----
 // 只影响预演的运动表现;blocking 数据里的起终点、机位端点一律不改。
@@ -554,6 +752,22 @@ function routePath(obs,a,b,r){
  const pts=pts2.map((q,i)=>{const f=len>0?cum[i]/len:0;
   return [q[0],a[1]+(b[1]-a[1])*f,q[1]]});
  return {pts,cum,len}}
+function measuredPath(points){
+ const clean=(points||[]).map(point=>P(point)).filter(point=>
+  point.every(value=>Number.isFinite(value))),cum=[0];
+ if(!clean.length)clean.push([0,0,0]);
+ let len=0;for(let i=1;i<clean.length;i++){
+  len+=V.len(V.sub(clean[i],clean[i-1]));cum.push(len)}
+ return {pts:clean,cum,len}}
+function contractRoutePath(owner,start,end){
+ // 真值模式只消费合同里的 route_3d；缺失时才连接原始起终点。
+ // 不调用 A*、不改端点，也不自创中间拐点。
+ const route=Array.isArray(owner&&owner.route_3d)?owner.route_3d:[];
+ const points=route.length?route.map(point=>P(point)):[];
+ const same=(a,b)=>V.len(V.sub(a,b))<1e-5;
+ if(!points.length||!same(points[0],start))points.unshift(start);
+ if(!same(points[points.length-1],end))points.push(end);
+ return measuredPath(points)}
 function pathPoint(path,f){
  const pts=path.pts;
  if(pts.length<2||path.len<=0)
@@ -581,17 +795,20 @@ function resolveEye(p){
  return [px,py,pz]}
 function ensureNav(){
  const key=(SHOT?String(SHOT.shot_no):"-")+"@"+
-  String((SCENE&&SCENE.location)||"")+"#"+OBSTACLES.length;
+  String((SCENE&&SCENE.location)||"")+"#"+OBSTACLES.length+"#"+previewMode;
  if(NAV.key===key)return;
  NAV.key=key;NAV.actors=[];NAV.cam=null;
  if(!SHOT)return;
  (SHOT.actors||[]).forEach((a,i)=>{
-  NAV.actors[i]=routePath(OBSTACLES,P(a.start_3d),P(a.end_3d),.26)});
+  const start=P(a.start_3d),end=P(a.end_3d||a.start_3d);
+  NAV.actors[i]=previewMode==="repair"?
+   routePath(OBSTACLES,start,end,.26):contractRoutePath(a,start,end)});
  const cam=SHOT.camera||{},e0=P(cam.start_3d,1.55),
        e1=P(cam.end_3d||cam.start_3d,1.55),
        lowY=Math.min(e0[1],e1[1]),
        camObs=OBSTACLES.filter(o=>o.y1>lowY-.15);
- NAV.cam=routePath(camObs,e0,e1,.35)}
+ NAV.cam=previewMode==="repair"?routePath(camObs,e0,e1,.35):
+  contractRoutePath(cam,e0,e1)}
 
 // ---- 网格工具箱:静态布景与动态人物共用的几何生成器 ----
 function meshKit(){
@@ -652,6 +869,16 @@ function meshKit(){
   if("pts" in target){refill(target,"pts",PT);target.ptCount=PT.length/6}}
  return {L,PT,LIT,SHADOW,push,litVertex,tri,face,addBox,addRound,
          shadowEllipse,upload}}
+function addSelectionWire(kit,x,y,z,width,height,depth,yawDeg){
+ const yaw=yawDeg*Math.PI/180,co=Math.cos(yaw),si=Math.sin(yaw),
+       w=width/2,d=depth/2,col=[1,.72,.16],
+       point=(lx,yy,lz)=>[x+lx*co+lz*si,yy,z-lx*si+lz*co],
+       v=[point(-w,y,-d),point(w,y,-d),point(w,y,d),point(-w,y,d),
+          point(-w,y+height,-d),point(w,y+height,-d),
+          point(w,y+height,d),point(-w,y+height,d)],
+       pairs=[[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],
+              [0,4],[1,5],[2,6],[3,7]];
+ pairs.forEach(pair=>kit.push(v[pair[0]],v[pair[1]],col))}
 // ---- 语义预制件:按名称与类别把包围盒长成可辨认的国风陈设 ----
 function addScenePrefab(kit,prefab,name,x,y,z,width,height,depth,yaw,m,edges){
  const {addBox,addRound,push}=kit,
@@ -1069,7 +1296,7 @@ function buildSceneGeometry(){
               semanticPrefabs:0,fallbackPrefabs:0};
  OBSTACLES=[];NAV.key=null;NAV.room={fw,fd,fh};
  const ranges=[];
- for(const obj of model.objects||[]){
+ for(const [objIndex,obj] of (model.objects||[]).entries()){
   if(!obj||typeof obj!=="object"){renderStats.invalid++;continue}
   const transform=obj.transform||{},bounds=obj.bounds||{},
         rawPos=renderPlacementFor(obj);
@@ -1081,16 +1308,19 @@ function buildSceneGeometry(){
         depth=Math.max(.08,finite(obj.depth_m??obj.depth??bounds.depth_m??bounds.depth,
                                   Math.min(width*.55,.8))),
         yaw=finite(obj.rotation_y_deg??transform.rotation_y_deg??transform.yaw_deg,0),
-        material=materialFor(obj),prefab=prefabFor(obj);
+        material=materialFor(obj),prefab=prefabFor(obj),key=objectKey(obj,objIndex);
   renderStats.objects++;if(material.usedDefault)renderStats.defaultMaterials++;
   if(prefab.source==="category_fallback")renderStats.fallbackPrefabs++;
   else renderStats.semanticPrefabs++;
   const litStart=kit.LIT.length/13;
   addScenePrefab(kit,prefab,obj.name||"",x,y,z,width,height,depth,yaw,
                  material,structure);
+  if(key===editState.selectedKey)
+   addSelectionWire(kit,x,y,z,width,height,depth,yaw);
   // 逐物件区段:镜头视角跳过贴脸遮挡物;通行障碍供人物/机位绕行。
   const rad=yaw*Math.PI/180;
-  ranges.push({start:litStart,count:kit.LIT.length/13-litStart,
+  ranges.push({start:litStart,count:kit.LIT.length/13-litStart,key,obj,
+   width,height,depth,yaw,
    ob:{x,z,hw:width/2,hd:depth/2,co:Math.cos(rad),si:Math.sin(rad),
        y0:y,y1:y+height}});
   const block=obstacleFrom(x,y,z,width,height,depth,yaw,prefab.type);
@@ -1105,6 +1335,23 @@ function buildSceneGeometry(){
  sceneGeo.ranges=ranges}
 
 // 动态层:人物/路线/机位/视锥,预演播放时逐帧重建。
+function contractFacingYaw(actor,position,u){
+ const start=actor.facing_start_yaw_deg??actor.facing_yaw_deg??
+  actor.rotation_y_deg??actor.facing_start,
+       end=actor.facing_end_yaw_deg??actor.facing_yaw_deg??
+  actor.rotation_y_deg??actor.facing_end;
+ if(Number.isFinite(Number(start))||Number.isFinite(Number(end))){
+  const a=finite(start,finite(end,0)),b=finite(end,a);return a+(b-a)*u}
+ const text=String((u>.5?actor.facing_end:actor.facing_start)||actor.facing||"");
+ const targetIndex=(SHOT&&SHOT.actors||[]).findIndex(other=>other!==actor&&
+  text.includes(String(other.name||other.display_label||"")));
+ if(targetIndex>=0){const nav=NAV.actors[targetIndex],target=nav?
+   pathPoint(nav,u).p:P(SHOT.actors[targetIndex].start_3d);
+  return Math.atan2(target[0]-position[0],target[2]-position[2])*180/Math.PI}
+ if(/东|右/.test(text))return 90;if(/西|左/.test(text))return -90;
+ if(/南|后/.test(text))return 180;if(/北|前/.test(text))return 0;
+ const degrees=text.match(/(-?\d+(?:\.\d+)?)\s*度/);
+ return degrees?Number(degrees[1]):0}
 function buildGeometry(silent){
  const kit=meshKit(),{push,PT,shadowEllipse}=kit,
        structure=displayMode==="structure";
@@ -1133,9 +1380,10 @@ function buildGeometry(silent){
   const bob=(PV.active&&walking&&uMove>0&&uMove<1)?
    Math.abs(Math.sin(uMove*nav.len*3.4))*.012*h0:0;
   // 朝向:移动时朝当前路段方向,静止时面向机位(演员向镜头打开)。
-  const yawA=dir&&Math.hypot(dir[0],dir[1])>.01?
-   Math.atan2(dir[0],dir[1])*180/Math.PI:
-   Math.atan2(camEye[0]-s[0],camEye[2]-s[2])*180/Math.PI;
+  const yawA=previewMode==="truth"?contractFacingYaw(a,s,uMove):
+   (dir&&Math.hypot(dir[0],dir[1])>.01?
+    Math.atan2(dir[0],dir[1])*180/Math.PI:
+    Math.atan2(camEye[0]-s[0],camEye[2]-s[2])*180/Math.PI);
   if(structure)stickman(kit,s[0],s[1],s[2],h0,col);
   else{addActorSolid(kit,s[0],s[1]+bob,s[2],h0,col,yawA);
    shadowEllipse(s[0],s[2],.17*h0,.13*h0,.03,.02,.26)}
@@ -1157,7 +1405,7 @@ function buildGeometry(silent){
         te=P(cam.target_end_3d||cam.target_3d||cam.target_start_3d,1.2),
         csRaw=PV.active&&NAV.cam&&NAV.cam.len>.05?
          pathPoint(NAV.cam,PV.u).p:(PV.active?lerp3(cs0,ce,PV.u):cs0),
-        cs=resolveEye(csRaw),
+        cs=previewMode==="repair"?resolveEye(csRaw):csRaw,
         tg=PV.active?lerp3(ts,te,PV.u):P(cam.target_3d||cam.target_start_3d,1.2),
         camCol=[.85,.64,.26];
   push([cs[0],0,cs[2]],[cs[0],cs[1],cs[2]],V.scale(camCol,.5));
@@ -1191,7 +1439,7 @@ function shotCam(asp){
        t1=P(cam.target_end_3d||cam.target_3d||cam.target_start_3d,1.2),
        eRaw=PV.active&&NAV.cam&&NAV.cam.len>.05?
         pathPoint(NAV.cam,PV.u).p:(PV.active?lerp3(e0,e1,PV.u):e0),
-       e=resolveEye(eRaw),
+       e=previewMode==="repair"?resolveEye(eRaw):eRaw,
        t=PV.active?lerp3(t0,t1,PV.u):P(cam.target_3d||cam.target_start_3d,1.2),
        vf=(Number(cam.vertical_fov_degrees)||
            (Number(cam.fov_degrees)||46)*16/9)*Math.PI/180;
@@ -1245,10 +1493,11 @@ function drawLabels(mvp){
       `<b>${escapeHtml(obj.name||obj.object_id||"场景物体")}</b>`,"obj")}}
 
 function renderScene(view,proj,eye,lens){
- // lens=镜头视角(本镜/画中画):贴脸的布景物件整段跳绘,
- // 镜头不再被柜体桌板吞掉画面;环视(导演外部视角)从不隐藏。
+ // 真值模式绝不隐藏家具。只有用户明确进入“修复预览”后，才允许
+ // 临时剖切吞没镜头的近物；该预览不能直接进入导出。
  const mvp=M4.mul(proj,view);
- const nearHidden=(lens&&sceneGeo.ranges)?sceneGeo.ranges.filter(rg=>{
+ const nearHidden=(previewMode==="repair"&&lens&&sceneGeo.ranges)?
+ sceneGeo.ranges.filter(rg=>{
   const o=rg.ob,[lx,lz]=obLocal(o,eye[0],eye[2]);
   return Math.abs(lx)<=o.hw+.42&&Math.abs(lz)<=o.hd+.42&&
          eye[1]>=o.y0-.1&&eye[1]<=o.y1+.3}):[];
@@ -1353,6 +1602,7 @@ function draw(now){
  gl.viewport(0,0,cv.width,cv.height);
  const main=camMatrices(),
        mvp=renderScene(main.view,main.proj,main.eye,mode==="shot");
+ lastFrame={mvp,eye:main.eye};
  // 双视窗:环视时叠加"镜头所见"画中画,运镜表达直接可见
  const showPip=previz.on&&mode==="orbit"&&SHOT;
  if(showPip){
@@ -1372,8 +1622,8 @@ function draw(now){
  const viewText=mode==="shot"
   ? `本镜机位 · fov ${(Number((SHOT&&SHOT.camera||{}).fov_degrees)||0).toFixed(0)}°`
   : `环视 · ${orbit.dist.toFixed(1)}m`;
- hud.textContent=`${displayMode==="realistic"?"写实":"结构"} · ${viewText}`+
-  ` · 真实物件 ${renderStats.semanticPrefabs}/${renderStats.objects}`;
+ hud.textContent=`${displayMode==="realistic"?"写实":"结构"} · `+
+  `${previewMode==="truth"?"真值":"修复预览"} · ${viewText}`;
  requestAnimationFrame(draw)}
 
 // ---- 动态预演:播放引擎 ----
@@ -1515,18 +1765,178 @@ document.getElementById("stmtSave").onclick=async()=>{
  }catch(e){stmtStatus.textContent="保存失败:"+e.message}};
 
 // ---- 交互 ----
-let drag=null;
-cv.addEventListener("pointerdown",e=>{drag={x:e.clientX,y:e.clientY};
- cv.classList.add("drag");cv.setPointerCapture(e.pointerId)});
-cv.addEventListener("pointermove",e=>{if(!drag)return;
- if(mode!=="orbit"){setMode("orbit")}
- orbit.yaw-=(e.clientX-drag.x)*0.006;
- orbit.pitch=Math.max(0.05,Math.min(1.5,orbit.pitch+(e.clientY-drag.y)*0.005));
- drag={x:e.clientX,y:e.clientY}});
-cv.addEventListener("pointerup",()=>{drag=null;cv.classList.remove("drag")});
-cv.addEventListener("wheel",e=>{e.preventDefault();
- orbit.dist=Math.max(2,Math.min(30,orbit.dist+e.deltaY*0.01));
- if(mode!=="orbit")setMode("orbit")},{passive:false});
+function unprojectPoint(x,y,z,inverse){
+ const w=inverse[3]*x+inverse[7]*y+inverse[11]*z+inverse[15];
+ if(Math.abs(w)<1e-8)return null;
+ return [(inverse[0]*x+inverse[4]*y+inverse[8]*z+inverse[12])/w,
+         (inverse[1]*x+inverse[5]*y+inverse[9]*z+inverse[13])/w,
+         (inverse[2]*x+inverse[6]*y+inverse[10]*z+inverse[14])/w]}
+function rayRangeDistance(origin,direction,range){
+ const o=range.ob,[ox,oz]=obLocal(o,origin[0],origin[2]),
+       dx=direction[0]*o.co-direction[2]*o.si,
+       dz=direction[0]*o.si+direction[2]*o.co,
+       localO=[ox,origin[1],oz],localD=[dx,direction[1],dz],
+       mins=[-o.hw,o.y0,-o.hd],maxs=[o.hw,o.y1,o.hd];
+ let near=0,far=Infinity;
+ for(let axis=0;axis<3;axis++){
+  if(Math.abs(localD[axis])<1e-8){
+   if(localO[axis]<mins[axis]||localO[axis]>maxs[axis])return Infinity;
+   continue}
+  let a=(mins[axis]-localO[axis])/localD[axis],
+      b=(maxs[axis]-localO[axis])/localD[axis];
+  if(a>b){const swap=a;a=b;b=swap}near=Math.max(near,a);far=Math.min(far,b);
+  if(near>far)return Infinity}
+ return far>=0?near:Infinity}
+function pickObject(clientX,clientY){
+ if(!lastFrame||!sceneGeo.ranges)return null;
+ const rect=cv.getBoundingClientRect(),x=(clientX-rect.left)/rect.width*2-1,
+       y=1-(clientY-rect.top)/rect.height*2,inv=M4.inv(lastFrame.mvp);
+ if(!inv)return null;
+ const near=unprojectPoint(x,y,-1,inv),far=unprojectPoint(x,y,1,inv);
+ if(!near||!far)return null;const direction=V.norm(V.sub(far,near));
+ let best=null,distance=Infinity;
+ for(const range of sceneGeo.ranges){const hit=rayRangeDistance(near,direction,range);
+  if(hit<distance){distance=hit;best=range}}
+ return best}
+function panOrbit(dx,dy){
+ const scale=orbit.dist*.0025,right=[Math.cos(orbit.yaw),0,-Math.sin(orbit.yaw)],
+       forward=[Math.sin(orbit.yaw),0,Math.cos(orbit.yaw)];
+ orbit.target=V.add(orbit.target,V.add(V.scale(right,-dx*scale),
+                                      V.scale(forward,dy*scale)))}
+function adjustZoom(factor){
+ if(mode!=="orbit")return;
+ orbit.dist=Math.max(2,Math.min(30,orbit.dist*factor))}
+function resetOrbit(){
+ orbit={yaw:.6,pitch:.85,dist:11,target:[0,1,0]};
+ if(SHOT){const target=P((SHOT.camera||{}).target_3d,1.2);
+  orbit.target=[target[0],1,target[2]]}}
+const pointers=new Map();let gesture=null;
+function gestureMetrics(){const values=[...pointers.values()];
+ if(values.length<2)return null;const a=values[0],b=values[1];
+ return {x:(a.x+b.x)/2,y:(a.y+b.y)/2,
+  distance:Math.hypot(a.x-b.x,a.y-b.y)}}
+cv.addEventListener("pointerdown",event=>{
+ pointers.set(event.pointerId,{x:event.clientX,y:event.clientY,startX:event.clientX,
+  startY:event.clientY,moved:false,button:event.button,pan:event.shiftKey||event.button===2});
+ cv.setPointerCapture(event.pointerId);cv.classList.add("drag");
+ gesture=pointers.size>=2?gestureMetrics():null});
+cv.addEventListener("pointermove",event=>{
+ const point=pointers.get(event.pointerId);if(!point)return;
+ const previous={x:point.x,y:point.y};point.x=event.clientX;point.y=event.clientY;
+ if(Math.hypot(point.x-point.startX,point.y-point.startY)>5)point.moved=true;
+ if(pointers.size>=2){const current=gestureMetrics();
+  if(gesture&&current&&mode==="orbit"){
+   adjustZoom(gesture.distance/Math.max(1,current.distance));
+   panOrbit(current.x-gesture.x,current.y-gesture.y)}
+  gesture=current;return}
+ if(mode!=="orbit")return;
+ if(point.pan)panOrbit(point.x-previous.x,point.y-previous.y);
+ else{orbit.yaw-=(point.x-previous.x)*.006;
+  orbit.pitch=Math.max(.05,Math.min(1.5,
+   orbit.pitch+(point.y-previous.y)*.005))}});
+function finishPointer(event){
+ const point=pointers.get(event.pointerId);pointers.delete(event.pointerId);
+ gesture=pointers.size>=2?gestureMetrics():null;
+ if(!pointers.size)cv.classList.remove("drag");
+ if(point&&!point.moved&&!point.pan&&event.button!==2){
+  const hit=pickObject(event.clientX,event.clientY);
+  if(hit)focusObject(hit.key)}}
+cv.addEventListener("pointerup",finishPointer);
+cv.addEventListener("pointercancel",finishPointer);
+cv.addEventListener("contextmenu",event=>event.preventDefault());
+cv.addEventListener("wheel",event=>{event.preventDefault();
+ adjustZoom(Math.exp(event.deltaY*.001))},{passive:false});
+document.getElementById("zoomIn").onclick=()=>adjustZoom(.82);
+document.getElementById("zoomOut").onclick=()=>adjustZoom(1.22);
+document.getElementById("resetView").onclick=resetOrbit;
+document.getElementById("footerToggle").onclick=()=>
+ document.body.classList.toggle("footer-collapsed");
+
+const EDIT_INPUTS={x:"editX",y:"editY",z:"editZ",width_m:"editW",
+ height_m:"editH",depth_m:"editD",rotation_y_deg:"editYaw",
+ mount_type:"editMount",support_id:"editSupport"};
+function sourceObjectByKey(key){const objects=sourceSceneModel().objects||[];
+ const index=objects.findIndex((obj,i)=>objectKey(obj,i)===String(key));
+ return index>=0?{obj:objects[index],index}:null}
+function editRecordFor(key){
+ const found=sourceObjectByKey(key);if(!found)return null;
+ const obj=found.obj,transform=obj.transform||{},bounds=obj.bounds||{},
+       pos=renderPlacementFor(obj)||{};
+ return {object_id:String(obj.object_id??obj.id??objectKey(obj,found.index)),
+  name:String(obj.name||""),position_3d:{x:finite(pos.x,0),y:finite(pos.y,0),z:finite(pos.z,0)},
+  width_m:Math.max(.01,finite(obj.width_m??obj.width??bounds.width_m??bounds.width,.6)),
+  height_m:Math.max(.01,finite(obj.height_m??obj.height??bounds.height_m??bounds.height,.8)),
+  depth_m:Math.max(.01,finite(obj.depth_m??obj.depth??bounds.depth_m??bounds.depth,.6)),
+  rotation_y_deg:finite(obj.rotation_y_deg??transform.rotation_y_deg??transform.yaw_deg,0),
+  mount_type:String(obj.mount_type??obj.mount??""),
+  support_id:String(obj.support_id??obj.support??"")}}
+function selectedEdit(){
+ return editState.edits.get(editState.selectedKey)||editRecordFor(editState.selectedKey)}
+function fillInspector(){
+ const found=sourceObjectByKey(editState.selectedKey),panel=document.getElementById("inspector");
+ panel.classList.toggle("show",Boolean(found));if(!found)return;
+ const value=selectedEdit();document.getElementById("inspectorTitle").textContent=
+  found.obj.name||found.obj.object_id||"场景物体";
+ const values={x:value.position_3d.x,y:value.position_3d.y,z:value.position_3d.z,
+  width_m:value.width_m,height_m:value.height_m,depth_m:value.depth_m,
+  rotation_y_deg:value.rotation_y_deg,mount_type:value.mount_type,
+  support_id:value.support_id};
+ for(const [key,id] of Object.entries(EDIT_INPUTS)){
+  const input=document.getElementById(id);input.value=values[key]??"";
+  input.disabled=previewMode!=="repair"}
+ document.getElementById("inspectorHint").textContent=previewMode==="repair"?
+  "修复预览正在使用本地改动；保存成功后才成为新真值。":"真值模式只读；进入“修复预览”后才可编辑。";
+ syncEditButtons()}
+function focusObject(key){
+ const found=sourceObjectByKey(key);if(!found)return;
+ const location=String((SCENE&&SCENE.location)||"");
+ if(editState.edits.size&&editState.location&&editState.location!==location){
+  warn("另一场景仍有未保存修复，请返回该场景保存后再编辑。",true);return}
+ editState.location=location;
+ editState.selectedKey=String(key);const pos=renderPlacementFor(found.obj)||{};
+ orbit.target=[finite(pos.x,0),Math.max(.5,finite(pos.y,0)+
+  finite(found.obj.height_m??found.obj.height,.8)/2),finite(pos.z,0)];
+ setMode("orbit");fillInspector();buildSceneGeometry();buildGeometry()}
+function syncEditButtons(){
+ document.getElementById("undoEdit").disabled=!editState.undo.length||editState.saving;
+ document.getElementById("redoEdit").disabled=!editState.redo.length||editState.saving;
+ document.getElementById("saveEdits").disabled=previewMode!=="repair"||
+  !editState.edits.size||editState.saving}
+function applyHistory(entry,forward){
+ const value=forward?entry.after:entry.before;
+ if(value)editState.edits.set(entry.key,structuredClone(value));
+ else editState.edits.delete(entry.key);
+ fillInspector();buildSceneGeometry();buildGeometry();syncPreviewBadge()}
+function readInspectorEdit(){
+ const current=selectedEdit();if(!current)return null;
+ const number=id=>Number(document.getElementById(id).value);
+ return Object.assign({},current,{position_3d:{x:number("editX"),y:number("editY"),
+  z:number("editZ")},width_m:Math.max(.01,number("editW")),
+  height_m:Math.max(.01,number("editH")),depth_m:Math.max(.01,number("editD")),
+  rotation_y_deg:number("editYaw"),mount_type:document.getElementById("editMount").value,
+  support_id:document.getElementById("editSupport").value.trim()})}
+Object.values(EDIT_INPUTS).forEach(id=>document.getElementById(id).addEventListener("input",event=>{
+ if(previewMode!=="repair"||!editState.selectedKey)return;
+ const before=editState.edits.has(editState.selectedKey)?
+  structuredClone(editState.edits.get(editState.selectedKey)):null,
+       after=readInspectorEdit();
+ if(!after||[after.position_3d.x,after.position_3d.y,after.position_3d.z,
+  after.width_m,after.height_m,after.depth_m,after.rotation_y_deg].some(
+   value=>!Number.isFinite(value)))return;
+ editState.edits.set(editState.selectedKey,after);
+ const prior=editState.undo[editState.undo.length-1];
+ if(prior&&prior.key===editState.selectedKey&&prior.field===event.target.id)
+  prior.after=structuredClone(after);
+ else editState.undo.push({key:editState.selectedKey,field:event.target.id,
+  before,after:structuredClone(after)});
+ editState.redo=[];syncEditButtons();syncPreviewBadge();buildSceneGeometry();buildGeometry()}));
+document.getElementById("undoEdit").onclick=()=>{const entry=editState.undo.pop();
+ if(!entry)return;editState.redo.push(entry);applyHistory(entry,false)};
+document.getElementById("redoEdit").onclick=()=>{const entry=editState.redo.pop();
+ if(!entry)return;editState.undo.push(entry);applyHistory(entry,true)};
+document.getElementById("inspectorClose").onclick=()=>{
+ editState.selectedKey="";document.getElementById("inspector").classList.remove("show");
+ buildSceneGeometry();buildGeometry()};
 
 function setMode(m){mode=m;
  document.getElementById("orbit").classList.toggle("on",m==="orbit");
@@ -1543,10 +1953,25 @@ function syncDisplayControls(){
  for(const [id,key] of [["tPath","path"],["tFrus","frus"],["tAxis","axis"]]){
   const item=document.getElementById(id);item.disabled=!show.control;
   item.classList.toggle("on",show.control&&show[key])}}
+function syncPreviewBadge(){
+ const badge=document.getElementById("previewBadge"),repair=previewMode==="repair";
+ badge.style.display=repair?"block":"none";
+ badge.textContent=repair?`修复预览 · ${editState.edits.size} 项未保存 · 不进入导出`:"";
+ const truth=document.getElementById("truthMode"),preview=document.getElementById("repairMode");
+ truth.classList.toggle("on",!repair);preview.classList.toggle("on",repair);
+ truth.setAttribute("aria-pressed",String(!repair));preview.setAttribute("aria-pressed",String(repair));
+ document.getElementById("exportPng").disabled=repair;syncEditButtons();fillInspector()}
+function setPreviewMode(next){
+ previewMode=next==="repair"?"repair":"truth";NAV.key=null;
+ syncPreviewBadge();buildSceneGeometry();buildGeometry()}
+document.getElementById("truthMode").onclick=()=>setPreviewMode("truth");
+document.getElementById("repairMode").onclick=()=>setPreviewMode("repair");
 function setDisplayMode(next){
  displayMode=next==="structure"?"structure":"realistic";
- // 写实默认是干净导演视图；控制信息仍可由用户显式重新打开。
- if(displayMode==="realistic")show.control=false;
+ // 结构一键进入可读控制图；写实一键恢复干净导演视图。
+ if(displayMode==="structure"){
+  show.control=true;show.frus=true;show.axis=true}
+ else show.control=false;
  syncDisplayControls();buildSceneGeometry();buildGeometry()}
 document.getElementById("modeReal").onclick=()=>setDisplayMode("realistic");
 document.getElementById("modeStructure").onclick=()=>setDisplayMode("structure");
@@ -1556,11 +1981,72 @@ document.getElementById("modeStructure").onclick=()=>setDisplayMode("structure")
    buildGeometry()}});
 document.getElementById("tControl").onclick=()=>{
  show.control=!show.control;syncDisplayControls();buildGeometry()};
+function sceneRevisionEntry(){
+ const location=String((SCENE&&SCENE.location)||""),map=DATA&&DATA.scene_model_revisions||{},
+       entry=map[location]||{},model=sourceSceneModel();
+ return {revision:Number(entry.revision??model.revision??editState.revision??0),
+  physical_scene_id:entry.physical_scene_id??model.physical_scene_id??""}}
+function replaceSceneModel(model){
+ const location=String((SCENE&&SCENE.location)||"");
+ DATA.scene_model_contracts=DATA.scene_model_contracts||{};
+ DATA.scene_model_contracts[location]=model;
+ if(SCENE&&SCENE.location===location)SCENE.scene_model=model}
+function applySavedEditsToModel(model){
+ const edits=editState.edits;
+ return Object.assign({},model,{objects:(model.objects||[]).map((obj,index)=>{
+  const edit=edits.get(objectKey(obj,index));if(!edit)return obj;
+  return Object.assign({},obj,{position_3d:Object.assign({},edit.position_3d),
+   width_m:edit.width_m,height_m:edit.height_m,depth_m:edit.depth_m,
+   rotation_y_deg:edit.rotation_y_deg,mount_type:edit.mount_type,
+   support_id:edit.support_id})})})}
+async function sceneEditRequest(payload){
+ const url="/api/scene3d?episode="+encodeURIComponent(episode),options={
+  method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify(payload)};
+ let response=await fetch(url,options);
+ if(response.status===404||response.status===405){
+  response=await fetch(url,{method:"PATCH",headers:options.headers,
+   body:JSON.stringify({scene_location:payload.scene_location,
+    revision:payload.expected_revision,edits:payload.updates})})}
+ const textValue=await response.text();let data={};
+ try{data=textValue?JSON.parse(textValue):{}}catch(error){data={error:textValue}}
+ if(!response.ok){const conflict=response.status===409?
+   `版本冲突：当前 v${data.actual??"?"}，本页基于 v${data.expected??payload.expected_revision}`:
+   (data.error||data.message||String(response.status));
+  const failure=new Error(conflict);failure.status=response.status;throw failure}
+ return data}
+document.getElementById("saveEdits").onclick=async()=>{
+ if(previewMode!=="repair"||!editState.edits.size||editState.saving)return;
+ const location=String((SCENE&&SCENE.location)||""),revision=sceneRevisionEntry(),
+       status=document.getElementById("saveStatus"),updates=[...editState.edits.values()].map(edit=>({
+        object_id:edit.object_id,position_3d:edit.position_3d,width_m:edit.width_m,
+        height_m:edit.height_m,depth_m:edit.depth_m,rotation_y_deg:edit.rotation_y_deg,
+        support_id:edit.support_id||null,mount_type:edit.mount_type||null})),
+       payload={episode_id:Number(episode),scene_location:location,
+        physical_scene_id:revision.physical_scene_id,
+        expected_revision:revision.revision,updates};
+ editState.saving=true;status.textContent="保存中…";syncEditButtons();
+ try{const data=await sceneEditRequest(payload),base=sourceSceneModel(),
+   saved=data.model||data.scene_model||applySavedEditsToModel(base);
+  replaceSceneModel(saved);editState.revision=Number(data.revision??revision.revision+1);
+  DATA.scene_model_revisions=DATA.scene_model_revisions||{};
+  DATA.scene_model_revisions[location]=Object.assign({},
+   DATA.scene_model_revisions[location]||{},data,{revision:editState.revision,
+    physical_scene_id:data.physical_scene_id??revision.physical_scene_id});
+  if(data.render_contract){DATA.render_contracts=DATA.render_contracts||{};
+   DATA.render_contracts[location]=data.render_contract}
+  editState.edits.clear();editState.undo=[];editState.redo=[];editState.location="";
+  status.textContent=`已保存 v${editState.revision}`;setPreviewMode("truth")
+ }catch(error){status.textContent="保存失败："+error.message;warn(
+  [{message:"场景修复保存失败："+error.message,objectKey:editState.selectedKey}],true)
+ }finally{editState.saving=false;syncEditButtons()}};
 async function exportCleanPng(){
  const previousControl=show.control;
  const button=document.getElementById("exportPng"),saved={
   displayMode,path:show.path,frus:show.frus,axis:show.axis};
  let exportError="";
+ if(previewMode!=="truth"){
+  warn("修复预览未保存，不能进入导出。请先保存修复或切回真值。",true);return}
  button.disabled=true;button.textContent="正在导出…";
  try{
   displayMode="realistic";show.control=false;show.path=false;show.frus=false;
@@ -1588,13 +2074,19 @@ async function exportCleanPng(){
   if(exportError)warn(exportError,true)}}
 document.getElementById("exportPng").onclick=exportCleanPng;
 syncDisplayControls();
+syncPreviewBadge();
 
 function selectShot(no){
+ const previousLocation=String((SCENE&&SCENE.location)||"");
  const idx=(DATA.blocking||{}).shot_index||{};
  SHOT=idx[String(no)]||null;
  SCENE=((DATA.blocking||{}).scenes||[]).find(
    s=>Number(s.scene_no)===Number(SHOT&&SHOT.scene_no))||
    ((DATA.blocking||{}).scenes||[])[0]||null;
+ const nextLocation=String((SCENE&&SCENE.location)||"");
+ if(previousLocation&&previousLocation!==nextLocation){
+  editState.selectedKey="";document.getElementById("inspector").classList.remove("show");
+  if(editState.edits.size&&editState.location===previousLocation)setPreviewMode("truth")}
  const w=Object.assign({},activeSceneModel().room||{},(SCENE&&SCENE.world)||{});
  buildRoomBox(Number(w.floor_width_m)||10,Number(w.floor_depth_m)||7,
               Number(w.ceiling_height_m)||4.2);

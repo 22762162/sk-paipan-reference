@@ -116,8 +116,11 @@ from .spatial_blocking import (
     director_camera_issues,
     mark_spatial_reference_requirements,
     rebuild_actor_routes,
+    rebuild_camera_route,
+    repair_previz_routes,
     requires_spatial_reference,
     shot_blocking,
+    write_clean_scene_geometry_png,
     write_spatial_reference_pngs,
     write_spatial_svgs,
 )
@@ -677,7 +680,8 @@ IMAGE_ASSET_KINDS = {
     "character_art", "character_sheet", "scene_art", "character_candidate",
     "prop_candidate", "prop_identity",
     "image", "first_frame", "last_frame", "cover", "reference",
-    "spatial_blocking", "inner_persona",
+    "spatial_blocking", "spatial_scene_clean", "scene_view",
+    "inner_persona",
 }
 
 # ``fresh_assets`` 只隔离本集派生物，不碰项目级人物/场景母资产。后者在
@@ -685,7 +689,8 @@ IMAGE_ASSET_KINDS = {
 # 和交付物则必须先写删除墓碑，避免旧图仍作为资产中心“当前版本”被旁路
 # 选择器或人工检查页面误用。
 FRESH_EPISODE_DERIVED_KINDS = frozenset({
-    "image", "first_frame", "last_frame", "spatial_blocking", "video",
+    "image", "first_frame", "last_frame", "spatial_blocking",
+    "spatial_scene_clean", "scene_view", "video",
     "edit", "review_board", "cover", "clip", "title",
 })
 
@@ -3144,35 +3149,170 @@ class Director:
             == "equirectangular_360x180"
         )
 
-    def _scene_slice_for_shot(self, ctx, location, shot_no):
-        """本镜机位的全景切片(空间前置核心):失败一律静默返 ""。
+    def _spatial_scene_clean_row(self, ctx, location, shot_no):
+        """Build/register the clean, camera-matched set reference for a shot.
 
-        条件:该场景已有 720° 全景母版 + ctx.blocking 里有本镜三维机位
-        + ffmpeg 可用。切片缓存在 p{pid}/scenes/slices,同参数复用。
+        The annotated blocking PNG remains a movement-control document.  It
+        must never be mistaken for the room's visual appearance.  This asset
+        is the complementary geometric truth: a 9:16 camera-oriented top-down
+        render built directly from the authoritative scene-model boxes, with
+        no people, labels, arrows, grids or other previz annotations.
+
+        Its signature includes every spatial dependency.  Moving a wall or
+        furniture item, changing the solved camera, rebuilding the blocking
+        contract, or rebuilding its panorama-derived scene model creates a new
+        asset version instead of silently reusing a stale view.
         """
-        if ctx.get("fresh_assets"):
-            # A panorama from an earlier production cannot be sliced into a
-            # supposedly all-new rebuild.
-            return ""
-        if not self.config.get("defaults", "pano_slice", default=True):
-            return ""
         if not location or shot_no is None:
-            return ""
+            return None
         location = self._physical_scene_location(ctx, location)
         blocking = (ctx or {}).get("blocking") or {}
         block = (blocking.get("shot_index") or {}).get(str(int(shot_no)))
         if not block:
-            return ""
+            return None
+        project_id = ctx["project"]["id"]
+        model, model_row, model_stale, model_reason = (
+            self._scene_model_state(project_id, location))
+        if model is None or model_stale or model_row is None:
+            return None
+        camera = copy.deepcopy(block.get("camera") or {})
+        geometry_contract = {
+            "room": copy.deepcopy(model.get("room") or {}),
+            "objects": [{
+                key: copy.deepcopy(item.get(key))
+                for key in (
+                    "name", "category", "position_3d", "width_m",
+                    "height_m", "depth_m", "rotation_y_deg", "blocking")
+            } for item in (model.get("objects") or [])
+            if isinstance(item, dict)],
+        }
+        signature_contract = {
+            "schema": "aifos.spatial-scene-clean/v1",
+            "render_contract": "aifos.scene-render-contract/v1",
+            "physical_scene_id": location,
+            "shot_no": int(shot_no),
+            "blocking_source_fingerprint": str(
+                blocking.get("source_fingerprint") or ""),
+            "scene_model_fingerprint": str(
+                blocking.get("scene_model_fingerprint") or ""),
+            "blocking_schema": str(blocking.get("schema") or ""),
+            "camera": camera,
+            "scene_model_asset_id": (
+                int(model_row["id"]) if model_row is not None else 0),
+            "scene_model_asset_version": (
+                int(model_row["version"]) if model_row is not None else 0),
+            "scene_model_state": "ready",
+            "scene_model_file_sha256": self._file_sha256(model_row["uri"]),
+            "geometry": geometry_contract,
+            "output": {
+                "aspect": "9:16", "projection": "camera_oriented_topdown",
+                "people": 0, "readable_text": False, "annotations": False,
+            },
+        }
+        signature = self._stable_hash(signature_contract)
+        name = (
+            f"e{int(ctx['episode']['number']):03d}_"
+            f"shot{int(shot_no):03d}_scene_clean")
+        latest = self.assets.latest(
+            project_id, "spatial_scene_clean", name,
+            include_deleted=True)
+        latest_meta = self._asset_meta(latest)
+        latest_uri = str(latest["uri"] or "") if latest is not None else ""
+        if (latest is not None and not self.assets.is_deleted(latest)
+                and latest_meta.get("render_signature") == signature
+                and latest_uri and Path(latest_uri).exists()
+                and latest_meta.get("file_sha256")
+                == self._file_sha256(latest_uri)):
+            return latest
+
+        out_dir = (self.artifacts_root / f"p{project_id:03d}"
+                   / "scenes" / "spatial_scene_clean"
+                   / f"shot_{int(shot_no):03d}" / signature[:16])
+        uri = write_clean_scene_geometry_png(
+            model, block, out_dir / "scene_geometry_clean.png")
+        if not uri or not Path(uri).exists():
+            return None
+        meta = {
+            **signature_contract,
+            "render_signature": signature,
+            "file_sha256": self._file_sha256(uri),
+            "reference_role": "spatial_scene_clean",
+            "image_quality": "high",
+            "mandatory_for_generation": True,
+            "contains_people": False,
+            "contains_readable_text": False,
+            "contains_annotations": False,
+            "movement_control_asset_kind": "spatial_blocking",
+        }
+        return self.assets.register(
+            project_id, "spatial_scene_clean", name, uri=str(uri), meta=meta,
+            new_version=latest is not None)
+
+    def _scene_view_for_shot_row(self, ctx, location, shot_no):
+        """Register the clean panorama appearance slice as ``scene_view``."""
+        if ctx.get("fresh_assets"):
+            return None
+        if not self.config.get("defaults", "pano_slice", default=True):
+            return None
+        if not location or shot_no is None:
+            return None
+        location = self._physical_scene_location(ctx, location)
+        blocking = (ctx or {}).get("blocking") or {}
+        block = (blocking.get("shot_index") or {}).get(str(int(shot_no)))
+        if not block:
+            return None
         project_id = ctx["project"]["id"]
         pano = self._scene_view_row(
             project_id, location, self.SCENE_PANORAMA_KEY)
-        if pano is None or not pano["uri"] or not Path(pano["uri"]).exists():
-            return ""
-        if not self._panorama_projection_validated(pano):
-            return ""
+        if (pano is None or not pano["uri"] or not Path(pano["uri"]).exists()
+                or not self._panorama_projection_validated(pano)):
+            return None
+        contract = {
+            "schema": "aifos.scene-view/v1",
+            "physical_scene_id": location,
+            "shot_no": int(shot_no),
+            "camera": copy.deepcopy(block.get("camera") or {}),
+            "panorama_asset_id": int(pano["id"]),
+            "panorama_asset_version": int(pano["version"]),
+            "panorama_file_sha256": self._file_sha256(pano["uri"]),
+            "output": {"aspect": "9:16", "people": 0, "annotations": False},
+        }
+        signature = self._stable_hash(contract)
+        name = (
+            f"e{int(ctx['episode']['number']):03d}_"
+            f"shot{int(shot_no):03d}_scene_view")
+        latest = self.assets.latest(
+            project_id, "scene_view", name, include_deleted=True)
+        meta = self._asset_meta(latest)
+        uri = str(latest["uri"] or "") if latest is not None else ""
+        if (latest is not None and not self.assets.is_deleted(latest)
+                and meta.get("render_signature") == signature
+                and uri and Path(uri).exists()
+                and meta.get("file_sha256") == self._file_sha256(uri)):
+            return latest
         out_dir = (self.artifacts_root / f"p{project_id:03d}"
-                   / "scenes" / "slices")
-        return slice_for_block(pano["uri"], out_dir, block)
+                   / "scenes" / "scene_views"
+                   / f"shot_{int(shot_no):03d}" / signature[:16])
+        uri = slice_for_block(pano["uri"], out_dir, block)
+        if not uri or not Path(uri).exists():
+            return None
+        return self.assets.register(
+            project_id, "scene_view", name, uri=str(uri), meta={
+                **contract,
+                "render_signature": signature,
+                "file_sha256": self._file_sha256(uri),
+                "reference_role": "scene_view",
+                "image_quality": "high",
+                "contains_people": False,
+                "contains_readable_text": False,
+                "contains_annotations": False,
+                "canonical_scene_asset_id": int(pano["id"]),
+            }, new_version=latest is not None)
+
+    def _scene_slice_for_shot(self, ctx, location, shot_no):
+        """Compatibility wrapper returning the clean appearance-view URI."""
+        row = self._scene_view_for_shot_row(ctx, location, shot_no)
+        return str(row["uri"] or "") if row is not None else ""
 
     @staticmethod
     def _saved_scene_annotations(model):
@@ -3534,8 +3674,17 @@ class Director:
                             "location": location,
                         })
                     adjustments.extend(camera_adjustments)
-                    if camera_adjustments:
-                        camera = shot.get("camera") or {}
+                    camera = shot.get("camera") or {}
+                    route_adjustments = rebuild_camera_route(
+                        camera, model, scene.get("world"))
+                    for adjustment in route_adjustments:
+                        adjustment.update({
+                            "scene_no": scene.get("scene_no"),
+                            "shot_no": shot_no,
+                            "location": location,
+                        })
+                    adjustments.extend(route_adjustments)
+                    if camera_adjustments or route_adjustments:
                         if isinstance(camera.get("start_3d"), dict):
                             camera["start"] = canvas_from_world(
                                 camera["start_3d"], scene.get("world"))
@@ -13619,6 +13768,38 @@ class Director:
             "previz_issues"] = report["issues"]
         if report["passed"]:
             return {"issues": [], "repaired": 0}
+
+        # First repair geometry with the same deterministic boxes used by the
+        # validator.  This must happen before asking a writer model to rewrite
+        # narrative staging: most "camera/actor crosses furniture" failures
+        # are routing problems, not story problems.  Persist and revalidate so
+        # the viewer, keyframes and Seedance all consume the repaired route;
+        # a browser-only detour is explicitly not accepted as a fix.
+        deterministic = repair_previz_routes(blocking, models)
+        if deterministic:
+            validation = blocking.setdefault("validation", {})
+            validation.setdefault("scene_physics_adjustments", []).extend(
+                copy.deepcopy(deterministic))
+            write_spatial_svgs(blocking, ctx["out_root"] / "blocking")
+            write_spatial_reference_pngs(
+                blocking, ctx["out_root"] / "blocking" / "seedance")
+            repaired_report = previz_report(
+                blocking, ctx.get("storyboard"), models)
+            validation["previz_issues"] = repaired_report["issues"]
+            version = self.projects.save_document(
+                ctx["episode"]["id"], "blocking", blocking)
+            ctx["blocking"] = blocking
+            self.log.info(
+                "director",
+                f"时间维度预检失败后已确定性重算并持久化人物/机位路径 "
+                f"v{version}: {len(report['issues'])} → "
+                f"{len(repaired_report['issues'])} 条")
+            report = repaired_report
+            if report["passed"]:
+                return {
+                    "issues": [], "repaired": len(deterministic),
+                    "deterministic_repair": True,
+                }
         state = (ctx.get("storyboard") or {}).get(
             "previz_repair_state") or {}
         signature = self._stable_hash(report["issues"])
@@ -13917,6 +14098,9 @@ class Director:
                     "scene_no": block.get("scene_no"),
                     "image_quality": "high",
                     "mandatory_for_seedance": True,
+                    "reference_role": "movement_control",
+                    "contains_annotations": True,
+                    "forbid_visual_leakage": True,
                     "reason": block.get("spatial_reference_reason", ""),
                 })
         ctx["blocking"] = blocking
@@ -17067,8 +17251,16 @@ class Director:
             if not remember(canonical_uri):
                 raise AifosError(
                     f"镜头{shot_no or 0}的统一物理母场景无法进入参考图"
-                    "硬槽位；请拆分群像镜头，禁止用机位图代替母场景")
+                    "硬槽位；请拆分群像镜头")
+            clean_scene = self._spatial_scene_clean_row(
+                ctx, location, shot_no)
+            clean_uri = str(
+                clean_scene["uri"] or "") if clean_scene is not None else ""
             refs.update({
+                # Scene identity must remain the canonical project-level
+                # master. Camera-specific slices are composition aids only;
+                # promoting one to scene_ref makes adjacent shots appear to
+                # belong to different rooms and breaks checkpoint lineage.
                 "scene_ref": canonical_uri,
                 "canonical_scene_asset_id": int(canonical_scene["id"]),
                 "canonical_scene_asset_version": int(
@@ -17086,18 +17278,34 @@ class Director:
                 "uri": canonical_uri,
                 "reference_role": "scene",
                 "attach_to": location,
+                "canonical_scene_asset_id": int(canonical_scene["id"]),
+                "canonical_scene_asset_version": int(
+                    canonical_scene["version"]),
+                "mandatory": True,
             })
-
-            # Keep a camera-specific crop/view only as a lowest-priority
-            # additional reference.  It must never replace or displace the
-            # canonical root above.
+            # Camera view is optional and never replaces the canonical scene
+            # identity above. Prefer the deterministic panorama slice; if it
+            # cannot be produced, fall back to the closest static scene view.
             slice_uri = self._scene_slice_for_shot(ctx, location, shot_no)
+            # Empty slice falls through to _scene_view_reference below.
             if slice_uri and str(slice_uri) != canonical_uri:
+                scene_view_row = next((
+                    row for row in self.assets.active_list(
+                        project_id, kind="scene_view")
+                    if str(row["uri"] or "") == str(slice_uri)), None)
                 camera_scene_reference = {
-                    "asset_id": None,
-                    "kind": "scene_slice",
-                    "name": f"{location}::view:slice",
-                    "label": f"场景:{location}(本镜机位全景切片，仅限机位)",
+                    "asset_id": (
+                        scene_view_row["id"]
+                        if scene_view_row is not None else None),
+                    "version": (
+                        scene_view_row["version"]
+                        if scene_view_row is not None else None),
+                    "kind": "scene_view",
+                    "name": (
+                        scene_view_row["name"]
+                        if scene_view_row is not None
+                        else f"{location}::view:slice"),
+                    "label": f"场景:{location}(本镜机位切片，仅辅助构图)",
                     "uri": str(slice_uri),
                     "reference_role": "scene_view",
                     "attach_to": location,
@@ -17118,11 +17326,28 @@ class Director:
                         "version": row["version"],
                         "kind": row["kind"],
                         "name": row["name"],
-                        "label": scene_label + "，仅限机位",
+                        "label": scene_label + "，仅辅助构图",
                         "uri": str(row["uri"]),
                         "reference_role": "scene_view",
                         "attach_to": location,
                     }
+            if clean_uri:
+                if not remember(clean_uri):
+                    raise AifosError(
+                        f"镜头{shot_no or 0}的真实几何空间图无法进入参考图"
+                        "硬槽位；请拆分群像镜头")
+                refs["spatial_scene_clean_ref"] = clean_uri
+                refs["asset_matches"].append({
+                    "asset_id": clean_scene["id"],
+                    "version": clean_scene["version"],
+                    "kind": "spatial_scene_clean",
+                    "name": clean_scene["name"],
+                    "label": f"场景:{location}(本镜干净真实几何图)",
+                    "uri": clean_uri,
+                    "reference_role": "spatial_scene_clean",
+                    "attach_to": location,
+                    "mandatory": True,
+                })
             # Pure contract/unit callers may intentionally omit the artifact
             # root while checking wording or phase projection.  A real
             # production payload always has ``out_root`` and must fail closed
@@ -18988,6 +19213,15 @@ class Director:
             "spatial": (
                 ["blocking", "camera", "occlusion"],
                 ["identity", "wardrobe", "style", "diagram_artifacts"]),
+            "spatial_scene_clean": (
+                [
+                    "scene_layout", "fixed_furniture", "materials",
+                    "lighting", "camera_view",
+                ], [
+                    "identity", "people", "wardrobe", "pose",
+                    "readable_text", "annotations", "movement_arrows",
+                    "diagram_artifacts",
+                ]),
             "inner_persona": (
                 ["overlay_identity", "chibi_proportion", "current_wardrobe"],
                 ["real_person_count", "physical_blocking", "default_props"]),
@@ -19041,7 +19275,8 @@ class Director:
                 "kind": kind or match.get("kind") or role,
                 "mandatory": bool(match.get("mandatory")) or role in {
                     "identity", "identity_detail", "headwear", "wardrobe",
-                    "prop", "spatial", "scene", "revision_base",
+                    "prop", "spatial", "spatial_scene_clean", "scene",
+                    "revision_base",
                 } or (
                     role == "continuity"
                     and bool(payload.get(
@@ -19205,6 +19440,14 @@ class Director:
                 "最终画面方向严格服从该裁决：" + spatial_resolution)
         add(payload.get("spatial_ref"), "本镜空间调度图",
             spatial_binding, role="spatial")
+        add(
+            payload.get("spatial_scene_clean_ref"),
+            "本镜干净机位空间图",
+            "这是按本镜权威摄影机从统一物理母场景导出的干净9:16空间"
+            "画面；锁定墙、门窗、固定家具的位置与朝向、材质、主光和本镜"
+            "机位视角；图中没有人物、文字、箭头、网格或标注，不得自行"
+            "新增这些元素；人物起终站位与运动只服从独立空间调度图",
+            role="spatial_scene_clean", kind="spatial_scene_clean")
         for uri in payload.get("prop_refs") or []:
             match = matches.get(uri) or {}
             name = str(match.get("name") or "核心道具")
@@ -22286,7 +22529,9 @@ class Director:
                 f"e{ctx['episode']['number']:03d}_shot{shot_no:03d}_space")
             row = self.assets.latest(
                 ctx["project"]["id"], "spatial_blocking", name)
-            if row is None or row["uri"] != uri:
+            if (row is None or row["uri"] != uri
+                    or self._asset_meta(row).get("reference_role")
+                    != "movement_control"):
                 row = self.assets.register(
                     ctx["project"]["id"], "spatial_blocking", name,
                     uri=uri, meta={
@@ -22294,6 +22539,9 @@ class Director:
                     "scene_no": block.get("scene_no"),
                     "image_quality": "high",
                     "mandatory_for_seedance": True,
+                    "reference_role": "movement_control",
+                    "contains_annotations": True,
+                    "forbid_visual_leakage": True,
                     "reason": block.get("spatial_reference_reason", ""),
                     })
             rows[shot_no] = row
@@ -22360,6 +22608,10 @@ class Director:
             mandatory_ids.add(spatial["row"]["id"])
         scene_row = self._required_video_scene_reference(ctx, target_shot)
         mandatory_ids.add(scene_row["id"])
+        clean_scene_row = self._clean_video_scene_reference(
+            ctx, target_shot)
+        if clean_scene_row is not None:
+            mandatory_ids.add(clean_scene_row["id"])
         missing_identities = []
         for name in self._video_identity_names(ctx, target_shot):
             row = self._locked_identity(episode["project_id"], name)
@@ -22557,6 +22809,12 @@ class Director:
                 "禁止只带人物/空间图生成视频")
         return row
 
+    def _clean_video_scene_reference(self, ctx, shot):
+        """Return this shot's current clean camera view when derivable."""
+        location = self._shot_location(ctx.get("script") or {}, shot)
+        return self._spatial_scene_clean_row(
+            ctx, location, int(shot.get("shot_no") or 0))
+
     def _auto_video_reference_rows(self, ctx, shot_no):
         """人工未选择时,按剧本/分镜自动集合本镜必要参考图。
 
@@ -22602,6 +22860,10 @@ class Director:
         # 场景母图同样是硬参考，并且必须在道具让位/总槽位计算之前
         # 占位；否则非导演自治模式会在最后一刻因 7→8 张而失败。
         add(self._required_video_scene_reference(ctx, shot))
+        # Visual layout and movement control are deliberately separate.  The
+        # clean view tells Seedance what this camera sees; the annotated
+        # blocking PNG only tells it how people/camera move.
+        add(self._clean_video_scene_reference(ctx, shot))
         missing = []
         for name in self._video_identity_names(ctx, shot):
             identity = self._locked_identity(project_id, name)
@@ -22819,6 +23081,19 @@ class Director:
                     f"场景资产「{row['name']}」属于物理场景"
                     f"「{asset_location}」，本镜必须使用"
                     f"「{expected_location}」的统一母图")
+        if kind == "spatial_scene_clean":
+            meta = self._asset_meta(row)
+            asset_location = str(
+                meta.get("physical_scene_id") or "").strip()
+            expected_location = canonical_scene_location(
+                script or {}, location)
+            if asset_location != expected_location:
+                return (
+                    f"干净机位空间图属于「{asset_location}」，本镜必须使用"
+                    f"「{expected_location}」")
+            if int(meta.get("shot_no") or -1) != int(
+                    shot.get("shot_no") or -2):
+                return "干净机位空间图属于其他镜头，禁止跨镜复用机位"
         if kind == "reference":
             meta = self._asset_meta(row)
             attach = str(meta.get("attach_to") or "").strip()
@@ -22879,6 +23154,11 @@ class Director:
         if scene_row["id"] not in seen:
             seen.add(scene_row["id"])
             rows.append(scene_row)
+        clean_scene_row = self._clean_video_scene_reference(ctx, shot)
+        if (clean_scene_row is not None
+                and clean_scene_row["id"] not in seen):
+            seen.add(clean_scene_row["id"])
+            rows.append(clean_scene_row)
         missing = []
         for name in self._video_identity_names(ctx, shot):
             row = self._locked_identity(ctx["project"]["id"], name)
@@ -22955,6 +23235,7 @@ class Director:
             # The room master is the geometry/material truth.  Dropping it
             # caused the exact failure where each video invented a new set.
             "scene_art": 120,
+            "spatial_scene_clean": 118,
             "spatial_blocking": 110,
             "character_art": 100,
             "character_identity": 100,
@@ -23031,7 +23312,17 @@ class Director:
         if kind == "spatial_blocking":
             return (
                 "只读取人物编号、起终站位、行动箭头、屏幕方向和摄影机"
-                "起终点；不得把俯视图、文字、坐标、箭头或图形画进成片")
+                "起终点；它只负责运动控制，不负责场景外观；不得把俯视图、"
+                "火柴人、文字、坐标、箭头、网格、色块或图形画进成片")
+        if kind == "spatial_scene_clean":
+            physical_scene = str(
+                meta.get("physical_scene_id") or "当前物理场景")
+            return (
+                f"这是物理场景「{physical_scene}」按本镜权威机位导出的"
+                "干净9:16空间真相；锁定墙、门窗、固定家具的位置/朝向、"
+                "材质、主光和本镜摄影机视角；本图没有人物、可读文字、"
+                "箭头、网格或标注，禁止自行新增；人物运动只服从独立的"
+                "空间调度控制图")
         if kind == "inner_persona":
             return (
                 "只锁定非现实内心Q版的脸、发型、当前衣着、Q版比例和材质；"
@@ -23636,6 +23927,11 @@ class Director:
         dropped_scene_rows = []
         normalized_reference_rows = []
         for row in reference_rows:
+            if str(row["kind"] or "") == "spatial_scene_clean":
+                # Reinsert the current signature below.  A frozen/manual row
+                # from an older blocking contract must never survive a camera
+                # or furniture change.
+                continue
             is_scene_truth = str(row["kind"] or "") == "scene_art"
             if (str(row["kind"] or "") == "reference"
                     and self._reference_role(row) == "scene"):
@@ -23650,6 +23946,10 @@ class Director:
             and str(normalized_reference_rows[0]["kind"] or "")
             == "spatial_blocking") else 0
         normalized_reference_rows.insert(insert_at, canonical_scene_row)
+        clean_scene_row = self._clean_video_scene_reference(ctx, shot)
+        if clean_scene_row is not None:
+            normalized_reference_rows.insert(
+                insert_at + 1, clean_scene_row)
         reference_rows = normalized_reference_rows
         if dropped_scene_rows:
             self.log.warn(
@@ -23659,6 +23959,14 @@ class Director:
                 f"{canonical_scene_row['id']}")
         physical_scene_id = self._physical_scene_location(
             ctx, self._shot_location(ctx.get("script") or {}, shot))
+        if (reference_mode == "all_around" and clean_scene_row is not None
+                and not any(
+                    str(row["kind"] or "") == "spatial_scene_clean"
+                    and int(row["id"]) == int(clean_scene_row["id"])
+                    for row in reference_rows)):
+            raise AifosError(
+                f"镜头{shot_no}缺少当前机位的干净空间参考图；"
+                "禁止拿网格/火柴人图冒充场景外观")
         if (reference_mode == "all_around"
                 and canonical_scene_row["id"] not in {
                     row["id"] for row in reference_rows}):
@@ -23767,6 +24075,15 @@ class Director:
                 "version": int(canonical_scene_row["version"]),
                 "uri": str(canonical_scene_row["uri"]),
             }),
+            "spatial_scene_clean_reference_uri": (
+                str(clean_scene_row["uri"])
+                if clean_scene_row is not None else ""),
+            "spatial_scene_clean_asset_id": (
+                int(clean_scene_row["id"])
+                if clean_scene_row is not None else None),
+            "spatial_scene_clean_asset_version": (
+                int(clean_scene_row["version"])
+                if clean_scene_row is not None else None),
             **prop_contract,
             "dialogue": video_dialogue,
             "characters": list(shot.get("characters") or []),

@@ -7480,8 +7480,8 @@ function blocking3dSceneHtml(scene, sceneIndex, episodeId) {
         <button type="button" data-view="reset" aria-label="重置3D视角">重置</button>
         <button type="button" class="active" data-view="pano"
           aria-pressed="true" aria-label="切换720全景房间底图">全景</button>
-        <a class="blocking-real-stage-link" href="${esc(realisticUrl)}"
-          target="_blank" rel="noopener" aria-label="打开真实布景渲染器">真实布景</a>
+        <a class="blocking-real-stage-link primary" href="${esc(realisticUrl)}"
+          target="_blank" rel="noopener" aria-label="打开可编辑真实3D片场">进入真实布景·3D片场</a>
       </div>
     </div>
     <canvas class="blocking-3d-canvas" tabindex="0" role="img"
@@ -8190,6 +8190,8 @@ async function showBlockingOverlay(episodeId) {
   const blocking = data.blocking || {};
   const scenes = blocking.scenes || [];
   const physicsIssues = blocking.validation?.scene_physics_issues || [];
+  const previzIssues = blocking.validation?.previz_issues || [];
+  const spatialIssueCount = physicsIssues.length + previzIssues.length;
   const overlay = document.createElement("div");
   overlay.className = "script-overlay";
   const sceneHtml = scenes.map((scene, sceneIndex) => {
@@ -8213,10 +8215,10 @@ async function showBlockingOverlay(episodeId) {
       ${blockingLegendHtml(scene, blocking)}
       ${blocking3dSceneHtml(scene, sceneIndex, episodeId)}
       ${svgUrl
-        ? `<details class="blocking-fixed-reference"><summary>查看给关键帧 / Seedance 使用的固定 3D 参考图</summary>
-          <div class="blocking-map-scroll"><button class="blocking-map-btn" data-map="${esc(svgUrl)}" data-label="第${scene.scene_no}场固定3D空间参考图"><img src="${esc(svgUrl)}" loading="lazy" alt="第${scene.scene_no}场固定3D空间参考图，点击放大"></button></div>
+        ? `<details class="blocking-fixed-reference"><summary>查看固定 3D 参考图（人物/机位控制，仅控制走位）</summary>
+          <div class="blocking-map-scroll"><button class="blocking-map-btn" data-map="${esc(svgUrl)}" data-label="第${scene.scene_no}场固定3D人物与机位控制图"><img src="${esc(svgUrl)}" loading="lazy" alt="第${scene.scene_no}场固定3D人物与机位控制图，点击放大"></button></div>
           <div class="blocking-map-mobile-hint">↔ 左右滑动查看全图 · 点图放大</div></details>`
-        : `<div class="blocking-empty">固定 3D 参考图尚未生成</div>`}
+        : `<div class="blocking-empty">固定 3D 人物/机位控制图尚未生成</div>`}
       <div class="blocking-shot-list">${(scene.shots || []).map(blockingShotHtml).join("")}</div>
     </section>`;
   }).join("");
@@ -8230,13 +8232,20 @@ async function showBlockingOverlay(episodeId) {
         <b>${blocking.summary?.scenes || 0}</b> 场 ·
         <b>${blocking.summary?.shots || 0}</b> 镜 ·
         <b>${blocking.summary?.required_scenes || 0}</b> 个重点调度场景
-        <span class="${blocking.validation?.passed ? "pass" : "warn"}">${blocking.validation?.passed ? "空间门禁 PASS" : "空间门禁待生成"}</span>
+        <span class="${blocking.validation?.passed ? "pass" : "warn"}">${blocking.validation?.passed
+          ? "空间门禁 PASS"
+          : (spatialIssueCount ? `空间门禁未通过 · ${spatialIssueCount} 项` : "空间门禁待生成")}</span>
       </div>
       ${physicsIssues.length ? `<div class="blocking-empty">
         <b class="warn">真实搭景检查发现 ${physicsIssues.length} 项</b>：
         红色阻断项必须先调整人物/机位；默认深度或朝向造成的低置信问题只提醒，不会误卡生产。
       </div>` : ""}
-      <p class="dim">交互 3D 与模型参考图共用同一套米制坐标；人物站位、路线、机位高度、瞄准点和视锥只约束构图，不会画进最终画面。</p>
+      ${previzIssues.length ? `<details class="blocking-empty" open>
+        <summary><b class="warn">人物/摄影机路径检查发现 ${previzIssues.length} 项</b></summary>
+        <ul>${previzIssues.map((item) => `<li>${item.shot_no != null
+          ? `<b>S${esc(item.shot_no)}</b>：` : ""}${esc(item.detail || item.message || item.kind || "空间路径待修正")}</li>`).join("")}</ul>
+      </details>` : ""}
+      <p class="dim">真实3D片场负责墙体、家具、尺度与镜头空间；人物/机位控制图只负责走位。两类参考职责分离，控制图的网格、文字、路线与图标禁止进入最终画面。</p>
       ${sceneHtml || `<div class="blocking-empty">本集还没有空间调度图；确认剧本并完成五维分镜后会自动生成。</div>`}
     </div>`;
   const cleanups = [];

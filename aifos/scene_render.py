@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 
+from .scene_model import normalize_scene_model_contract
 
 SCHEMA = "aifos.scene-render-contract/v1"
 
@@ -64,7 +65,28 @@ _PREFAB_RULES = (
 )
 
 
-def _render_prefab(name, category):
+def _render_prefab(name, category, semantic_type=""):
+    semantic_type = _text(semantic_type)
+    if semantic_type:
+        known = {name for name, _words in _PREFAB_RULES}
+        semantic_prefab = {
+            "architectural_opening": "architectural_frame",
+            "light_fixture": "lantern",
+            "generic_furniture": "generic_furniture",
+            "generic_prop": "generic_prop",
+            "decor": "decor_panel",
+            "structure": "generic_object",
+        }.get(semantic_type, semantic_type if semantic_type in known else "")
+        if semantic_prefab:
+            return {
+                "type": semantic_prefab,
+                "version": 1,
+                # Keep the public source value compatible with v1 consumers;
+                # the basis now records that the semantic class was explicit.
+                "source": "semantic_name",
+                "confidence": {"score": 0.95, "level": "high",
+                               "basis": ["object.semantic_type"]},
+            }
     text = _text(name).lower()
     for prefab_type, words in _PREFAB_RULES:
         if any(word.lower() in text for word in words):
@@ -257,8 +279,14 @@ def _material_contract(obj, category):
 
 def _object_contract(raw, index):
     obj = _mapping(raw)
+    object_id = _text(obj.get("object_id") or obj.get("id")) \
+        or f"object-{index}"
     name = _text(obj.get("name")) or f"object-{index}"
     category = _text(obj.get("category")).lower() or "unknown"
+    semantic_type = _text(obj.get("semantic_type"))
+    mount_type = _text(obj.get("mount_type")) or "floor_contact"
+    support_id = _text(obj.get("support_id")) or None
+    support_source = _text(obj.get("support_source")) or None
     position = _position(obj)
     width = _number(obj.get("width_m", obj.get("width")))
     height = _number(obj.get("height_m", obj.get("height")))
@@ -300,7 +328,7 @@ def _object_contract(raw, index):
                 f"「{name}」的朝向为径向回退值，并非视觉标注",
                 object_name=name))
     material, material_confidence = _material_contract(obj, category)
-    render_prefab = _render_prefab(name, category)
+    render_prefab = _render_prefab(name, category, semantic_type)
     if material["source"] == "category_render_default":
         warnings.append(_warning(
             "unverified_material", "material",
@@ -308,8 +336,13 @@ def _object_contract(raw, index):
             object_name=name))
 
     return {
+        "object_id": object_id,
         "name": name,
         "category": category,
+        "semantic_type": semantic_type,
+        "mount_type": mount_type,
+        "support_id": support_id,
+        "support_source": support_source,
         "position": position,
         "width": width,
         "height": height,
@@ -387,6 +420,10 @@ def _render_position_on_support(obj, support):
 
 
 def _attach_render_supports(objects):
+    by_id = {
+        str(obj.get("object_id")): obj for obj in objects
+        if str(obj.get("object_id") or "").strip()
+    }
     for obj in objects:
         position = dict(_mapping(obj.get("position")))
         obj["render_transform"] = {
@@ -394,10 +431,12 @@ def _attach_render_supports(objects):
             "source": "measured_geometry",
             "support": None,
         }
+        declared_support_id = (
+            "" if _text(obj.get("support_source"))
+            == "semantic_name_inference" else _text(obj.get("support_id")))
+        support = by_id.get(declared_support_id)
         marker, support_words = _explicit_support_words(obj.get("name"))
-        if not marker:
-            continue
-        candidates = [
+        candidates = [] if support is not None else [
             candidate for candidate in objects
             if candidate is not obj
             and any(word in _text(candidate.get("name"))
@@ -409,27 +448,34 @@ def _attach_render_supports(objects):
         ]
         ox = _number(position.get("x"))
         oz = _number(position.get("z"))
-        if ox is None or oz is None or not candidates:
+        if ox is None or oz is None or (support is None and not candidates):
             continue
-        support = min(candidates, key=lambda candidate: math.hypot(
-            ox - _number(_mapping(candidate.get("position")).get("x")),
-            oz - _number(_mapping(candidate.get("position")).get("z"))))
+        if support is None:
+            support = min(candidates, key=lambda candidate: math.hypot(
+                ox - _number(_mapping(candidate.get("position")).get("x")),
+                oz - _number(_mapping(candidate.get("position")).get("z"))))
         render_position = _render_position_on_support(obj, support)
         if render_position is None:
             continue
         obj["render_transform"] = {
             "position": render_position,
-            "source": "explicit_name_support",
+            "source": ("explicit_support_id" if declared_support_id
+                       else "explicit_name_support"),
             "support": {
+                "object_id": support.get("object_id"),
                 "name": support.get("name"),
-                "relation": marker,
-                "confidence": {"score": 0.75, "level": "medium",
-                               "basis": ["object.name", "nearest_support"]},
+                "relation": "support_id" if declared_support_id else marker,
+                "confidence": ({"score": 1.0, "level": "high",
+                                "basis": ["object.support_id"]}
+                               if declared_support_id else
+                               {"score": 0.75, "level": "medium",
+                                "basis": ["object.name", "nearest_support"]}),
             },
         }
         obj["warnings"].append(_warning(
             "render_support_inference", "render_transform.position",
-            f"「{obj.get('name')}」按名称中的「{marker}」放到"
+            f"「{obj.get('name')}」按"
+            f"「{'support_id' if declared_support_id else marker}」放到"
             f"「{support.get('name')}」顶面；原始全景落地点仍保留用于审计",
             object_name=_text(obj.get("name"))))
 
@@ -529,7 +575,8 @@ def build_scene_render_contract(scene_model, panorama_info=None, *,
     panorama_missing = panorama_info is None
     model_valid = isinstance(scene_model, dict)
     panorama_valid = isinstance(panorama_info, dict)
-    model = scene_model if model_valid else {}
+    model = normalize_scene_model_contract(
+        scene_model, location=location) if model_valid else {}
     panorama = panorama_info if panorama_valid else {}
     resolved_location = (_text(location) or _text(model.get("location")))
     panorama_url = _text(panorama.get("url") or model.get("panorama_uri"))
