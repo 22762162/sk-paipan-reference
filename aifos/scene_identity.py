@@ -85,7 +85,13 @@ def scene_family_map(script_or_scenes):
     }
     mapping = {}
     for location in locations:
-        if explicit.get(location):
+        # A root that points somewhere else is an intentional authoring fact
+        # and always wins.  Older AIFOS versions, however, stamped every
+        # visible location with ``physical_scene_id == location`` before they
+        # knew about staging zones.  Treat that self-reference as a legacy
+        # default so a declared room plus its narrower ``书案前/床侧`` view can
+        # still converge to one set without deleting old scripts or assets.
+        if explicit.get(location) and explicit[location] != location:
             mapping[location] = explicit[location]
             continue
         candidates = [

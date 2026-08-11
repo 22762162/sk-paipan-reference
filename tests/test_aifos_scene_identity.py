@@ -48,6 +48,20 @@ def test_period_desk_zone_reuses_declared_physical_room():
     }
 
 
+def test_legacy_self_root_does_not_freeze_a_narrow_staging_zone():
+    script = {"scenes": [
+        {"location": "都察院东值房",
+         "physical_scene_id": "都察院东值房",
+         "base_location": "都察院东值房"},
+        {"location": "都察院东值房书案前",
+         "physical_scene_id": "都察院东值房书案前",
+         "base_location": "都察院东值房书案前"},
+    ]}
+
+    assert canonical_scene_location(
+        script, "都察院东值房书案前") == "都察院东值房"
+
+
 def test_explicit_physical_scene_id_beats_legacy_inference():
     script = {"scenes": [{
         "location": "酒店房间走廊",
