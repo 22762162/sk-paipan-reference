@@ -624,8 +624,13 @@ function issueObjectKey(item,message){
 function lightingIsVerified(){
  const contract=activeRenderContract(),light=contract&&(contract.lighting||
   contract.light||contract.directional_light);
- return Boolean(light&&typeof light==="object"&&
-  (light.verified===true||light.source||light.direction))}
+ if(!light||typeof light!=="object")return false;
+ if(light.verified===true)return true;
+ const source=String(light.source||"").trim().toLowerCase(),
+       confidence=String((light.confidence||{}).level||"").toLowerCase();
+ return Boolean(light.direction&&source&&
+  !["unverified","default","fallback","category_render_default"].includes(source)&&
+  confidence!=="low")}
 function updateQualityBadges(){
  const box=document.getElementById("quality"),total=(sourceSceneModel().objects||[]).length,
        geometry=renderStats.objects,
@@ -959,14 +964,15 @@ function addScenePrefab(kit,prefab,name,x,y,z,width,height,depth,yaw,m,edges){
    part(0,height*.46,-depth/2-.02,width*.07,height*.09,.018,0,metalMat)}
   return}
  if(type==="lattice"){
-  const frame=Math.max(.04,Math.min(width,height)*.06),front=-depth*.12,
-        glow={...paperMat,panoBlend:0,emissive:.20};
+  const frame=Math.max(.04,Math.min(width,height)*.06),front=-depth*.12;
   part(0,-.02,0,width*1.05,.05,depth*1.3,0,dark);
   part(0,0,front,width,frame,depth,0,dark);
   part(0,height-frame,front,width,frame,depth,0,dark);
   part(-width/2+frame/2,0,front,frame,height,depth,0,dark);
   part(width/2-frame/2,0,front,frame,height,depth,0,dark);
-  part(0,frame,front+depth*.30,width-frame*1.6,height-frame*2,.02,0,glow);
+  // The panorama supplies the light/view beyond this measured opening.  An
+  // opaque luminous backing turned a large lattice window into a white wall.
+  // Render only its frame and bars so the room remains spatially readable.
   const cols=clamp(Math.round(width/.15),4,14),
         rows=clamp(Math.round(height/.34),2,6),bar=Math.max(.016,frame*.34);
   for(let i=1;i<cols;i++)part(-width/2+width*i/cols,frame,front,
