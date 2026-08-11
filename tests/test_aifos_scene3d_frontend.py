@@ -81,3 +81,5 @@ def test_quality_is_split_and_issues_can_locate_objects():
     assert "function issueObjectKey(" in html
     assert "focusObject(row.objectKey)" in html
     assert "` · 真实物件 ${renderStats.semanticPrefabs}/${renderStats.objects}`" not in html
+    assert '!["unverified","default","fallback","category_render_default"]' in html
+    assert "opaque luminous backing turned a large lattice window" in html
