@@ -469,6 +469,130 @@ function updateSceneStatus(extra=[]){
  if(!pano)rows.push("本场没有全景母版：已使用中性写实房壳作为背景。");
  warn(rows,Boolean(modelEntry&&modelEntry.error))}
 
+// ---- 通行导航:人物与机位绕开实体布景 ----
+// 只影响预演的运动表现;blocking 数据里的起终点、机位端点一律不改。
+// 直线插值本来就是查看器的自创补间,绕行是更接近真实走位的补间。
+let OBSTACLES=[];
+let NAV={key:null,actors:[],cam:null,room:{fw:10,fd:7,fh:4.2}};
+const SOLID_PREFABS=new Set(["table","cabinet","chair","bed","screen",
+ "column","lantern","brazier","plant","vessel","instrument",
+ "generic_furniture","generic_object","generic_prop"]);
+function obstacleFrom(x,y,z,width,height,depth,yaw,type){
+ if(y>.4)return null;                        // 台面道具不挡路
+ if(!SOLID_PREFABS.has(String(type)))return null; // 帘门窗毯可穿行
+ if(width*depth<.05)return null;             // 过小物件忽略
+ const rad=yaw*Math.PI/180;
+ return {x,z,hw:width/2,hd:depth/2,co:Math.cos(rad),si:Math.sin(rad),
+         y0:y,y1:y+height}}
+function obLocal(o,px,pz){const dx=px-o.x,dz=pz-o.z;
+ return [dx*o.co-dz*o.si,dx*o.si+dz*o.co]}
+function pointBlockedIn(obs,px,pz,r){
+ for(const o of obs){const [lx,lz]=obLocal(o,px,pz);
+  if(Math.abs(lx)<=o.hw+r&&Math.abs(lz)<=o.hd+r)return o}
+ return null}
+function segBlockedIn(obs,ax,az,bx,bz,r){
+ for(const o of obs){
+  const [lax,laz]=obLocal(o,ax,az),[lbx,lbz]=obLocal(o,bx,bz),
+        dx=lbx-lax,dz=lbz-laz,hw=o.hw+r,hd=o.hd+r,
+        tests=[[-dx,lax+hw],[dx,hw-lax],[-dz,laz+hd],[dz,hd-laz]];
+  let t0=0,t1=1,hit=true;
+  for(const [p,q] of tests){
+   if(Math.abs(p)<1e-9){if(q<0){hit=false;break}continue}
+   const t=q/p;
+   if(p<0){if(t>t1){hit=false;break}if(t>t0)t0=t}
+   else{if(t<t0){hit=false;break}if(t<t1)t1=t}}
+  if(hit&&t0<=t1)return o}
+ return null}
+function insideRoom(px,pz,margin){
+ const hx=NAV.room.fw/2-margin,hz=NAV.room.fd/2-margin;
+ return Math.abs(px)<=hx&&Math.abs(pz)<=hz}
+function clampRoom(p,margin){
+ const hx=NAV.room.fw/2-margin,hz=NAV.room.fd/2-margin;
+ return [Math.max(-hx,Math.min(hx,p[0])),
+         Math.max(.12,Math.min(NAV.room.fh-.15,p[1])),
+         Math.max(-hz,Math.min(hz,p[2]))]}
+// 可见图 A*:节点=起终点+外扩障碍角点;小规模场景一次算完并缓存。
+function route2d(obs,a,b,r){
+ if(pointBlockedIn(obs,a[0],a[1],r)||pointBlockedIn(obs,b[0],b[1],r))
+  return [a,b];       // 端点本身在障碍里是数据问题,不强行绕
+ if(!segBlockedIn(obs,a[0],a[1],b[0],b[1],r))return [a,b];
+ const corners=[a,b];
+ for(const o of obs){const m=r+.14;
+  for(const [sx,sz] of [[-1,-1],[1,-1],[1,1],[-1,1]]){
+   const lx=(o.hw+m)*sx,lz=(o.hd+m)*sz,
+         wx=o.x+lx*o.co+lz*o.si,wz=o.z-lx*o.si+lz*o.co;
+   if(!pointBlockedIn(obs,wx,wz,r-.02)&&insideRoom(wx,wz,.24))
+    corners.push([wx,wz])}}
+ const n=corners.length,dist=new Array(n).fill(1/0),
+       prev=new Array(n).fill(-1),done=new Array(n).fill(false),
+       d2=(i,j)=>Math.hypot(corners[i][0]-corners[j][0],
+                            corners[i][1]-corners[j][1]);
+ dist[0]=0;
+ for(;;){
+  let u=-1,best=1/0;
+  for(let i=0;i<n;i++)
+   if(!done[i]&&Number.isFinite(dist[i])&&dist[i]+d2(i,1)<best){
+    best=dist[i]+d2(i,1);u=i}
+  if(u<0||u===1)break;
+  done[u]=true;
+  for(let v=0;v<n;v++){
+   if(done[v])continue;
+   const nd=dist[u]+d2(u,v);
+   if(nd<dist[v]&&!segBlockedIn(obs,corners[u][0],corners[u][1],
+                                corners[v][0],corners[v][1],r-.01)){
+    dist[v]=nd;prev[v]=u}}}
+ if(!Number.isFinite(dist[1]))return [a,b];
+ const out=[];
+ for(let u=1;u!==-1;u=prev[u]){out.unshift(corners[u]);if(u===0)break}
+ return out.length>=2?out:[a,b]}
+function routePath(obs,a,b,r){
+ const pts2=route2d(obs,[a[0],a[2]],[b[0],b[2]],r),cum=[0];
+ let len=0;
+ for(let i=1;i<pts2.length;i++){
+  len+=Math.hypot(pts2[i][0]-pts2[i-1][0],pts2[i][1]-pts2[i-1][1]);
+  cum.push(len)}
+ const pts=pts2.map((q,i)=>{const f=len>0?cum[i]/len:0;
+  return [q[0],a[1]+(b[1]-a[1])*f,q[1]]});
+ return {pts,cum,len}}
+function pathPoint(path,f){
+ const pts=path.pts;
+ if(pts.length<2||path.len<=0)
+  return {p:pts[0].slice(),dir:null};
+ const t=Math.max(0,Math.min(1,f))*path.len;
+ let i=1;
+ while(i<path.cum.length-1&&path.cum[i]<t)i++;
+ const t0=path.cum[i-1],t1=path.cum[i],
+       u=(t-t0)/Math.max(1e-6,t1-t0),A=pts[i-1],B=pts[i];
+ return {p:[A[0]+(B[0]-A[0])*u,A[1]+(B[1]-A[1])*u,A[2]+(B[2]-A[2])*u],
+         dir:[B[0]-A[0],B[2]-A[2]]}}
+// 机位:钳在房内,并从家具体内推出(静止机位放进柜子属数据问题,
+// 查看器至少不让镜头黑在箱体里)。
+function resolveEye(p){
+ let [px,py,pz]=clampRoom(p,.22);
+ for(let guard=0;guard<3;guard++){
+  const o=pointBlockedIn(OBSTACLES,px,pz,.28);
+  if(!o||py>o.y1+.12)break;
+  const [lx,lz]=obLocal(o,px,pz),
+        pushX=(o.hw+.32)-Math.abs(lx),pushZ=(o.hd+.32)-Math.abs(lz);
+  if(pushX<=pushZ){const nl=(o.hw+.32)*(lx>=0?1:-1);
+   px=o.x+nl*o.co+lz*o.si;pz=o.z-nl*o.si+lz*o.co}
+  else{const nl=(o.hd+.32)*(lz>=0?1:-1);
+   px=o.x+lx*o.co+nl*o.si;pz=o.z-lx*o.si+nl*o.co}}
+ return [px,py,pz]}
+function ensureNav(){
+ const key=(SHOT?String(SHOT.shot_no):"-")+"@"+
+  String((SCENE&&SCENE.location)||"")+"#"+OBSTACLES.length;
+ if(NAV.key===key)return;
+ NAV.key=key;NAV.actors=[];NAV.cam=null;
+ if(!SHOT)return;
+ (SHOT.actors||[]).forEach((a,i)=>{
+  NAV.actors[i]=routePath(OBSTACLES,P(a.start_3d),P(a.end_3d),.26)});
+ const cam=SHOT.camera||{},e0=P(cam.start_3d,1.55),
+       e1=P(cam.end_3d||cam.start_3d,1.55),
+       lowY=Math.min(e0[1],e1[1]),
+       camObs=OBSTACLES.filter(o=>o.y1>lowY-.15);
+ NAV.cam=routePath(camObs,e0,e1,.35)}
+
 // ---- 网格工具箱:静态布景与动态人物共用的几何生成器 ----
 function meshKit(){
  const L=[],PT=[],LIT=[],SHADOW=[];
@@ -943,6 +1067,8 @@ function buildSceneGeometry(){
  buildShellFaces(shellActive,fw,fd,fh);
  renderStats={objects:0,invalid:0,defaultMaterials:0,
               semanticPrefabs:0,fallbackPrefabs:0};
+ OBSTACLES=[];NAV.key=null;NAV.room={fw,fd,fh};
+ const ranges=[];
  for(const obj of model.objects||[]){
   if(!obj||typeof obj!=="object"){renderStats.invalid++;continue}
   const transform=obj.transform||{},bounds=obj.bounds||{},
@@ -959,21 +1085,31 @@ function buildSceneGeometry(){
   renderStats.objects++;if(material.usedDefault)renderStats.defaultMaterials++;
   if(prefab.source==="category_fallback")renderStats.fallbackPrefabs++;
   else renderStats.semanticPrefabs++;
+  const litStart=kit.LIT.length/13;
   addScenePrefab(kit,prefab,obj.name||"",x,y,z,width,height,depth,yaw,
                  material,structure);
+  // 逐物件区段:镜头视角跳过贴脸遮挡物;通行障碍供人物/机位绕行。
+  const rad=yaw*Math.PI/180;
+  ranges.push({start:litStart,count:kit.LIT.length/13-litStart,
+   ob:{x,z,hw:width/2,hd:depth/2,co:Math.cos(rad),si:Math.sin(rad),
+       y0:y,y1:y+height}});
+  const block=obstacleFrom(x,y,z,width,height,depth,yaw,prefab.type);
+  if(block)OBSTACLES.push(block);
   // 台面道具(y 抬高)不投地面影,避免隔着桌板出现悬空黑斑。
   if(!structure&&y<.4){const sy=Math.max(.24,Math.abs(light.direction[1])),
     offX=-light.direction[0]/sy*Math.min(.55,height*.16),
     offZ=-light.direction[2]/sy*Math.min(.55,height*.16);
    shadowEllipse(x,z,width*.60,depth*.62,offX,offZ,.13,yaw);
    shadowEllipse(x,z,width*.48,depth*.48,0,0,.22,yaw)}}
- kit.upload(sceneGeo)}
+ kit.upload(sceneGeo);
+ sceneGeo.ranges=ranges}
 
 // 动态层:人物/路线/机位/视锥,预演播放时逐帧重建。
 function buildGeometry(silent){
  const kit=meshKit(),{push,PT,shadowEllipse}=kit,
        structure=displayMode==="structure";
  if(!SHOT){kit.upload(geo);if(!silent)updateSceneStatus();return geo}
+ ensureNav();
  const cam=SHOT.camera||{},acts=SHOT.actors||[];
  const uMove=PV.active?easeInOut(PV.u):0;
  const camEye=P(cam.start_3d,1.55);
@@ -982,23 +1118,34 @@ function buildGeometry(silent){
   for(let t=0;t<1;t+=.05){const p=V.add(a,V.scale(V.sub(b,a),t)),
    q=V.add(a,V.scale(V.sub(b,a),Math.min(1,t+.028)));
    push([p[0],.02,p[2]],[q[0],.02,q[2]],c)}}
- acts.forEach(a=>{
+ acts.forEach((a,ai)=>{
   const col=hex(a.color),s0=P(a.start_3d),e=P(a.end_3d),
         startH=Math.max(.7,finite(a.start_height_m??a.height_m,1.7)),
         endH=Math.max(.7,finite(a.end_height_m??a.height_m,startH));
-  // 预演播放:人物沿起终点连线随时间插值(缓入缓出),身高同步过渡
-  const s=PV.active?lerp3(s0,e,uMove):s0,
-        h0=PV.active?startH+(endH-startH)*uMove:startH;
-  // 朝向:移动时朝移动方向,静止时面向机位(演员向镜头打开)。
-  const move=V.sub(e,s0),
-        yawA=V.len(move)>.05?Math.atan2(move[0],move[2])*180/Math.PI:
-             Math.atan2(camEye[0]-s[0],camEye[2]-s[2])*180/Math.PI;
+  // 预演播放:人物沿绕行路径按弧长插值(缓入缓出),身高同步过渡;
+  // 路径由通行导航算出,起终点仍是 blocking 数据原值。
+  const nav=NAV.actors[ai],walking=nav&&nav.len>.05;
+  let s,dir=null;
+  if(walking){const pp=pathPoint(nav,uMove);s=pp.p;dir=pp.dir}
+  else s=PV.active?lerp3(s0,e,uMove):s0;
+  const h0=PV.active?startH+(endH-startH)*uMove:startH;
+  // 行走起伏:按已走弧长起落,静止与到点后归零。
+  const bob=(PV.active&&walking&&uMove>0&&uMove<1)?
+   Math.abs(Math.sin(uMove*nav.len*3.4))*.012*h0:0;
+  // 朝向:移动时朝当前路段方向,静止时面向机位(演员向镜头打开)。
+  const yawA=dir&&Math.hypot(dir[0],dir[1])>.01?
+   Math.atan2(dir[0],dir[1])*180/Math.PI:
+   Math.atan2(camEye[0]-s[0],camEye[2]-s[2])*180/Math.PI;
   if(structure)stickman(kit,s[0],s[1],s[2],h0,col);
-  else{addActorSolid(kit,s[0],s[1],s[2],h0,col,yawA);
+  else{addActorSolid(kit,s[0],s[1]+bob,s[2],h0,col,yawA);
    shadowEllipse(s[0],s[2],.17*h0,.13*h0,.03,.02,.26)}
   if(show.control)PT.push(s[0],s[1]+.9*h0,s[2],col[0],col[1],col[2]);
   if(show.control&&show.path&&!PV.active&&(a.moving||V.len(V.sub(e,s0))>.05)){
-   const dim=V.scale(col,.62);push([s[0],s[1]+.05,s[2]],[e[0],e[1]+.05,e[2]],dim);
+   const dim=V.scale(col,.62);
+   if(walking)for(let i=1;i<nav.pts.length;i++)
+    push([nav.pts[i-1][0],s0[1]+.05,nav.pts[i-1][2]],
+         [nav.pts[i][0],s0[1]+.05,nav.pts[i][2]],dim);
+   else push([s[0],s[1]+.05,s[2]],[e[0],e[1]+.05,e[2]],dim);
    for(let i=0;i<12;i++){const t0=i/12*Math.PI*2,t1=(i+1)/12*Math.PI*2;
     push([e[0]+.18*Math.cos(t0),e[1]+.03,e[2]+.18*Math.sin(t0)],
          [e[0]+.18*Math.cos(t1),e[1]+.03,e[2]+.18*Math.sin(t1)],dim)}
@@ -1008,7 +1155,9 @@ function buildGeometry(silent){
         ce=P(cam.end_3d||cam.start_3d,1.55),
         ts=P(cam.target_start_3d||cam.target_3d,1.2),
         te=P(cam.target_end_3d||cam.target_3d||cam.target_start_3d,1.2),
-        cs=PV.active?lerp3(cs0,ce,PV.u):cs0,
+        csRaw=PV.active&&NAV.cam&&NAV.cam.len>.05?
+         pathPoint(NAV.cam,PV.u).p:(PV.active?lerp3(cs0,ce,PV.u):cs0),
+        cs=resolveEye(csRaw),
         tg=PV.active?lerp3(ts,te,PV.u):P(cam.target_3d||cam.target_start_3d,1.2),
         camCol=[.85,.64,.26];
   push([cs[0],0,cs[2]],[cs[0],cs[1],cs[2]],V.scale(camCol,.5));
@@ -1034,11 +1183,15 @@ function buildGeometry(silent){
 function shotCam(asp){
  // 本镜相机:预演播放时按 PV.u 在起终机位/瞄准点之间插值——运镜的
  // 真实感受(推近变大、环绕换面、俯冲视平线下坠)就来自这里。
+ // 机位走绕行路径且始终钳在房内、推出家具体外,镜头不再穿模。
+ ensureNav();
  const cam=(SHOT&&SHOT.camera)||{},
        e0=P(cam.start_3d,1.55),e1=P(cam.end_3d||cam.start_3d,1.55),
        t0=P(cam.target_start_3d||cam.target_3d,1.2),
        t1=P(cam.target_end_3d||cam.target_3d||cam.target_start_3d,1.2),
-       e=PV.active?lerp3(e0,e1,PV.u):e0,
+       eRaw=PV.active&&NAV.cam&&NAV.cam.len>.05?
+        pathPoint(NAV.cam,PV.u).p:(PV.active?lerp3(e0,e1,PV.u):e0),
+       e=resolveEye(eRaw),
        t=PV.active?lerp3(t0,t1,PV.u):P(cam.target_3d||cam.target_start_3d,1.2),
        vf=(Number(cam.vertical_fov_degrees)||
            (Number(cam.fov_degrees)||46)*16/9)*Math.PI/180;
@@ -1091,8 +1244,14 @@ function drawLabels(mvp){
   add([p[0],p[1]+height+.08,p[2]],
       `<b>${escapeHtml(obj.name||obj.object_id||"场景物体")}</b>`,"obj")}}
 
-function renderScene(view,proj,eye){
+function renderScene(view,proj,eye,lens){
+ // lens=镜头视角(本镜/画中画):贴脸的布景物件整段跳绘,
+ // 镜头不再被柜体桌板吞掉画面;环视(导演外部视角)从不隐藏。
  const mvp=M4.mul(proj,view);
+ const nearHidden=(lens&&sceneGeo.ranges)?sceneGeo.ranges.filter(rg=>{
+  const o=rg.ob,[lx,lz]=obLocal(o,eye[0],eye[2]);
+  return Math.abs(lx)<=o.hw+.42&&Math.abs(lz)<=o.hd+.42&&
+         eye[1]>=o.y0-.1&&eye[1]<=o.y1+.3}):[];
  gl.clearColor(0.063,0.055,0.047,1);
  gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
  gl.enable(gl.DEPTH_TEST);
@@ -1149,7 +1308,15 @@ function renderScene(view,proj,eye){
   for(const g of litGeos)if(g.litCount){
    bindAttr(pLit,"pos",g.lit,3,13,0);bindAttr(pLit,"nor",g.lit,3,13,3);
    bindAttr(pLit,"col",g.lit,3,13,6);bindAttr(pLit,"mat",g.lit,4,13,9);
-   gl.drawArrays(gl.TRIANGLES,0,g.litCount)}
+   if(g===sceneGeo&&nearHidden.length){
+    let cursor=0;
+    for(const rg of nearHidden.slice().sort((a,b)=>a.start-b.start)){
+     if(rg.start>cursor)
+      gl.drawArrays(gl.TRIANGLES,cursor,rg.start-cursor);
+     cursor=Math.max(cursor,rg.start+rg.count)}
+    if(cursor<g.litCount)
+     gl.drawArrays(gl.TRIANGLES,cursor,g.litCount-cursor)}
+   else gl.drawArrays(gl.TRIANGLES,0,g.litCount)}
   gl.disable(gl.POLYGON_OFFSET_FILL)}
  if(sceneGeo.lineCount||geo.lineCount){
   gl.useProgram(pLine);
@@ -1176,13 +1343,16 @@ function pipRect(){
 function draw(now){
  if(!gl)return;
  const d=Math.min(devicePixelRatio||1,2);
- if(cv.width!==Math.round(cv.clientWidth*d)||
-    cv.height!==Math.round(cv.clientHeight*d)){
+ // 页面被隐藏(clientWidth=0)时不清空画布,保留最后一帧可读回。
+ if(cv.clientWidth>0&&cv.clientHeight>0&&
+    (cv.width!==Math.round(cv.clientWidth*d)||
+     cv.height!==Math.round(cv.clientHeight*d))){
   cv.width=Math.round(cv.clientWidth*d);cv.height=Math.round(cv.clientHeight*d)}
  pvTick(typeof now==="number"?now:performance.now());
  gl.disable(gl.SCISSOR_TEST);
  gl.viewport(0,0,cv.width,cv.height);
- const main=camMatrices(),mvp=renderScene(main.view,main.proj,main.eye);
+ const main=camMatrices(),
+       mvp=renderScene(main.view,main.proj,main.eye,mode==="shot");
  // 双视窗:环视时叠加"镜头所见"画中画,运镜表达直接可见
  const showPip=previz.on&&mode==="orbit"&&SHOT;
  if(showPip){
@@ -1194,7 +1364,7 @@ function draw(now){
   gl.enable(gl.SCISSOR_TEST);gl.scissor(gx,gy,gw,gh);
   gl.viewport(gx,gy,gw,gh);
   const cam2=shotCam(gw/Math.max(1,gh));
-  renderScene(cam2.view,cam2.proj,cam2.eye);
+  renderScene(cam2.view,cam2.proj,cam2.eye,true);
   gl.disable(gl.SCISSOR_TEST);
   gl.viewport(0,0,cv.width,cv.height)}
  else pip.style.display="none";

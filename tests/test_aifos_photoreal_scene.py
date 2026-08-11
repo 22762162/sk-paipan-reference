@@ -431,6 +431,32 @@ def test_scene3d_detail_renderer_keeps_stability_and_fallback_contracts():
     assert "gl.deleteBuffer" not in _extract_js_function(source, "meshKit")
 
 
+def test_scene3d_previz_keeps_actors_and_camera_out_of_set_pieces():
+    """预演防穿模的四个承诺。
+
+    1) 实体布景生成通行障碍,人物按可见图路径绕行(帘/门/窗/毯可穿行,
+       台面道具不挡路);起终点仍是 blocking 数据原值,只改补间;
+    2) 机位同样绕行,并始终钳制在房间内、从家具体内推出;
+    3) 镜头视角(本镜/画中画)对贴脸物件整段跳绘,画面不被柜体吞掉,
+       而俯瞰环视永不隐藏任何物件;
+    4) 路径与绕行完全由障碍布局决定,无运行时随机,逐帧稳定。
+    """
+    source, _page = _page_source_and_inventory()
+
+    for marker in (
+            "OBSTACLES", "SOLID_PREFABS", "function obstacleFrom(",
+            "function route2d(", "function routePath(",
+            "function pathPoint(", "function ensureNav(",
+            "function resolveEye(", "function clampRoom(",
+            "sceneGeo.ranges", "nearHidden"):
+        assert marker in source, f"防穿模契约缺少 {marker}"
+    # 台面道具与可穿行类不得成为障碍
+    assert "y>.4" in source
+    # 镜头视角标志位:环视传 false,画中画传 true
+    assert 'mode==="shot"' in source
+    assert "renderScene(cam2.view,cam2.proj,cam2.eye,true)" in source
+
+
 def test_scene3d_can_open_the_requested_shot_from_episode_overlay():
     source, _page = _page_source_and_inventory()
 
