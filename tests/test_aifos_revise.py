@@ -117,6 +117,32 @@ def test_regen_shot_invalidates_video(app):
     assert revision["active"] is False
 
 
+def test_regen_shot_keeps_success_when_dependent_frame_chain_defers(
+        app, monkeypatch):
+    """下一镜帧链构建失败不能倒灌成当前关键帧重画失败。"""
+    _to_preflight(app, "万妖图录", 21, finish=True)
+    project = app.projects.get_project("万妖图录")
+    before = app.assets.latest(
+        project["id"], "image", "e021_shot001")
+
+    def defer_frames(*_args, **_kwargs):
+        raise AifosError("镜头2的空间参考预算暂不可构建")
+
+    monkeypatch.setattr(
+        app.director, "_regenerate_revised_frame_chain", defer_frames)
+    revised = app.director.regen_image(
+        "万妖图录", 21, {"kind": "shot", "shot_no": 1},
+        feedback="只调整当前镜头构图")
+
+    after = app.assets.latest(
+        project["id"], "image", "e021_shot001")
+    assert after["version"] == before["version"] + 1
+    assert revised["uri"] == after["uri"]
+    assert revised["sync"]["frames_deferred"] is True
+    assert revised["sync"]["frame_shots"] == []
+    assert "镜头2" in revised["sync"]["frame_defer_reason"]
+
+
 def test_revise_last_and_first_frame_syncs_shared_boundary_and_references(app):
     _to_preflight(app, "万妖图录", 3, finish=True)
     project = app.projects.get_project("万妖图录")

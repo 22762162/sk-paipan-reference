@@ -1257,6 +1257,109 @@ def test_codex_five_reference_budget_never_drops_scene_master(
     assert "图6=" not in payload["prompt"]
 
 
+def test_three_person_keyframe_reserves_spatial_before_clean_camera_view(
+        app, tmp_path):
+    """三人镜不能让重复的干净机位图挤掉空间调度硬锚。"""
+    paths = {}
+    for name in (
+            "person-a", "person-b", "person-c", "scene", "space",
+            "clean"):
+        uri = tmp_path / f"{name}.png"
+        uri.write_bytes(PNG)
+        paths[name] = str(uri)
+    payload = {
+        "prompt": "同一值房内三人静态关键帧",
+        "characters": ["甲", "乙", "丙"],
+        "identity_references": [
+            {"character": "甲", "uri": paths["person-a"]},
+            {"character": "乙", "uri": paths["person-b"]},
+            {"character": "丙", "uri": paths["person-c"]},
+        ],
+        "character_refs": [
+            paths["person-a"], paths["person-b"], paths["person-c"]],
+        "scene_ref": paths["scene"],
+        "spatial_ref": paths["space"],
+        "spatial_scene_clean_ref": paths["clean"],
+        "asset_matches": [
+            {"uri": paths["scene"], "label": "统一物理母场景",
+             "reference_role": "scene", "mandatory": True},
+            {"uri": paths["space"], "label": "本镜空间调度图",
+             "reference_role": "spatial", "mandatory": True},
+            {"uri": paths["clean"], "label": "本镜干净机位空间图",
+             "reference_role": "spatial_scene_clean", "mandatory": True},
+        ],
+    }
+
+    app.director._attach_reference_manifest(payload)
+
+    roles = [row["role"] for row in payload["reference_manifest"]]
+    assert roles.count("identity") == 3
+    assert {"scene", "spatial"} <= set(roles)
+    assert "spatial_scene_clean" not in roles
+    assert "spatial_scene_clean_ref" not in payload
+    assert payload["reference_budget"]["spatial_anchor_preserved"] is True
+    assert payload["reference_budget"][
+        "clean_scene_anchor_preserved"] is False
+
+
+def test_three_person_revision_switches_to_clean_redraw_when_slots_are_full(
+        app, tmp_path):
+    """三人返修自动丢弃编辑基底，保留三身份、场景和空间硬锚。"""
+    paths = {}
+    for name in (
+            "person-a", "person-b", "person-c", "scene", "space",
+            "clean", "revision"):
+        uri = tmp_path / f"{name}.png"
+        uri.write_bytes(PNG)
+        paths[name] = str(uri)
+    payload = {
+        "prompt": "只修正三人镜头中被质检指出的问题",
+        "shot_no": 16,
+        "physical_scene_id": "都察院东值房",
+        "canonical_scene_reference_uri": paths["scene"],
+        "characters": ["甲", "乙", "丙"],
+        "identity_references": [
+            {"character": "甲", "uri": paths["person-a"]},
+            {"character": "乙", "uri": paths["person-b"]},
+            {"character": "丙", "uri": paths["person-c"]},
+        ],
+        "character_refs": [
+            paths["person-a"], paths["person-b"], paths["person-c"]],
+        "scene_ref": paths["scene"],
+        "spatial_ref": paths["space"],
+        "spatial_scene_clean_ref": paths["clean"],
+        "reference_images": [paths["revision"]],
+        "asset_matches": [
+            {"uri": paths["scene"], "label": "统一物理母场景",
+             "reference_role": "scene", "mandatory": True},
+            {"uri": paths["space"], "label": "本镜空间调度图",
+             "reference_role": "spatial", "mandatory": True},
+            {"uri": paths["clean"], "label": "本镜干净机位空间图",
+             "reference_role": "spatial_scene_clean", "mandatory": True},
+            {"uri": paths["revision"], "label": "上一轮相对最优失败图（待修改基底）",
+             "reference_role": "revision_base",
+             "scene_id": "都察院东值房", "shot_no": 16},
+        ],
+    }
+
+    app.director._attach_reference_manifest(payload)
+
+    roles = [row["role"] for row in payload["reference_manifest"]]
+    assert roles.count("identity") == 3
+    assert set(roles) == {"identity", "scene", "spatial"}
+    assert len(roles) == 5
+    assert payload["scene_ref"] == paths["scene"]
+    assert "spatial_scene_clean_ref" not in payload
+    assert payload["reference_budget"]["spatial_anchor_preserved"] is True
+    assert payload["reference_budget"][
+        "revision_base_preserved"] is False
+    assert payload["reference_budget"]["scene_anchor_preserved"] is True
+    assert payload["revision_mode"] == "regenerate_clean"
+    assert payload["revision_base_budget_dropped"] is True
+    assert paths["revision"] not in payload.get("reference_images", [])
+    assert "图6=" not in payload["prompt"]
+
+
 def test_frame_budget_keeps_room_keyframe_and_adjacent_tail(
         app, tmp_path):
     paths = {}

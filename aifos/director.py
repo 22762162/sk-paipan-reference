@@ -17247,6 +17247,8 @@ class Director:
         # ceiling.  Losing either anchor is what previously let one bedroom
         # turn into a different room from shot to shot.
         camera_scene_reference = None
+        clean_scene = None
+        clean_uri = ""
         if location and ctx.get("out_root"):
             # The canonical root/panorama is the immutable set identity.  A
             # reverse view or panorama crop only explains this shot's camera
@@ -17339,23 +17341,6 @@ class Director:
                         "reference_role": "scene_view",
                         "attach_to": location,
                     }
-            if clean_uri:
-                if not remember(clean_uri):
-                    raise AifosError(
-                        f"镜头{shot_no or 0}的真实几何空间图无法进入参考图"
-                        "硬槽位；请拆分群像镜头")
-                refs["spatial_scene_clean_ref"] = clean_uri
-                refs["asset_matches"].append({
-                    "asset_id": clean_scene["id"],
-                    "version": clean_scene["version"],
-                    "kind": "spatial_scene_clean",
-                    "name": clean_scene["name"],
-                    "label": f"场景:{location}(本镜干净真实几何图)",
-                    "uri": clean_uri,
-                    "reference_role": "spatial_scene_clean",
-                    "attach_to": location,
-                    "mandatory": True,
-                })
             # Pure contract/unit callers may intentionally omit the artifact
             # root while checking wording or phase projection.  A real
             # production payload always has ``out_root`` and must fail closed
@@ -17445,6 +17430,46 @@ class Director:
             raise AifosError(
                 f"镜头{shot_no or 0}的空间调度图无法进入参考图硬槽位；"
                 "禁止降级为无空间锚生成")
+        # The annotated blocking image is the only attachment that proves
+        # actor positions, routes and the camera frustum.  Reserve it before
+        # the clean camera render.  In a three-person shot the provider's five
+        # slots are already occupied by three identity anchors, the canonical
+        # room and blocking; rejecting the whole shot because the redundant
+        # clean render is sixth created a permanent pre-generation deadlock.
+        # The clean render remains attached whenever capacity exists.  When it
+        # does not, canonical scene pixels + the measured blocking contract
+        # still preserve the same physical room without weakening identity or
+        # spatial truth.
+        if clean_uri:
+            if remember(clean_uri):
+                refs["spatial_scene_clean_ref"] = clean_uri
+                refs["asset_matches"].append({
+                    "asset_id": clean_scene["id"],
+                    "version": clean_scene["version"],
+                    "kind": "spatial_scene_clean",
+                    "name": clean_scene["name"],
+                    "label": f"场景:{location}(本镜干净真实几何图)",
+                    "uri": clean_uri,
+                    "reference_role": "spatial_scene_clean",
+                    "attach_to": location,
+                    "mandatory": True,
+                })
+            else:
+                warning = {
+                    "shot_no": shot_no,
+                    "location": location,
+                    "reason": (
+                        "参考图硬槽位已由人物身份、统一物理母场景和本镜"
+                        "空间调度占满；干净机位空间图与上述空间真值重复，"
+                        "本轮不上传但保留审计"),
+                }
+                refs.setdefault("spatial_reference_warnings", []).append(
+                    warning)
+                self.log.warn(
+                    "director",
+                    f"镜头{shot_no or 0}参考图已达"
+                    f"{SHOT_BASE_REFERENCE_LIMIT}张；保留空间调度硬锚，"
+                    "省略重复的干净机位空间图，不阻断生图")
         # A face/full-body identity image is not evidence for hidden headwear
         # geometry.  Add one narrowly scoped mother asset whenever the current
         # worn contract calls out view-dependent structure (most importantly
@@ -20066,10 +20091,6 @@ class Director:
         for row in identities:
             add(row["uri"])
 
-        # The physical room is mandatory for every shot and must be reserved
-        # before props, detail sheets or continuity conveniences.
-        add(payload.get("scene_ref"))
-
         matches = {
             str(row.get("uri") or ""): row
             for row in (payload.get("asset_matches") or [])
@@ -20133,41 +20154,96 @@ class Director:
         for uri in revision_bases:
             add(uri)
 
-        # Identity + canonical room + one repair base are hard requirements.
-        # If those alone exceed the provider contract there is no honest
-        # five-image selection: silently dropping any one of them causes face
-        # drift, scene drift, or another from-scratch repair.
-        hard_count = len(selected)
-        if hard_count > IMAGE_REFERENCE_LIMIT:
-            raise AifosError(
-                f"人物身份、统一场景与待修改基底共需 {hard_count} 张参考图，"
-                f"超过 Codex imagegen 硬上限 {IMAGE_REFERENCE_LIMIT} 张；"
-                "请拆分多人群像镜头，禁止静默丢弃人物、场景或返修基底")
+        frame_kind = str(
+            payload.get("frame_kind")
+            or payload.get("image_task_class") or "").strip().lower()
+        is_boundary_frame = frame_kind in {
+            "frames", "frame", "first", "last",
+            "first_frame", "last_frame",
+        }
+
+        edit_hard_uris = list(dict.fromkeys(
+            [str(row.get("uri") or "") for row in identities]
+            + [str(uri) for uri in revision_bases]
+            + [str(payload.get("scene_ref") or ""),
+               str(payload.get("spatial_ref") or "")]))
+        edit_hard_uris = [uri for uri in edit_hard_uris if uri]
+        if revision_bases and len(edit_hard_uris) > IMAGE_REFERENCE_LIMIT:
+            # Three-person repairs need 3 identity + canonical room + spatial
+            # truth before any editable base.  The failed pixels cannot replace
+            # either space anchor without perpetuating drift.  A reference-
+            # budget conflict is one of the explicit cases where the repair
+            # contract permits a clean redraw, so drop the edit base
+            # deterministically and continue instead of failing before spend.
+            self._clear_candidate_revision_base(payload)
+            payload["revision_mode"] = "regenerate_clean"
+            payload["revision_base_budget_dropped"] = True
+            payload["revision_base_budget_reason"] = (
+                "identity_scene_spatial_exceed_limit_with_revision_base")
+            revision_bases = []
+            selected = []
+            selected_set = set()
+            for row in identities:
+                add(row.get("uri"))
 
         if revision_bases:
-            # The failed image already carries the preceding composition,
-            # wardrobe and prop pixels.  Under the five-slot cap, preserve the
-            # editable base and use the remaining slot for physical blocking;
-            # core props come next, then old boundary frames.  This deterministic
-            # order prevents optional detail/style images from evicting the
-            # actual repair target.
-            add(payload.get("spatial_ref"))
+            # A revision base already contains the current room pixels.  The
+            # annotated blocking reference is therefore the stronger final
+            # hard slot: it proves actor positions, support, routes and camera
+            # geometry.  With three visible identities, identity + edit base
+            # + blocking exactly fills five attachments; adding the canonical
+            # scene as a sixth must not abort before generation.  Keep the
+            # scene master whenever capacity remains and record the inherited
+            # fallback below when the edit base has to carry it.
+            if payload.get("spatial_ref"):
+                add(payload.get("spatial_ref"))
+            else:
+                add(payload.get("scene_ref"))
+            hard_count = len(selected)
+            if hard_count > IMAGE_REFERENCE_LIMIT:
+                raise AifosError(
+                    f"人物身份、待修改基底与空间硬锚共需 {hard_count} 张"
+                    f"参考图，超过 Codex imagegen 硬上限 "
+                    f"{IMAGE_REFERENCE_LIMIT} 张；请拆分多人群像镜头")
+            add(payload.get("scene_ref"))
+            add(payload.get("spatial_scene_clean_ref"))
             for uri in payload.get("prop_refs") or []:
                 add(uri)
             for key in ("keyframe_reference_uri", "image_uri",
                         "keyframe_last_uri", "chain_first_uri"):
                 add(payload.get(key))
             add(payload.get("inner_persona_ref"))
-        else:
+        elif is_boundary_frame:
             # Boundary/continuity pixels are stronger than prose for normal
             # frame chains that do not have a targeted edit base.
+            add(payload.get("scene_ref"))
             for key in ("keyframe_reference_uri", "image_uri",
                         "keyframe_last_uri", "chain_first_uri"):
                 add(payload.get(key))
             add(payload.get("spatial_ref"))
+            add(payload.get("spatial_scene_clean_ref"))
             add(payload.get("inner_persona_ref"))
             for uri in payload.get("prop_refs") or []:
                 add(uri)
+        else:
+            # A new shot image cannot be spatially correct without both the
+            # canonical room identity and its shot-specific blocking.  Reserve
+            # those before clean-view, prop, style and continuity conveniences.
+            add(payload.get("scene_ref"))
+            add(payload.get("spatial_ref"))
+            hard_count = len(selected)
+            if hard_count > IMAGE_REFERENCE_LIMIT:
+                raise AifosError(
+                    f"人物身份、统一场景与空间调度共需 {hard_count} 张"
+                    f"参考图，超过 Codex imagegen 硬上限 "
+                    f"{IMAGE_REFERENCE_LIMIT} 张；请拆分多人群像镜头")
+            add(payload.get("spatial_scene_clean_ref"))
+            for uri in payload.get("prop_refs") or []:
+                add(uri)
+            for key in ("keyframe_reference_uri", "image_uri",
+                        "keyframe_last_uri", "chain_first_uri"):
+                add(payload.get(key))
+            add(payload.get("inner_persona_ref"))
         for row in payload.get("headwear_references") or []:
             if isinstance(row, dict):
                 add(row.get("uri"))
@@ -20199,7 +20275,8 @@ class Director:
             or not row.get("uri")
             or str(row.get("uri") or "") in chosen_set]
         for key in (
-                "spatial_ref", "inner_persona_ref", "image_uri",
+                "spatial_ref", "spatial_scene_clean_ref",
+                "inner_persona_ref", "image_uri",
                 "keyframe_reference_uri", "keyframe_last_uri",
                 "chain_first_uri", "previous_shot_reference_uri",
                 "scene_ref", "style_ref"):
@@ -20227,6 +20304,15 @@ class Director:
             "scene_anchor_preserved": bool(
                 payload.get("scene_ref")
                 and str(payload.get("scene_ref")) in chosen_set),
+            "scene_anchor_inherited_from_revision_base": bool(
+                revision_bases and not payload.get("scene_ref")),
+            "spatial_anchor_preserved": bool(
+                payload.get("spatial_ref")
+                and str(payload.get("spatial_ref")) in chosen_set),
+            "clean_scene_anchor_preserved": bool(
+                payload.get("spatial_scene_clean_ref")
+                and str(payload.get("spatial_scene_clean_ref"))
+                in chosen_set),
             "revision_base_preserved": bool(
                 revision_bases
                 and str(revision_bases[0]) in chosen_set),
@@ -27544,12 +27630,32 @@ class Director:
                 self.assets.mark_superseded(
                     old_image["id"], new_image["id"],
                     reason="image_revision")
-            sync = self._regenerate_revised_frame_chain(
-                ctx, storyboard, shot, feedback=feedback,
-                prompt_override=prompt_override,
-                quality_override=quality_choice,
-                revision_source=revision_source,
-                codex_profile=codex_profile)
+            try:
+                sync = self._regenerate_revised_frame_chain(
+                    ctx, storyboard, shot, feedback=feedback,
+                    prompt_override=prompt_override,
+                    quality_override=quality_choice,
+                    revision_source=revision_source,
+                    codex_profile=codex_profile)
+            except AifosError as exc:
+                # The keyframe above is already generated, registered and
+                # superseded atomically.  A downstream frame-chain payload can
+                # still be temporarily unbuildable (for example the next
+                # three-person shot needs a different reference budget).
+                # Propagating that exception made redo_items report the
+                # successful current keyframe as failed and left its plan row
+                # stuck at ``generating``.  Defer only the dependent frame
+                # chain; normal checkpoint production will fill it later.
+                sync = {
+                    "frame_shots": [],
+                    "invalidated_video_shots": [],
+                    "frames_deferred": True,
+                    "frame_defer_reason": str(exc),
+                }
+                self.log.warn(
+                    "director",
+                    f"镜头{shot_no}关键帧已重画成功；后续首尾帧链暂缓: "
+                    f"{exc}")
             sync.update(self._invalidate_revised_delivery(
                 ctx, shot, formal_ready=formal_ready))
             sync["video_reference_shots"] = reference_shots
@@ -30353,6 +30459,28 @@ class Director:
                         raise ProduceCancelled("已手动暂停重画")
                     if result.get("failed"):
                         failed += 1
+                        # regen_image may have claimed the render-plan row as
+                        # ``generating`` before a prompt/reference contract
+                        # error is raised.  Returning only a failed counter
+                        # leaves that durable claim behind forever: the UI
+                        # keeps counting minutes although no worker exists,
+                        # and normal resume can mistake it for live work.
+                        # Finalise the failed worker atomically as a visible,
+                        # retryable technical gap.  The next incremental
+                        # images pass will seed/rebuild this item from the
+                        # latest contract; completed siblings remain intact.
+                        self._plan_mark(
+                            ctx, item_id, "technical_incomplete",
+                            error=(
+                                "本轮重画未得到技术可用产物；已释放生成中"
+                                "认领，等待增量断点自动补齐："
+                                + str(result.get("error") or "未知错误")
+                            )[:1200],
+                            extra={
+                                "selection_required": False,
+                                "technical_retry_required": True,
+                                "redo_failed": True,
+                            })
                         self.log.warn(
                             "director",
                             f"重画 {item_id} 跳过: {result.get('error', '')}")
@@ -30393,13 +30521,19 @@ class Director:
                     "failed": failed, "checked": checked}
         finally:
             row = self.projects.get_episode(episode["id"])
-            if row and row["status"] in ("cast", "cancelling"):
+            incomplete = bool(row and self._preflight_plan_incomplete(ctx))
+            if incomplete:
+                # A batch may begin from awaiting_confirm and redraw only one
+                # target.  If another shot is pending (or this target failed),
+                # restoring awaiting_confirm makes produce() skip images and
+                # jump toward Seedance.  Normalise every prior status to the
+                # explicit resumable state instead; no phone confirmation is
+                # required and the next incremental pass can rebuild the
+                # continuity wavefront.
+                self.projects.set_episode_status(episode["id"], "paused")
+            elif row and row["status"] in ("cast", "cancelling"):
                 self.projects.set_episode_status(
                     episode["id"], previous_status)
-            elif (row and previous_status == "failed"
-                  and row["status"] == "awaiting_confirm"
-                  and self._preflight_plan_incomplete(ctx)):
-                self.projects.set_episode_status(episode["id"], "failed")
         self.log.info("director", f"批量重画完成:{redone} 张")
         if progress:
             progress(phase="done", total=total, completed=processed,

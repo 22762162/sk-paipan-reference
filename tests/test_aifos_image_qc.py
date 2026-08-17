@@ -2498,6 +2498,50 @@ def test_batch_redo_dispatches_same_scene_keyframes_in_parallel(app, monkeypatch
                for call in regen_kwargs)
 
 
+def test_batch_redo_failure_releases_generating_claim_and_pauses(
+        app, monkeypatch):
+    """单图重画异常必须留下可续跑状态，不能假装仍在生成或已完成。"""
+    project = _preproduce(app, title="重画异常断点归一")
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    plan_path = (app.workspace.artifacts_dir
+                 / f"p{project['id']:03d}" / "e001" / "render_plan.json")
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    target = next(
+        item for item in plan["items"]
+        if item["category"] == "shot_image")
+    app.projects.set_episode_status(episode["id"], "awaiting_confirm")
+
+    from aifos.director import Director
+
+    def fail_after_claim(self, project_title, episode_number, target, **_kw):
+        worker_project, worker_episode = self._episode_ctx(
+            project_title, episode_number)
+        worker_ctx = {
+            "project": dict(worker_project),
+            "episode": dict(worker_episode),
+            "out_root": self._episode_dir(worker_project, worker_episode),
+        }
+        self._plan_mark(
+            worker_ctx, f"shot:{int(target['shot_no'])}", "generating")
+        raise AifosError("三人镜头参考图超过供应商上限")
+
+    monkeypatch.setattr(Director, "regen_image", fail_after_claim)
+    result = app.director.redo_items(
+        project["title"], 1, item_ids=[target["id"]])
+
+    assert result["failed"] == 1 and result["redone"] == 0
+    refreshed = next(
+        item for item in json.loads(
+            plan_path.read_text(encoding="utf-8"))["items"]
+        if item["id"] == target["id"])
+    assert refreshed["status"] == "technical_incomplete"
+    assert refreshed["technical_retry_required"] is True
+    assert "已释放生成中认领" in refreshed["error"]
+    assert app.projects.get_episode(episode["id"])["status"] == "paused"
+
+
 def test_manual_qc_pass_promotes_failed_draft_and_keeps_audit_reason(app,
                                                                       tmp_path):
     """轻微问题可人工放行;失败稿进入正式资产但原问题不丢。"""

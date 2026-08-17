@@ -184,3 +184,39 @@ def test_image_and_video_chains_receive_three_separate_space_roles(
     assert "运动控制" in bindings["spatial_blocking"]
     assert "固定家具" in bindings["spatial_scene_clean"]
     assert "唯一空间真相" in bindings["scene_art"]
+
+
+def test_three_person_art_refs_omit_clean_duplicate_not_spatial_anchor(
+        app, tmp_path, deterministic_svg_png, monkeypatch):
+    """三人身份占满额度时，组装阶段仍须成功并保留本镜空间图。"""
+    ctx, _model, _model_row, location = _fixture(app, tmp_path)
+    identities = []
+    for index, character in enumerate(("甲", "乙", "丙"), 1):
+        uri = tmp_path / f"identity-{index}.png"
+        uri.write_bytes(PNG)
+        identities.append({
+            "character": character,
+            "actor_id": f"P{index:02d}",
+            "asset_id": 100 + index,
+            "uri": str(uri),
+            "version": 1,
+        })
+    monkeypatch.setattr(
+        app.director, "_identity_references",
+        lambda *_args, **_kwargs: identities)
+    movement = tmp_path / "three-person-movement.png"
+    movement.write_bytes(PNG)
+
+    refs = app.director._art_refs(
+        ctx, ["甲", "乙", "丙"], location,
+        shot_no=1, spatial_ref=str(movement))
+
+    assert refs["spatial_ref"] == str(movement)
+    assert "spatial_scene_clean_ref" not in refs
+    assert refs["spatial_reference_warnings"]
+    roles = {
+        row.get("reference_role") for row in refs["asset_matches"]}
+    assert {"scene", "spatial"} <= roles
+    assert "spatial_scene_clean" not in roles
+    assert [row["actor_id"] for row in refs["identity_references"]] == [
+        "P01", "P02", "P03"]
