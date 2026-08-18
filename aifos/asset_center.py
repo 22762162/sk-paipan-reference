@@ -119,13 +119,32 @@ class AssetCenter:
     def is_deleted(cls, row):
         return bool(cls.meta(row).get("deleted"))
 
+    def _latest_rows(self, project_id, kind=None):
+        """每个 kind/name 的最高版本行。
+
+        去重下推到 SQL:历史版本不再物化进 Python,资产库随版本增长时
+        看板/资产页等热点路径的内存与序列化开销保持稳定。
+        UNIQUE(project_id, kind, name, version) 索引同时覆盖分组查询。
+        """
+        sql = (
+            "SELECT a.* FROM assets a "
+            "JOIN (SELECT kind, name, MAX(version) AS version FROM assets "
+            "WHERE project_id=? GROUP BY kind, name) latest "
+            "ON latest.kind=a.kind AND latest.name=a.name "
+            "AND latest.version=a.version "
+            "WHERE a.project_id=? "
+        )
+        params = [project_id, project_id]
+        if kind is not None:
+            sql += "AND a.kind=? "
+            params.append(kind)
+        sql += "ORDER BY a.kind, a.name"
+        return self.db.query(sql, params)
+
     def active_list(self, project_id, kind=None):
         """每个 kind/name 只返回当前未删除的最新版本。"""
-        rows = self.list(project_id, kind=kind)
-        latest = {}
-        for row in rows:
-            latest[(row["kind"], row["name"])] = row
-        return [row for row in latest.values() if not self.is_deleted(row)]
+        return [row for row in self._latest_rows(project_id, kind=kind)
+                if not self.is_deleted(row)]
 
     def get(self, asset_id):
         return self.db.query_one(
