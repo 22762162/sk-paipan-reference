@@ -30,6 +30,7 @@ API:
 import base64
 import binascii
 import copy
+import gzip
 import hashlib
 import ipaddress
 import json
@@ -106,6 +107,69 @@ MIME = {
     ".mp3": "audio/mpeg",
     ".wav": "audio/wav",
 }
+
+# 可按需 gzip 的文本类型(二进制媒体压缩无收益,不参与)
+GZIP_EXTS = frozenset({
+    ".html", ".js", ".css", ".json", ".svg", ".webmanifest",
+    ".jsonl", ".log", ".txt",
+})
+GZIP_MIN_SIZE = 1024
+_GZIP_CACHE = {}
+_GZIP_CACHE_MAX = 32
+
+
+def _gzipped(path, body):
+    """按 (路径, mtime, 大小) 缓存压缩结果;静态界面文件反复请求时
+    不为每个连接重复压缩。文件内容变化(mtime/size)自动失效。"""
+    key = (str(path), path.stat().st_mtime, len(body))
+    hit = _GZIP_CACHE.get(key)
+    if hit is None:
+        hit = gzip.compress(body, compresslevel=6)
+        if len(_GZIP_CACHE) >= _GZIP_CACHE_MAX:
+            _GZIP_CACHE.clear()
+        _GZIP_CACHE[key] = hit
+    return hit
+
+
+def _gzip_bytes(body):
+    """动态负载(JSON)按内容哈希缓存压缩结果;内容未变的轮询请求
+    直接命中,避免每 2.5s 重复压缩 260KB 的看板数据。"""
+    key = hashlib.sha256(body).hexdigest()
+    hit = _GZIP_CACHE.get(key)
+    if hit is None:
+        hit = gzip.compress(body, compresslevel=6)
+        if len(_GZIP_CACHE) >= _GZIP_CACHE_MAX:
+            _GZIP_CACHE.clear()
+        _GZIP_CACHE[key] = hit
+    return hit
+
+
+def _parse_range(header, size):
+    """解析单范围 Range 头。
+
+    返回 (start, end) 闭区间;None 表示按 RFC 9110 忽略该头回全量
+    (语法非法或多范围);"unsatisfiable" 表示语法合法但不可满足(416)。
+    """
+    unit, _, spec = (header or "").partition("=")
+    if unit.strip() != "bytes":
+        return None
+    spec = spec.strip()
+    if "," in spec:
+        return None
+    first, _, last = spec.partition("-")
+    try:
+        if first == "":
+            suffix = int(last)
+            if suffix <= 0:
+                return "unsatisfiable"
+            return (max(size - suffix, 0), size - 1)
+        start = int(first)
+        end = size - 1 if last == "" else min(int(last), size - 1)
+    except ValueError:
+        return None
+    if start >= size or start > end or start < 0:
+        return "unsatisfiable"
+    return (start, end)
 
 CREATIVE_RULE_PACK_SCHEMA = "aifos.creative-rule-pack/v1"
 PROJECT_RULE_SCOPE = "project_series"
@@ -4468,6 +4532,13 @@ def make_handler(workspace, jobs):
             self.send_response(status)
             self.send_header("Content-Type",
                              "application/json; charset=utf-8")
+            if (len(body) >= GZIP_MIN_SIZE
+                    and "gzip" in (self.headers.get("Accept-Encoding") or "")):
+                # 看板等大负载过隧道/外网时体积敏感;按内容哈希缓存压缩
+                # 结果,2.5s 轮询命中缓存时不必重复压缩
+                body = _gzip_bytes(body)
+                self.send_header("Content-Encoding", "gzip")
+                self.send_header("Vary", "Accept-Encoding")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -4494,19 +4565,57 @@ def make_handler(workspace, jobs):
             path = Path(path)
             if not path.is_file():
                 return self._error(404, "文件不存在")
+            size = path.stat().st_size
+            content_type = MIME.get(
+                path.suffix.lower(), "application/octet-stream")
+
+            def send_cache_headers():
+                if no_cache:
+                    # 界面文件禁缓存:git pull 更新后刷新即生效,
+                    # 避免浏览器缓存旧版界面导致"更新了却看不到新功能"
+                    self.send_header("Cache-Control", "no-cache")
+                elif cache_seconds:
+                    self.send_header("Cache-Control",
+                                     f"public, max-age={int(cache_seconds)}")
+
+            if "Range" in self.headers:
+                parsed_range = _parse_range(self.headers["Range"], size)
+                if parsed_range == "unsatisfiable":
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{size}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                if parsed_range is not None:
+                    start, end = parsed_range
+                    with open(path, "rb") as fh:
+                        fh.seek(start)
+                        body = fh.read(end - start + 1)
+                    self.send_response(206)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header(
+                        "Content-Range", f"bytes {start}-{end}/{size}")
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.send_header("Content-Length", str(len(body)))
+                    send_cache_headers()
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+
             body = path.read_bytes()
             self.send_response(200)
-            self.send_header(
-                "Content-Type",
-                MIME.get(path.suffix.lower(), "application/octet-stream"))
+            self.send_header("Content-Type", content_type)
+            # 大文本(界面 js/css、数据导出)过隧道/外网时体积敏感;
+            # 按内容协商压缩,压缩结果按 (路径, mtime, 大小) 缓存
+            if (size >= GZIP_MIN_SIZE
+                    and path.suffix.lower() in GZIP_EXTS
+                    and "gzip" in (self.headers.get("Accept-Encoding") or "")):
+                body = _gzipped(path, body)
+                self.send_header("Content-Encoding", "gzip")
+                self.send_header("Vary", "Accept-Encoding")
+            self.send_header("Accept-Ranges", "bytes")
             self.send_header("Content-Length", str(len(body)))
-            if no_cache:
-                # 界面文件禁缓存:git pull 更新后刷新即生效,
-                # 避免浏览器缓存旧版界面导致"更新了却看不到新功能"
-                self.send_header("Cache-Control", "no-cache")
-            elif cache_seconds:
-                self.send_header("Cache-Control",
-                                 f"public, max-age={int(cache_seconds)}")
+            send_cache_headers()
             self.end_headers()
             self.wfile.write(body)
 
@@ -5056,11 +5165,10 @@ def make_handler(workspace, jobs):
             return target
 
         def _artifact(self, rel, query=None):
-            app = App(workspace)
-            try:
-                root = app.workspace.artifacts_dir.resolve()
-            finally:
-                app.close()
+            # 产物目录是 workspace 下的固定子目录;列表页每张图/每段视频
+            # 都走这里,若为一静态文件装配整套 App(数据库连接 + 全部
+            # 业务中心),高并发刷图时会造成持续的 SQLite 连接抖动。
+            root = (workspace / "artifacts").resolve()
             target = (root / rel).resolve()
             if not str(target).startswith(str(root) + "/"):
                 return self._error(404, "非法路径")
