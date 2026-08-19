@@ -4199,7 +4199,10 @@ class Director:
         locked_look = locked_look if isinstance(locked_look, dict) else {}
         fields = {
             "turnaround": ("species", "gender", "age_range", "appearance",
-                           "hair", "era_setting"),
+                           "hair",
+                           # 审核板四视角为全身,服装可见且须四视图一致,
+                           # 必须自带锁定主造型(同下方 features/makeup)。
+                           "costume", "era_setting"),
             "closeup": ("species", "gender", "age_range", "appearance",
                         "hair", "eyes", "makeup", "temperament"),
             "front": ("species", "gender", "age_range", "appearance",
@@ -4211,7 +4214,11 @@ class Director:
             "back": ("species", "gender", "age_range", "hair", "costume",
                      "costume_detail", "accessories", "palette", "era_setting"),
             "features": ("species", "gender", "age_range", "appearance",
-                         "hair", "eyes", "signature", "temperament"),
+                         "hair", "eyes", "signature", "temperament",
+                         # 特征板为正面半身/局部,服装可见;身份参考图职责
+                         # 排除 wardrobe、规则禁止新增服装——必须自带锁定
+                         # 主造型,否则审核门禁三方互锁必然熔断(j50 实熔断)。
+                         "costume"),
             "makeup": ("species", "gender", "age_range", "appearance",
                        "hair", "eyes", "makeup", "temperament",
                        # 正面半身必然露出服装,而身份参考图职责排除

@@ -114,6 +114,17 @@ def test_makeup_sheet_carries_locked_costume(app):
     assert "底妆" in prompt or "淡妆" in prompt
 
 
+def test_features_and_turnaround_sheets_carry_locked_costume(app):
+    """正面半身/全身审核板都露出服装:必须自带锁定主造型(j50 实熔断)。"""
+    for key in ("features", "turnaround"):
+        prompt = app.director._sheet_prompt(
+            "顾衡", "重要配角", "电影级写实", "特征设定", "legacy",
+            key=key, design=_design(),
+            locked_look={"costume": _design()["costume"]})
+        assert "服装" in prompt, key
+        assert "短外套叠无袖针织内层" in prompt, key
+
+
 # ---- 审核上下文透传相位 ----
 
 def test_review_context_exposes_story_phase_and_base_state():
