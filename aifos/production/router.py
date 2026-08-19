@@ -480,6 +480,11 @@ class ProviderRouter:
                 "location": contract.get("scene")
                 or payload.get("location"),
                 "era_context": payload.get("era_context"),
+                # 母资产/镜头显式声明的相位与基准状态是裁决条件态事实
+                # (相位光色、起止状态)的决定性依据,必须透传给审核。
+                "story_phase": payload.get("story_phase"),
+                "initial_character_state": payload.get(
+                    "initial_character_state"),
                 "sanctioned_anachronisms": payload.get(
                     "sanctioned_anachronisms") or [],
                 "prompt_contract": executable_contract,
@@ -499,6 +504,7 @@ class ProviderRouter:
             "reference_manifest", "identity_references",
             "character_background", "story_world", "story_background",
             "style", "aspect",
+            "story_phase", "initial_character_state",
         )
         context = {
             "capability": capability,

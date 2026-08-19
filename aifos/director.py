@@ -4061,6 +4061,37 @@ class Director:
         text = re.sub(
             r"[（(][^（）()]*?(?:本体|错穿|备用|第二套|身份|载)[^（）()]*[）)]",
             "", text)
+        # 否定排除整段剔除:「鞋面无泥污」「无伤口」这类排除剧情状态的
+        # 表述必须连同否定词整体移除,且必须先于下面的单词级删除——
+        # 否则「无泥污」只删掉「泥污」,留下「鞋面无;」截断残句,审核
+        # 门禁会按「缺少决定性事实」正确阻断(12星座 costume_detail 实
+        # 际熔断即此形态)。两种形态分别处理:连接词引导(且鞋面无泥污)
+        # 与整段排除(，无伤口);名词段不允许再含连接词,防止跨越吞噬
+        # 前段稳定事实。长词在前,避免「汗湿痕」被「汗湿」截掉。
+        _STATE_WORDS = (
+            r"汗湿痕|泥水痕|泥污|泥点|污渍|血痕|血污|血迹|伤口?|"
+            r"包扎|汗湿|渗痕|污损|伤情")
+        _NEGATION = r"(?:无|没有|未|不带|不沾|不见|不含)"
+        text = re.sub(
+            r"(?:且|与|和)[^，；。、且与和]{0,6}?" + _NEGATION
+            + r"[^，；。、]{0,4}?(?:" + _STATE_WORDS + r")",
+            "", text)
+        text = re.sub(
+            r"(?:^|[，；。、,;])\s*[^，；。、且与和]{0,6}?" + _NEGATION
+            + r"[^，；。、]{0,4}?(?:" + _STATE_WORDS + r")[^，；。、]*",
+            "", text)
+        # 相位条件态(「认证失败时红色」「共鸣后才转为银白」)是具体剧情
+        # 相位下的配饰状态,不是母资产的稳定属性;母资产锁定首次登场
+        # 基础定妆态,条件段在编译期剔除,相位由 story_phase 统一声明。
+        text = re.sub(
+            r"[^，；。]*(?:认证|验证|触发|激活|共鸣|觉醒|战斗|受伤)"
+            r"[^，；。]*(?:时|之后|后)[^，；。]*",
+            "", text)
+        text = re.sub(
+            r"[^，；。]*(?:时|之后|后)(?:才|便|则)"
+            r"(?:转为|变为|变成|亮起|熄灭|发光|显出|呈现|泛起)"
+            r"[^，；。]*",
+            "", text)
         for phrase in (
                 "旅途风尘", "汗湿痕", "汗湿", "泥水痕", "泥点", "泥污",
                 "污渍", "血痕", "血污", "血迹", "渗痕", "刀伤", "伤口",
@@ -4182,7 +4213,11 @@ class Director:
             "features": ("species", "gender", "age_range", "appearance",
                          "hair", "eyes", "signature", "temperament"),
             "makeup": ("species", "gender", "age_range", "appearance",
-                       "hair", "eyes", "makeup", "temperament"),
+                       "hair", "eyes", "makeup", "temperament",
+                       # 正面半身必然露出服装,而身份参考图职责排除
+                       # wardrobe、规则又禁止新增服装——妆容板必须自带
+                       # 锁定主造型,否则审核门禁三方互锁必然熔断。
+                       "costume"),
             "costume": ("species", "gender", "age_range", "hair", "costume",
                         "costume_detail", "accessories", "palette",
                         "era_setting"),
@@ -4416,6 +4451,9 @@ class Director:
             f"【STYLE】{style}；本剧所有人物设定图保持同一媒介与渲染方式。",
             "【单一状态】本批母资产统一使用干净、均匀、自然微纹理的皮肤；"
             "不画泥点、血污、汗湿污痕、伤口、包扎或其他临时剧情损伤。",
+            "【相位基准】本资产为首次登场基础定妆母版；相位条件配饰"
+            "（状态光、状态纹样等）一律按未激活基础态执行：未亮、无光、"
+            "无剧情相位特效。",
             f"【背景】{SHEET_BACKGROUND_RULE}",
             "【硬禁止】不要补写剧情、不要把人物传记/动作/道具/第二套服装"
             "带入本张图；不要新增或复制角色，不要把四视图的同一人误画成多人。",
@@ -16412,6 +16450,15 @@ class Director:
                             locked_look=locked_looks.get(name)),
                         "style": style,
                         "prompt_contract_complete": True,
+                        # 母资产统一锁定首次登场基础定妆态:相位条件配饰
+                        # (状态光等)按未激活基础态执行,审核门禁据此裁决,
+                        # 不再需要在多个剧情相位间猜测。
+                        "story_phase": "首次登场基础定妆",
+                        "initial_character_state": (
+                            "母版基准状态：干燥、洁净、无伤、无污、无包扎；"
+                            "相位条件配饰（状态光、状态纹样等）按首次登场"
+                            "基础态执行，一律未激活、未亮、无光；本资产服装"
+                            "即已锁定主造型"),
                         "character_background": designs.get(name) or {},
                         "character_refs": (
                             [portrait_uri] if portrait_uri else []),
