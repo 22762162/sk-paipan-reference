@@ -461,13 +461,20 @@ class ProviderRouter:
                     "schema", "output", "frame_target", "subject",
                     "population", "scene", "scene_layout",
                     "style_direction", "camera", "lighting",
-                    "spatial_staging",
+                    "spatial_staging", "aspect_precedence",
                     "physical", "frame_props", "readable_text_current",
                     "text_rule", "reference_roles",
                 )
                 if contract.get(key) not in (None, "", [], {})
             }
-            return {
+            # 裁决条款是平台政策(代码常量),不是逐镜数据:断点续产会
+            # 恢复修复前编译的旧冻结合同,审核必须始终拿到当前代码的
+            # 条款全文(12星座 shot 12 因旧条款缺少画内/画外裁决而反复
+            # 熔断)。与 prompt_adjudication_clause 同一生效方式。
+            from ..prompt_contract import CAMERA_PRECEDENCE_CLAUSE
+            executable_contract["camera_precedence"] = (
+                CAMERA_PRECEDENCE_CLAUSE)
+            context = {
                 "capability": capability,
                 "shot_no": payload.get("shot_no"),
                 "frame_kind": payload.get("frame_kind"),
@@ -490,6 +497,11 @@ class ProviderRouter:
                 "prompt_contract": executable_contract,
                 "reference_manifest": payload.get(
                     "reference_manifest") or [],
+            }
+            # 瘦身:剥掉空值键,审核上下文只携带真实事实。
+            return {
+                key: value for key, value in context.items()
+                if value not in (None, "", [], {})
             }
         keys = (
             "title", "episode", "tagline",

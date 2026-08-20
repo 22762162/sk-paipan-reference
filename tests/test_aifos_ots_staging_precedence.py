@@ -85,6 +85,42 @@ def test_camera_precedence_covers_staging_projection_values():
     assert "population" in precedence
 
 
+def test_review_context_injects_fresh_camera_precedence_for_stale_contracts():
+    """断点续产恢复的旧冻结合同不含新裁决句,审核上下文也必须拿到
+    当前代码的条款全文(12星座 shot 12 熔断形态)。"""
+    from aifos.prompt_contract import CAMERA_PRECEDENCE_CLAUSE
+    from aifos.production.router import ProviderRouter
+
+    payload = {
+        "prompt_contract_complete": True,
+        "prompt_contract": {
+            "schema": "aifos.shot-prompt/v2.2",
+            "camera": "全景",
+            # 旧合同:没有 camera_precedence,或只有旧版短文本
+        },
+        "characters": ["林未", "顾衡"],
+    }
+    context = ProviderRouter._prompt_review_context("image", payload)
+    injected = context["prompt_contract"]["camera_precedence"]
+    assert injected == CAMERA_PRECEDENCE_CLAUSE
+    assert "画面内/外归属" in injected
+    assert "轴线锚点合同为执行值" in injected
+
+
+def test_review_context_strips_empty_values():
+    """瘦身:空值键不再进入审核上下文 JSON。"""
+    from aifos.production.router import ProviderRouter
+    context = ProviderRouter._prompt_review_context("image", {
+        "prompt_contract_complete": True,
+        "prompt_contract": {"schema": "aifos.shot-prompt/v2.2"},
+        "characters": [],
+        "story_phase": "",
+    })
+    assert "story_phase" not in context
+    assert "characters" not in context
+    assert context["capability"] == "image"
+
+
 def test_non_ots_shot_not_polluted_by_ots_ruling():
     """普通镜头不应出现过肩裁决条款。"""
     shot = _ots_shot()
