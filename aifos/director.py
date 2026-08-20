@@ -6152,6 +6152,11 @@ class Director:
             r"(?:原)?(?:参考)?图\s*(\d+)",
             r"(?:原)?(?:参考)?图\s*(\d+)"
             r"[^。；\n]{0,20}(?:移除|删除|去掉|剔除|禁用|不再使用|不得读取)",
+            # Codex 常写「移除index 3」「删除index=3」而非「图3」
+            r"(?:移除|删除|去掉|剔除|禁用|不再使用|不得读取|不读取|不继承)"
+            r"[^。；\n]{0,8}?index\s*[=＝#号]?\s*(\d+)",
+            r"index\s*[=＝#号]?\s*(\d+)[^。；\n]{0,16}"
+            r"(?:移除|删除|去掉|剔除|禁用|不再使用|不得读取)",
         )
         seen = set()
         for pattern in remove_patterns:
@@ -6230,15 +6235,27 @@ class Director:
         # Structured QC remains authoritative when it already names the same
         # operation.  Explicit numbered commands fill the common gap where
         # Codex says "remove image 6" in prose but emits only keep rows.
+        # 同一目标的结构化动作若同时被文字指令明确点名,显式标记必须合并
+        # 过去——否则结构化行没有 _codex_explicit、文字行被去重丢弃,
+        # 「Codex 明确下令移除」会被误判成弱引用而永远跳过(12星座 shot 8
+        # 修复循环即此形态:每轮 QC 重复同一移除指令,每轮都被跳过)。
         structured_keys = {
             (str(action.get("action") or ""),
              action.get("target_index"))
             for action in actions
         }
-        actions.extend(
-            action for action in explicit_actions
-            if (str(action.get("action") or ""),
-                action.get("target_index")) not in structured_keys)
+        for action in explicit_actions:
+            key = (str(action.get("action") or ""),
+                   action.get("target_index"))
+            if key in structured_keys:
+                for existing in actions:
+                    if (str(existing.get("action") or ""),
+                            existing.get("target_index")) == key:
+                        existing["_codex_explicit"] = True
+                        if not existing.get("reason"):
+                            existing["reason"] = action.get("reason")
+                continue
+            actions.append(action)
         manifest = {
             int(item.get("index")): item
             for item in (payload.get("reference_manifest") or [])
@@ -6319,9 +6336,14 @@ class Director:
                 continue
             if kind == "remove":
                 explicit = bool(action.get("_codex_explicit"))
+                # 角色按词根归一:spatial_scene_clean/spatial_blocking 等
+                # 空间族与 scene_clean 等场景族同属可诊断冲突的弱引用;
+                # 此前只认 prop/spatial/scene 整词,QC 确诊冲突的
+                # 「干净机位空间图」永远落不进豁免而反复轮空。
                 diagnosed_conflict = bool(
                     reference_status == "conflicting"
-                    and target_role in {"prop", "spatial", "scene"})
+                    and target_role.split("_", 1)[0] in {
+                        "prop", "spatial", "scene"})
                 if (target_role not in removable_roles
                         and not explicit and not diagnosed_conflict):
                     skip(action, f"{target_role or '未标注'}参考图不是可自动移除的弱引用")
