@@ -31,9 +31,11 @@ class _Result:
         self.qc = qc
 
 
-def _escalation_qc(action="repair_contract", instruction="将本镜焦段统一为50mm"):
+def _escalation_qc(action="repair_contract", instruction="将本镜焦段统一为50mm",
+                   issues=None):
     return {
         "passed": False,
+        "issues": list(issues or []),
         "codex_escalation": {
             "triggered": True,
             "status": "completed",
@@ -138,8 +140,8 @@ def test_escalation_without_a_concrete_instruction_still_goes_to_human(
 
 def test_repair_is_bounded_to_nine_four_draw_batches(app, monkeypatch):
     ctx, task = _ctx_and_task(app, monkeypatch)
-    # Codex 每轮给的是不同诊断,合同每次都真的变;这样才走得到上限,
-    # 否则第二次修出同一份合同会先被「输入未变化」挡掉。
+    # 每轮带来不同的新诊断信号(收敛中),合同每次都真的变;
+    # 收敛中的修复放行到 9 批上限,超过后不再继续付费抽卡。
     rounds = {"n": 0}
 
     def varying_call(_self, _ctx, capability, payload, _sub):
@@ -154,19 +156,44 @@ def test_repair_is_bounded_to_nine_four_draw_batches(app, monkeypatch):
 
     monkeypatch.setattr(Director, "_call", varying_call)
     assert app.director._auto_apply_codex_escalation(
-        ctx, task, _Result(_escalation_qc()))
+        ctx, task, _Result(_escalation_qc(issues=[f"第1轮新问题:焦段"])))
     assert task["payload"]["_codex_contract_repair_count"] == 1
     assert task["payload"]["_auto_repair_batches_used"] == 1
-    # 初始四抽后允许最多 9 个自动修复批次；每批仍由外层候选器固定
-    # 生成 4 张，总上限 10 轮/40 张。超过上限后不再继续付费抽卡。
     repair_limit = app.director._shot_auto_repair_batches()
     assert repair_limit == 9
     for expected in range(2, repair_limit + 1):
+        assert app.director._auto_apply_codex_escalation(
+            ctx, task, _Result(_escalation_qc(
+                issues=[f"第{expected}轮新问题:完全不同"])))
+        assert task["payload"]["_auto_repair_batches_used"] == expected
+    assert app.director._auto_apply_codex_escalation(
+        ctx, task, _Result(_escalation_qc(issues=["继续新问题"]))) == ""
+
+
+def test_stagnant_repair_stops_at_early_promote_line(app, monkeypatch):
+    """非收敛修复(无新诊断信号)在早停线收手,转入相对最优晋升。"""
+    ctx, task = _ctx_and_task(app, monkeypatch)
+    rounds = {"n": 0}
+
+    def varying_call(_self, _ctx, capability, payload, _sub):
+        rounds["n"] += 1
+        class R:
+            data = {"camera": {"焦段": f"{40 + rounds['n']}mm"},
+                    "repair_summary": f"第{rounds['n']}轮"}
+            cost = 0.0
+            provider = "deepseek"
+        return R()
+
+    monkeypatch.setattr(Director, "_call", varying_call)
+    early = app.director.QC_EARLY_PROMOTE_BATCHES
+    for expected in range(1, early + 1):
+        # 每轮都是同一问题的重复(无新信号)= 非收敛
         assert app.director._auto_apply_codex_escalation(
             ctx, task, _Result(_escalation_qc()))
         assert task["payload"]["_auto_repair_batches_used"] == expected
     assert app.director._auto_apply_codex_escalation(
         ctx, task, _Result(_escalation_qc())) == ""
+    assert task["payload"]["_auto_repair_batches_used"] == early
 
 
 def test_fourth_repair_instruction_is_applied_without_human_confirmation(

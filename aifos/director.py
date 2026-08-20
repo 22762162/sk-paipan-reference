@@ -10947,6 +10947,11 @@ class Director:
     # a fixed four-draw round converges.  Keep the run autonomous instead of
     # falling back to a human confirmation after an otherwise recoverable miss.
     CODEX_CONTRACT_REPAIR_LIMIT = 10
+    # 精修早停:同一质检问题签名第 3 次出现即判定非收敛;修复批次达到
+    # 5 批仍未过检也提前晋升相对最优稿(降级接收,风险台账留痕),
+    # 不再把长尾烧到 10 轮上限。
+    QC_STAGNATION_SIGNATURE_LIMIT = 2
+    QC_EARLY_PROMOTE_BATCHES = 5
     DEEP_CONTRACT_SLIMMING_MARKER = "【连续失败后的深度合同瘦身】"
     DEEP_CONTRACT_SLIMMING_GUIDANCE = (
         "【连续失败后的深度合同瘦身】这是第3轮或之后的自动修复，"
@@ -10961,6 +10966,35 @@ class Director:
         "为固定(2026-08-01 实测:三轮瘦身把「中景·推」削成固定,"
         "关键帧没得救,成片先没了运镜)。"
         "输出一份更短、无互斥、单帧真实可拍的唯一合同。")
+
+    @staticmethod
+    def _qc_issue_signature(issues):
+        """归一化质检问题签名:跨轮比较收敛性,忽略编号、标点与措辞变化。"""
+        parts = []
+        for issue in (issues or [])[:3]:
+            text = re.sub(r"[\d\s\W_]+", "", str(issue or ""))[:40]
+            if text:
+                parts.append(text)
+        return "｜".join(parts)
+
+    def _qc_stagnation_rounds(self, task, signature):
+        if not signature:
+            return 0
+        history = (task.get("payload") or {}).get("_qc_issue_signatures") or []
+        return sum(1 for item in history if item == signature)
+
+    def _qc_stagnation_reached(self, task, signature):
+        """同一签名已出现 QC_STAGNATION_SIGNATURE_LIMIT 次→本轮即第 3 次。"""
+        return (self._qc_stagnation_rounds(task, signature)
+                >= self.QC_STAGNATION_SIGNATURE_LIMIT)
+
+    def _record_qc_issue_signature(self, task, signature):
+        if not signature:
+            return
+        payload = task.setdefault("payload", {})
+        history = list(payload.get("_qc_issue_signatures") or [])
+        history.append(signature)
+        payload["_qc_issue_signatures"] = history[-6:]
 
     def _auto_apply_codex_escalation(self, ctx, task, result):
         """Codex 给了具体修改指令就自动执行,不再推给人工。
@@ -11008,6 +11042,30 @@ class Director:
             return ""
         if used >= self.CODEX_CONTRACT_REPAIR_LIMIT:
             return ""
+        # 非收敛早停:同一问题签名第 3 次出现,说明修复在原地踏步;
+        # 或修复批次达到早停线且没有新诊断信号(不收敛)——继续烧轮次
+        # 的预期收益极低。返回空串,调用方走既有的相对最优晋升(降级
+        # 接收+风险台账),与十轮上限后的结局一致,只是把必然结果提前。
+        # 每轮都带来新问题的修复视为收敛中,放行到既有批次上限。
+        current_sig = self._qc_issue_signature(qc.get("issues"))
+        sig_rounds = self._qc_stagnation_rounds(task, current_sig)
+        if (current_sig
+                and sig_rounds >= self.QC_STAGNATION_SIGNATURE_LIMIT):
+            self.log.warn(
+                "director",
+                f"{item_id} 同一质检问题第 {sig_rounds + 1} 轮"
+                "仍未收敛,提前转入相对最优晋升,不再消耗修复轮次:"
+                f"{current_sig[:120]}")
+            return ""
+        converging = bool(current_sig) and sig_rounds == 0
+        if (repair_batches_used >= self.QC_EARLY_PROMOTE_BATCHES
+                and not converging):
+            self.log.warn(
+                "director",
+                f"{item_id} 已达早停线({self.QC_EARLY_PROMOTE_BATCHES} 批)且无"
+                "新诊断信号,提前转入相对最优晋升;问题留在风险台账,界面可见")
+            return ""
+        self._record_qc_issue_signature(task, current_sig)
         before = self._image_generation_input(task.get("payload") or {})
         diagnostics = normalize_generation_diagnostics(
             qc.get("input_diagnosis") or qc,
