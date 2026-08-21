@@ -39,12 +39,35 @@ from aifos.prompt_contract import readable_text_required, sanitize_text_whitelis
 
 # 非交互出图必需:可写沙箱 + 跳过 git 仓库检查(产物目录不是 git 仓库)。
 # 旧版 codex 不认识这些参数时,run() 会自动去掉重试。
-DEFAULT_EXEC_ARGS = ["--sandbox", "workspace-write", "--skip-git-repo-check"]
+# 推理强度显式压到 low:出图代理的活是把指令交给图像模型、落盘并复检
+# 文件,是纯机械执行;账号 config.toml 默认 xhigh 会让每张图在规划阶段
+# 白烧几分钟思考(12星座 ep1 出图链 97% 墙钟时间实测)。
+DEFAULT_EXEC_ARGS = [
+    "--sandbox", "workspace-write", "--skip-git-repo-check",
+    "-c", 'model_reasoning_effort="low"',
+]
 PROMPT_REVIEW_EXEC_ARGS = [
     "--sandbox", "read-only", "--skip-git-repo-check",
     "--ephemeral", "--ignore-rules",
     "-c", 'model_reasoning_effort="low"',
 ]
+# 视觉复检要逐张比对参考图与画面事实,给 medium 保留判断力;
+# 仍比账号默认的 xhigh 快数倍。
+IMAGE_QC_EXEC_ARGS = [
+    "--sandbox", "workspace-write", "--skip-git-repo-check",
+    "-c", 'model_reasoning_effort="medium"',
+]
+
+def _exec_args_for(capability, plain=False):
+    """按能力选择 exec 参数;plain 模式不带任何默认参数(旧版兼容重试)。"""
+    if plain:
+        return []
+    if capability == "prompt_review":
+        return list(PROMPT_REVIEW_EXEC_ARGS)
+    if capability == "image_qc":
+        return list(IMAGE_QC_EXEC_ARGS)
+    return list(DEFAULT_EXEC_ARGS)
+
 
 # 强制真实出图:Codex 是编码代理,放任它就会用 Pillow 画示意图充数
 # 画面语义硬约束:角色名不是物种;不画剧情外的杂物
@@ -1414,10 +1437,7 @@ def run(request, codex, timeout, extra_args, plain=False):
             before_targets[str(path)] = (stat.st_mtime_ns, stat.st_size)
         except OSError:
             before_targets[str(path)] = None
-    exec_args = (
-        [] if plain else list(
-            PROMPT_REVIEW_EXEC_ARGS
-            if capability == "prompt_review" else DEFAULT_EXEC_ARGS))
+    exec_args = _exec_args_for(capability, plain)
 
     def invoke(args):
         proc = subprocess.Popen(
