@@ -8530,8 +8530,10 @@ class Director:
             index for index in range(1, pulls + 1)
             if index not in results]
         run_wave(missing, 1)
-        # API/文件落盘等技术错误只补当前唯一槽位一次。
-        run_wave(sorted(failures), 2)
+        # 瞬时通道故障(限流/传输中断/全链暂不可用)需要时间恢复:背靠背
+        # 重试只会把 60 秒配额窗口固化成整轮零候选(12星座 j61 的 16 镜头
+        # 缺图即此形态)。退避后最多补两波;非瞬时错误维持原单次补位。
+        self._candidate_retry_waves(failures, run_wave)
 
         ordered = [results[index] for index in sorted(results)]
         candidates = [candidate for _result, candidate in ordered]
@@ -10867,6 +10869,37 @@ class Director:
             if label not in labels:
                 labels.append(label)
         return "零张技术可用候选：" + "；".join(labels)[:850]
+
+    @staticmethod
+    @staticmethod
+    def _is_transient_provider_error(text):
+        """限流/传输中断/全链暂不可用等瞬时通道故障:值得退避重试。"""
+        lowered = str(text or "").lower()
+        return any(token in lowered for token in (
+            "429", "rate limit", "rate_limit", "ratelimit",
+            "usage limit", "incompleteread", "timed out", "timeout",
+            "temporarily", "connection reset", "connection aborted",
+            "没有可用 provider", "没有可用provider", "quota",
+        ))
+
+    def _candidate_retry_waves(self, failures, run_wave, sleep=time.sleep):
+        """候选补位波次调度:瞬时通道故障退避重试(60s/150s 两波),
+        非瞬时错误维持原有的单次补位。failures 由 run_wave 就地更新。"""
+        pending = sorted(failures)
+        if not pending:
+            return
+        if not all(
+                self._is_transient_provider_error(
+                    failures[index].get("error"))
+                for index in pending):
+            run_wave(pending, 2)
+            return
+        for attempt, delay in ((2, 60), (3, 150)):
+            if not pending:
+                break
+            sleep(delay)
+            run_wave(pending, attempt)
+            pending = sorted(failures)
 
     @staticmethod
     def _candidate_selection_pending(result):
