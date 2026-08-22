@@ -6150,6 +6150,9 @@ class Director:
         remove_patterns = (
             r"(?:移除|删除|去掉|剔除|禁用|不再使用|不得读取)"
             r"(?:原)?(?:参考)?图\s*(\d+)",
+            # 桥接型:「移除标示"S1·0人"的参考图1」——动词与编号间有修饰语
+            r"(?:移除|删除|去掉|剔除|禁用|不再使用|不得读取)"
+            r"[^。；\n]{0,12}?(?:参考)?图\s*(\d+)",
             r"(?:原)?(?:参考)?图\s*(\d+)"
             r"[^。；\n]{0,20}(?:移除|删除|去掉|剔除|禁用|不再使用|不得读取)",
             # Codex 常写「移除index 3」「删除index=3」而非「图3」
@@ -22029,6 +22032,21 @@ class Director:
             for task in round_tasks:
                 result = results.get(task["tag"])
                 if result is None:
+                    # 修订型首尾帧被审核阻断(如修订要求的参考职责无法补足)
+                    # 且本镜已有过检成品帧时,保留现状继续生产——修订指令
+                    # 留痕在清单与日志,不让一次打磨性修订拖停整条产线。
+                    block_reason = next(
+                        (str(exc) for failed_task, exc in qc_failures
+                         if str(failed_task.get("item_id") or "")
+                         == str(task.get("item_id") or "")), "")
+                    kept = self._frames_keep_current_pair(
+                        ctx, task, block_reason)
+                    if kept:
+                        reused += 1
+                        last_by_chain[task["scene"]] = {
+                            "uri": kept["last"],
+                            "image_quality": kept["image_quality"],
+                            "shot_no": task["tag"]}
                     continue
                 shot_no = task["tag"]
                 decision = task["payload"]["quality_decision"]
@@ -22100,6 +22118,61 @@ class Director:
                 "以下镜头等待人工修改或上游尾帧通过后再从断点继续: "
                 + "、".join(map(str, sorted(set(waiting)))))
         return {"count": len(ctx["frames"]), "reused": reused}
+
+    def _frames_keep_current_pair(self, ctx, task, block_reason=""):
+        """修订型首尾帧被审核阻断时,保留本镜已过检的现有帧对继续生产。
+
+        修订反馈改变了输入签名,常规复用(签名精确匹配)因此失效而触发
+        重生成;若重生成被审核门禁阻断(例如修订要求的参考职责当前无法
+        补足),本镜已有 QC 通过的帧对应保留下来——打磨性修订不拖停整
+        条产线,未落实的修订原因在清单与日志留痕,界面上可见。
+        返回复用条目;无可用过检帧对时返回 None(维持原失败路径)。
+        """
+        shot_no = task.get("tag")
+        name = self._shot_name(ctx, shot_no)
+        first = self._existing_asset_uri(ctx, "first_frame", name)
+        last = self._existing_asset_uri(ctx, "last_frame", name)
+        if not (first and last):
+            return None
+        if not (Path(first).is_file() and Path(last).is_file()):
+            return None
+        first_row = self.assets.latest(
+            ctx["project"]["id"], "first_frame", name)
+        last_row = self.assets.latest(
+            ctx["project"]["id"], "last_frame", name)
+        levels = (self._asset_quality(first_row), self._asset_quality(last_row))
+        frame_quality = min(levels, key=("low", "medium", "high").index)
+        decision = (task.get("payload") or {}).get("quality_decision") or {}
+        if not self._quality_meets(
+                frame_quality, decision.get("level", "medium")):
+            return None
+        saved_qc_passed = any(
+            self._asset_meta(row).get("qc_passed") is True
+            for row in (first_row, last_row))
+        if self._image_qc_enabled() and not saved_qc_passed:
+            return None
+        content_qc_waived = not self._image_qc_enabled()
+        note = (
+            "本次修订未落实(生成前审核阻断),已保留本镜过检现状帧继续生产; "
+            "阻断原因:" + (block_reason or "未知"))[:400]
+        self._plan_mark(
+            ctx, f"frames:{shot_no}", "reused",
+            extra={"revision_blocked_keep_current": True,
+                   "revision_block_reason": (block_reason or "")[:300]})
+        self.log.warn(
+            "director",
+            f"镜头{shot_no} 首尾帧修订被审核阻断,保留已过检现状帧继续: "
+            + (block_reason or "")[:200])
+        return {
+            "shot_no": shot_no, "first": first, "last": last,
+            "image_quality": frame_quality,
+            "qc_passed": saved_qc_passed,
+            "content_qc_enabled": not content_qc_waived,
+            "content_qc_waived": content_qc_waived,
+            "inspection_waived": self._director_autonomy_enabled(),
+            "revision_blocked_keep_current": True,
+            "revision_note": note,
+        }
 
     def _stage_preflight(self, ctx):
         """确认前硬门禁：任一项未过都不能消耗 Seedance 额度。"""
