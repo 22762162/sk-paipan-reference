@@ -3,7 +3,6 @@ from reference.relations_ref import (
 )
 
 
-@__import__("pytest").mark.xfail(strict=False, reason="盲写自检未过,证据保全不修改;待 INV-08 仲裁,见 docs/duipai/divination-diff-events-20260831.md DIFF-DIV-003")
 def test_all_six_pairs_and_half_combinations():
     assert "六合" in relation_names("子", "丑")
     assert "六冲" in relation_names("子", "午")
@@ -11,7 +10,7 @@ def test_all_six_pairs_and_half_combinations():
     assert any(item["relation"] == "半合" for item in branch_relations("子", "辰"))
     assert not any(item["relation"] == "半合" for item in branch_relations("申", "辰"))
     assert branch_relations("辰", "辰") == [{"relation": "三刑", "subtype": "自刑"}]
-    assert any(item["subtype"] == "寅巳申三刑" for item in branch_relations("巳", "申"))
+    assert any(item.get("subtype") == "寅巳申三刑" for item in branch_relations("巳", "申"))
 
 
 def test_full_trine_and_full_punishment_are_distinct_from_pairs():
