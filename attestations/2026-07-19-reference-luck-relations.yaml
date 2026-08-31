@@ -1,0 +1,42 @@
+artifact_id: reference-luck-shensha-relations-2026-07-19
+timestamp: 2026-07-18T18:09:45Z
+provider: openai
+model_id: gpt-5
+model_release: codex-desktop
+agent_role: reference_implementer
+session_id: not_exposed_by_codex_desktop
+run_manifest_id: not_applicable_no_runtime_model_call
+source_repository: 22762162/sk-paipan-reference
+source_commit: f6f22546715def952b8c237bcd0d9aed311e5d07
+generated_files:
+  - BLIND-REFERENCE-SPEC.md
+  - SPEC-QUESTIONS.md
+  - README.md
+  - paipan_ref/__init__.py
+  - paipan_ref/blind_cli.py
+  - paipan_ref/extended_validation.py
+  - paipan_ref/luck.py
+  - paipan_ref/relations.py
+  - paipan_ref/shensha.py
+  - tests/test_blind_cli.py
+  - tests/test_luck.py
+  - tests/test_relations.py
+  - tests/test_shensha.py
+  - attestations/2026-07-19-reference-luck-relations.yaml
+reviewed_files:
+  - AGENTS.md
+  - TASK.md
+  - contracts.lock
+  - contracts/paipan-spec.md
+  - contracts/schemas/paipan.schema.json
+blind_isolation:
+  main_l1_code_read: false
+  main_l1_tests_read: false
+  forbidden_file_read: false
+  forbidden_file: consult-engine/luck.py
+  implementation_sources:
+    - vendored contracts v0.2.0
+    - public traditional formula sources listed in BLIND-REFERENCE-SPEC.md
+notes:
+  - New ops are isolated in paipan_ref.blind_cli because the pinned contract does not define them.
+  - Formal contract adoption remains blocked on the decisions recorded in SPEC-QUESTIONS.md.
