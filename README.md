@@ -21,6 +21,21 @@ echo '{"case_id":"x","op":"year_pillar","input":{"civil_year":1984,"t_unix":1,"l
   | python3 -m paipan_ref.cli       # 对拍 CLI(contracts/paipan-spec.md 附录 A 协议)
 ```
 
+需要 Python 3.10 或更高版本。
+
+## 业主要求的盲写对拍扩展（候选）
+
+2026-07-19 新增大运起运、十三种神煞、双向十神及地支六合/六冲/六害/刑关系表。
+因当前契约尚未定义这些 op，它们与正式 CLI 物理分开：
+
+```bash
+python3 -m paipan_ref.blind_cli
+```
+
+候选 JSONL 协议、公式口径、资料来源与待裁决项见
+[`BLIND-REFERENCE-SPEC.md`](BLIND-REFERENCE-SPEC.md) 和
+[`SPEC-QUESTIONS.md`](SPEC-QUESTIONS.md)。正式契约 CLI 的既有行为不变。
+
 ## contracts 镜像同步
 
 `contracts/` 为主仓库同名目录的只读镜像,以主仓库 main 的 commit 对齐;
