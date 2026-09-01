@@ -1,0 +1,481 @@
+"""Codex 图片适配桥测试:协议转换、文件校验、路由集成(假 codex 二进制)。"""
+
+import json
+import re
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from aifos.app import App
+
+# 假 codex:记录完整参数,从指令文本中提取目标 png 路径并创建之
+FAKE_CODEX = '''#!/usr/bin/env python3
+import json, os, re, struct, sys, zlib
+
+def write_test_png(path, width=9, height=16):
+    """Write a genuinely decodable 9:16 PNG for production probe tests."""
+    def chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff))
+    scanline = b"\\x00" + (b"\\x28\\x78\\xc8" * width)
+    payload = b"\\x89PNG\\r\\n\\x1a\\n"
+    payload += chunk(
+        b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+    payload += chunk(b"IDAT", zlib.compress(scanline * height))
+    payload += chunk(b"IEND", b"")
+    with open(path, "wb") as image_file:
+        image_file.write(payload)
+
+instruction = sys.argv[-1]
+log = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                   "codex_argv.jsonl")
+with open(log, "a", encoding="utf-8") as f:
+    f.write(json.dumps(sys.argv[1:], ensure_ascii=False) + "\\n")
+if "你是AIFOS图片生成前的提示词审核员" in instruction:
+    source = instruction.split("【AIFOS原始提示词】\\n", 1)[1].split(
+        "\\n【冲突裁决规则】", 1)[0]
+    print(json.dumps({
+        "schema": "aifos.codex-prompt-review/v1",
+        "approved": True,
+        "optimized_prompt": source,
+        "issues_found": [], "changes_made": [], "blocking_reason": "",
+    }, ensure_ascii=False))
+    sys.exit(0)
+if "你是漫剧图片质检员" in instruction:
+    print(json.dumps({
+        "pass": True,
+        "identity_checked": True, "identity_match": True,
+        "gender_checked": True, "gender_match": True,
+        "count_checked": True, "count_match": True,
+        "detected_count": 1, "issues": [],
+    }, ensure_ascii=False))
+    sys.exit(0)
+paths = re.findall(r"(/\\S+?\\.png)", instruction)
+for p in paths:
+    write_test_png(p)
+print("codex done:", len(paths), "files")
+'''
+
+# 假旧版 codex:不认识 --sandbox,报 unexpected argument;去掉后才成功
+FAKE_OLD_CODEX = '''#!/usr/bin/env python3
+import re, sys
+args = sys.argv[1:]
+if "--sandbox" in args or "--skip-git-repo-check" in args:
+    print("error: unexpected argument '--sandbox' found", file=sys.stderr)
+    sys.exit(2)
+instruction = args[-1]
+for p in re.findall(r"(/\\S+?\\.png)", instruction):
+    open(p, "wb").write(b"fake-png")
+print("old codex ok")
+'''
+
+REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+
+
+@pytest.fixture()
+def fake_codex(tmp_path):
+    binary = tmp_path / "bin" / "codex"
+    binary.parent.mkdir(parents=True)
+    binary.write_text(FAKE_CODEX, encoding="utf-8")
+    binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
+    return binary
+
+
+def _bridge(request, codex):
+    proc = subprocess.run(
+        [sys.executable, "-m", "aifos.adapters.codex_image",
+         "--codex", str(codex)],
+        input=json.dumps(request, ensure_ascii=False),
+        capture_output=True, text=True, timeout=60, cwd=REPO_ROOT)
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def _candidate_comparison_payload(tmp_path):
+    candidates = [tmp_path / f"candidate-{index}.png" for index in (2, 3)]
+    for path in candidates:
+        path.write_bytes(b"candidate")
+    request = {
+        "candidate_set_token": "set-eligible",
+        "target_input_hash": "target-hash",
+        "reference_selection_hash": "reference-hash",
+        "ranking_input_hash": "ranking-hash",
+        "candidates": [{
+            "candidate_id": f"set-eligible#{index}",
+            "candidate_index": index,
+            "uri": str(path),
+        } for index, path in zip((2, 3), candidates)],
+    }
+    return {
+        "candidate_comparison": request,
+        "image_uri": str(candidates[0]),
+        "reference_manifest": [{
+            "index": 2,
+            "uri": str(candidates[1]),
+            "label": "候选#3",
+            "role": "candidate_comparison",
+            "candidate_id": "set-eligible#3",
+            "candidate_index": 3,
+            "binding": "与首个 eligible 候选比较",
+        }],
+    }
+
+
+def test_codex_candidate_comparison_uses_dedicated_prompt_and_validation(
+        tmp_path, monkeypatch):
+    from aifos.adapters import codex_image
+
+    payload = _candidate_comparison_payload(tmp_path)
+    rows = [{
+        "candidate_id": f"set-eligible#{index}",
+        "candidate_index": index,
+        "dimension_scores": {"identity": 90 - index},
+        "evidence": [], "fatal_issues": [], "soft_issues": [],
+        "total_score": 90 - index,
+    } for index in (2, 3)]
+    verdict = {
+        "schema": "aifos.candidate-comparison-result/v1",
+        "candidate_set_token": "set-eligible",
+        "target_input_hash": "target-hash",
+        "reference_selection_hash": "reference-hash",
+        "ranking_input_hash": "ranking-hash",
+        "candidates": rows,
+        "winner_candidate_id": "set-eligible#2",
+        "winner_reason": "候选#2更符合身份",
+        "confidence": 0.8,
+    }
+    captured = {}
+
+    class FakePopen:
+        returncode = 0
+
+        def __init__(self, *args, **_kwargs):
+            self.args = args[0]
+            captured["instruction"] = self.args[-1]
+
+        def communicate(self, timeout=None):
+            return json.dumps(verdict, ensure_ascii=False), ""
+
+    monkeypatch.setattr(codex_image.shutil, "which",
+                        lambda _command: "/usr/bin/codex")
+    monkeypatch.setattr(codex_image.subprocess, "Popen", FakePopen)
+    reply = codex_image.run({
+        "capability": "image_qc", "payload": payload,
+        "out_dir": str(tmp_path / "out"),
+    }, "codex", 30, [])
+
+    assert reply["ok"] is True
+    assert reply["data"]["winner_candidate_id"] == "set-eligible#2"
+    assert reply["model"] == "Codex 候选四图比较导演"
+    assert "候选图比较导演" in captured["instruction"]
+    assert "实际候选#2 candidate_id=set-eligible#2" in captured[
+        "instruction"]
+    assert "不能返回普通单图质检" in captured["instruction"]
+
+
+def test_codex_candidate_comparison_rejects_single_image_qc_shape(
+        tmp_path, monkeypatch):
+    from aifos.adapters import codex_image
+
+    payload = _candidate_comparison_payload(tmp_path)
+
+    class FakePopen:
+        returncode = 0
+
+        def __init__(self, *args, **_kwargs):
+            self.args = args[0]
+
+        def communicate(self, timeout=None):
+            return '{"pass":true,"visual_pass":true,"issues":[]}', ""
+
+    monkeypatch.setattr(codex_image.shutil, "which",
+                        lambda _command: "/usr/bin/codex")
+    monkeypatch.setattr(codex_image.subprocess, "Popen", FakePopen)
+    reply = codex_image.run({
+        "capability": "image_qc", "payload": payload,
+        "out_dir": str(tmp_path / "out"),
+    }, "codex", 30, [])
+
+    assert reply["ok"] is False
+    assert "候选四图比较结构无效" in reply["error"]
+    assert "candidate_set_token" in reply["error"]
+
+
+def test_image_capability(tmp_path, fake_codex):
+    out = tmp_path / "out"
+    reply = _bridge({
+        "capability": "image",
+        "payload": {"shot_no": 1, "prompt": "古镇长街", "characters": ["林昭"]},
+        "out_dir": str(out)}, fake_codex)
+    assert reply["ok"], reply
+    assert reply["uri"].endswith("shot_001.keyframe.png")
+    assert Path(reply["uri"]).exists()
+
+
+def test_repair_static_contract_is_final_provider_prompt(tmp_path, fake_codex):
+    """返工短合同后不得再回灌旧文字、动作或镜头字段。"""
+    out = tmp_path / "out"
+    new_prompt = (
+        "【返工静态合同v1】\n"
+        "【当前相位】终点；只生成一张静态画面。\n"
+        "【唯一画面】NEW_UNIQUE_FRAME；手机隐藏，不显示任何文字。\n"
+        "【人数】画面严格共2人。"
+    )
+    identity = tmp_path / "identity.png"
+    identity.write_bytes(b"reference")
+    reply = _bridge({
+        "capability": "image",
+        "payload": {
+            "shot_no": 2,
+            "prompt": new_prompt,
+            "prompt_compact": new_prompt,
+            "_repair_static_contract_replaced": True,
+            "prompt_contract_complete": True,
+            "characters": ["甲"],
+            "functional_figures": [{
+                "name": "乙", "count": 1,
+                "state": "OLD_ACTION_SENTINEL",
+            }],
+            "visible_figure_count": 5,
+            "camera": "OLD_CAMERA_SENTINEL",
+            "readable_text": {
+                "carrier": "OLD_TEXT_CARRIER_SENTINEL电脑屏幕",
+                "whitelist": ["OLD_SCREEN_TEXT_SENTINEL"],
+            },
+            "feedback": "OLD_FEEDBACK_SENTINEL",
+            "reference_manifest": [{
+                "index": 1,
+                "role": "identity",
+                "label": "身份参考",
+                "binding": "REFERENCE_IDENTITY_DUTY_SENTINEL",
+                "uri": str(identity),
+            }],
+        },
+        "out_dir": str(out),
+    }, fake_codex)
+    assert reply["ok"], reply
+
+    argv_log = fake_codex.parent / "codex_argv.jsonl"
+    args = json.loads(argv_log.read_text(encoding="utf-8").splitlines()[-1])
+    instruction = args[-1]
+    assert "【返工静态合同v1】" in instruction
+    assert "NEW_UNIQUE_FRAME" in instruction
+    assert "REFERENCE_IDENTITY_DUTY_SENTINEL" in instruction
+    assert str(identity) in instruction
+    for stale in (
+            "OLD_ACTION_SENTINEL", "OLD_CAMERA_SENTINEL",
+            "OLD_TEXT_CARRIER_SENTINEL", "OLD_SCREEN_TEXT_SENTINEL",
+            "OLD_FEEDBACK_SENTINEL", "【屏幕/页面文字硬锁】"):
+        assert stale not in instruction
+
+
+def test_projected_phase_contract_is_the_real_codex_instruction(
+        tmp_path, fake_codex):
+    """CLI argv must not revive hidden props/text from whole-take audit data."""
+    log = fake_codex.parent / "codex_argv.jsonl"
+    shared = {
+        "prompt_contract_complete": True,
+        "readable_text": {
+            "required": True,
+            "carrier": "手机锁屏",
+            "whitelist": ["02:21:59"],
+        },
+        "start_state": {
+            "虞寻歌": {"prop": "手机锁屏显示02:21:59"},
+        },
+        "end_state": {
+            "虞寻歌": {"prop": "手机已收入口袋"},
+        },
+    }
+
+    image_reply = _bridge({
+        "capability": "image",
+        "payload": {
+            **shared,
+            "shot_no": 4,
+            "prompt": "整镜审计原文",
+            "prompt_compact": "终点静态合同：人物看向床；手机不可见，无文字",
+        },
+        "out_dir": str(tmp_path / "image"),
+    }, fake_codex)
+    assert image_reply["ok"], image_reply
+    image_instruction = json.loads(
+        log.read_text(encoding="utf-8").splitlines()[-1])[-1]
+    assert "手机已收入口袋" not in image_instruction
+    assert "02:21:59" not in image_instruction
+
+    frames_reply = _bridge({
+        "capability": "frames",
+        "payload": {
+            **shared,
+            "shot_no": 4,
+            "prompt": "整镜审计原文",
+            "prompt_compact": "合并审计稿",
+            "frame_prompt_compacts": {
+                "first_frame": "首帧静态合同：人物看向床；手机不可见，无文字",
+                "last_frame": "尾帧静态合同：人物走向门口；手机不可见，无文字",
+            },
+        },
+        "out_dir": str(tmp_path / "frames"),
+    }, fake_codex)
+    assert frames_reply["ok"], frames_reply
+    frames_instruction = json.loads(
+        log.read_text(encoding="utf-8").splitlines()[-1])[-1]
+    assert "手机已收入口袋" not in frames_instruction
+    assert "02:21:59" not in frames_instruction
+
+
+def test_existing_target_must_be_updated_by_current_codex_call(tmp_path):
+    binary = tmp_path / "bin" / "codex-noop"
+    binary.parent.mkdir(parents=True)
+    binary.write_text(
+        "#!/usr/bin/env python3\nprint('ok but no image written')\n",
+        encoding="utf-8")
+    binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
+    out = tmp_path / "out"
+    out.mkdir()
+    target = out / "shot_001.keyframe.png"
+    target.write_bytes(b"old-failed-image")
+
+    reply = _bridge({
+        "capability": "image",
+        "payload": {
+            "shot_no": 1, "prompt": "必须重新生成",
+            "characters": ["林昭"],
+        },
+        "out_dir": str(out),
+    }, binary)
+
+    assert reply["ok"] is False
+    assert "拒绝把断点旧图冒充新结果" in reply["error"]
+    assert target.read_bytes() == b"old-failed-image"
+
+
+def test_frames_capability(tmp_path, fake_codex):
+    out = tmp_path / "out"
+    reply = _bridge({
+        "capability": "frames",
+        "payload": {"shot_no": 2, "image_uri": "/x.png", "prompt": "p"},
+        "out_dir": str(out)}, fake_codex)
+    assert reply["ok"]
+    assert Path(reply["data"]["first"]).exists()
+    assert Path(reply["data"]["last"]).exists()
+
+
+def test_missing_codex_reports_error(tmp_path):
+    reply = _bridge({
+        "capability": "image",
+        "payload": {"shot_no": 1},
+        "out_dir": str(tmp_path / "out")}, "/missing/codex")
+    assert not reply["ok"]
+    assert "不存在" in reply["error"]
+
+
+def test_unknown_capability(tmp_path, fake_codex):
+    reply = _bridge({
+        "capability": "video", "payload": {},
+        "out_dir": str(tmp_path / "out")}, fake_codex)
+    assert not reply["ok"]
+
+
+def test_instruction_quality(tmp_path, fake_codex):
+    """出图指令:真实出图指令 + 画风统一 + 参考图 + 默认非交互参数。"""
+    out = tmp_path / "out"
+    ref = tmp_path / "portrait_林昭.png"
+    ref.write_bytes(b"x")
+    scene = tmp_path / "scene_古镇.png"
+    scene.write_bytes(b"x")
+    reply = _bridge({
+        "capability": "image",
+        "payload": {"shot_no": 1, "prompt": "古镇长街夜景",
+                    "characters": ["林昭"], "camera": "远景推近",
+                    "style": "水墨国风",
+                    "character_refs": [str(ref)],
+                    "scene_ref": str(scene)},
+        "out_dir": str(out)}, fake_codex)
+    assert reply["ok"], reply
+    argv = [json.loads(line) for line in
+            (fake_codex.parent / "codex_argv.jsonl")
+            .read_text(encoding="utf-8").splitlines()]
+    args = argv[-1]
+    # 默认非交互参数
+    assert "--sandbox" in args and "workspace-write" in args
+    assert "--skip-git-repo-check" in args
+    instruction = args[-1]
+    # 禁止代码画图充数,必须真实出图
+    assert "禁止用 Pillow" in instruction
+    assert "图像生成能力" in instruction
+    # 画风统一 + 参考图一致性
+    assert "水墨国风" in instruction
+    assert str(ref) in instruction and str(scene) in instruction
+    assert "人物设定图" in instruction and "场景概念图" in instruction
+
+
+def test_old_codex_flags_fallback(tmp_path):
+    """旧版 codex 不认默认参数 → 自动去掉重试,依然成功。"""
+    binary = tmp_path / "bin" / "codex"
+    binary.parent.mkdir(parents=True)
+    binary.write_text(FAKE_OLD_CODEX, encoding="utf-8")
+    binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
+    reply = _bridge({
+        "capability": "image",
+        "payload": {"shot_no": 3, "prompt": "x", "characters": []},
+        "out_dir": str(tmp_path / "out")}, binary)
+    assert reply["ok"], reply
+    assert Path(reply["uri"]).exists()
+
+
+def test_produce_passes_reference_art(tmp_path, fake_codex, monkeypatch):
+    """整集制作时,镜头出图指令必须带上人物立绘/场景图做一致性参考。"""
+    monkeypatch.setenv("PYTHONPATH", REPO_ROOT)
+    app = App(tmp_path / "ws", config_overrides={"providers": {"codex": {
+        "enabled": True,
+        "command": [sys.executable, "-m", "aifos.adapters.codex_image",
+                    "--codex", str(fake_codex)],
+    }}})
+    try:
+        summary = app.director.produce("参考图验证", 1)
+        assert summary["status"] == "awaiting_cast"
+        project = app.projects.get_project("参考图验证")
+        episode = app.db.query_one(
+            "SELECT * FROM episodes WHERE project_id=? AND number=1",
+            (project["id"],))
+        script, _ = app.projects.latest_document(episode["id"], "script")
+        for character in script["characters"]:
+            app.director.select_character_candidate(
+                "参考图验证", 1, character["name"], 1)
+        app.director.produce("参考图验证", 1)
+    finally:
+        app.close()
+    log = fake_codex.parent / "codex_argv.jsonl"
+    instructions = [json.loads(line)[-1] for line in
+                    log.read_text(encoding="utf-8").splitlines()]
+    keyframe_calls = [i for i in instructions if "keyframe" in i]
+    assert keyframe_calls
+    # 对白镜头的指令按参考图对照表引用人工锁定立绘(portrait_*.png 真实路径)
+    assert any("最终立绘" in i and "portrait_" in i
+               for i in keyframe_calls)
+    # 场景图同样进对照表(编号绑定,标签为「场景…基准图」)
+    assert any("基准图" in i and "scene_" in i for i in keyframe_calls)
+    # 对照表编号与用途绑定进入指令
+    assert any("参考图对照表" in i and "图1=" in i for i in keyframe_calls)
+
+
+def test_router_integration(tmp_path, fake_codex, monkeypatch):
+    monkeypatch.setenv("PYTHONPATH", REPO_ROOT)
+    app = App(tmp_path / "ws", config_overrides={"providers": {"codex": {
+        "enabled": True,
+        "command": [sys.executable, "-m", "aifos.adapters.codex_image",
+                    "--codex", str(fake_codex)],
+    }}})
+    try:
+        result = app.router.call(
+            "image", {"shot_no": 5, "prompt": "测试", "characters": []},
+            app.workspace.artifacts_dir)
+        assert result.provider == "codex"
+        assert Path(result.uri).exists()
+    finally:
+        app.close()

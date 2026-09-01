@@ -1,0 +1,1201 @@
+"""资产中心:人物完整资产套件 + 参考图上传与出图复用。"""
+
+import json
+from pathlib import Path
+
+import pytest
+
+from aifos.adapters.codex_image import build_instruction, run as run_codex_image
+from aifos.app import App
+from aifos.director import (
+    CHARACTER_SHEETS,
+    character_candidate_target,
+    resolve_character_asset_policy,
+)
+from aifos.errors import AifosError
+from aifos.production.base import ProviderResult
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"0" * 16
+
+
+@pytest.fixture()
+def app(tmp_path):
+    instance = App(tmp_path / "ws")
+    yield instance
+    instance.close()
+
+
+def _preproduce(app, title="万妖图录", number=1, asset_mode=None):
+    app.director.produce(title, number, pause_for_confirm=True)   # 剧本停
+    summary = app.director.produce(
+        title, number, pause_for_confirm=True)   # 人物候选停
+    if summary["status"] == "awaiting_cast":
+        project = app.projects.get_project(title)
+        episode = app.db.query_one(
+            "SELECT * FROM episodes WHERE project_id=? AND number=?",
+            (project["id"], number))
+        script, _ = app.projects.latest_document(episode["id"], "script")
+        for character in script["characters"]:
+            app.director.select_character_candidate(
+                title, number, character["name"], 1)
+        if asset_mode:
+            app.director.update_character_asset_policy(
+                episode["id"], asset_mode)
+        app.director.produce(title, number, pause_for_confirm=True)
+    return app.projects.get_project(title)
+
+
+def test_character_sheet_prompt_compiler_is_scope_specific(app):
+    """每类人物设定图只接收当前可执行字段,不复用整套剧情状态。"""
+    design = {
+        "species": "人类", "gender": "男", "age_range": "20-24岁",
+        "appearance": "清正骨相，面白略带旅途风尘，眼神清明兼具疲惫与警觉",
+        "hair": "明式束发，戴儒巾或幞头", "eyes": "黑褐瞳色",
+        "temperament": "落魄清醒、隐忍机敏",
+        "costume": "本体：交领右衽粗布青灰长衫；错穿：青色举人官服",
+        "costume_detail": "粗布长衫无纹样；官服领缘与门襟为深青织带",
+        "accessories": "黄花梨木文匣及内含官印",
+        "era_setting": "中国明朝洪武二十四年（约1391年），胭谷山山道",
+        "visual_dna": {
+            "face_structure": "清正骨相，面白略带旅途风尘",
+            "hair_silhouette": "明式束发",
+            "body_or_occupation_marks": "清瘦书生体态；醒来后左臂刀伤包扎",
+            "clothing_structure": "本体：粗布长衫；错穿：青色官服",
+            "signature_accessory": "黄花梨木文匣及官印",
+        },
+    }
+    for key in ("turnaround", "closeup", "front", "profile", "back",
+                "features", "makeup", "costume", "costume_detail"):
+        prompt = app.director._sheet_prompt(
+            "林川", "主角", "电影级半写实", "人物设定图", "legacy desc",
+            key=key, design=design,
+            locked_look={"costume": design["costume"],
+                         "accessories": design["accessories"]})
+        assert "实际可见人形=1" in prompt
+        assert "None" not in prompt
+        assert "错穿" not in prompt
+        assert "文匣" not in prompt
+        assert "刀伤" not in prompt
+
+
+def test_scene_prompt_preserves_full_location_name_with_separator(app):
+    location = "赴任途中·驿馆内室（闪回，数日前夜）"
+    prompt = app.director._scene_prompt(
+        location, "电影级半写实", scene={})
+    assert f"场景概念图/环境基准:{location}" in prompt
+    assert "时间与天气:驿馆内室（闪回，数日前夜）" in prompt
+
+
+def test_scene_prompt_filters_ancient_furnishings_only_for_modern_location(app):
+    style = (
+        "鎏金柔雾、电影级半写实3D；"
+        "暖金古室中以书案、卷册、香炉和半垂纱幕构图")
+    modern = app.director._scene_prompt(
+        "2078年现代豪宅卧室", style, scene={})
+    historical = app.director._scene_prompt(
+        "明代宫殿内景", style, scene={})
+
+    assert "鎏金柔雾" in modern and "电影级半写实3D" in modern
+    for forbidden in ("古室", "书案", "卷册", "香炉", "纱幕"):
+        assert forbidden not in modern
+        assert forbidden in historical
+
+
+def test_character_sheet_contract_is_single_subject(app):
+    contract = app.director._character_sheet_composition_contract(
+        "林川", "closeup")
+    assert contract["expected_primary_count"] == 1
+    assert contract["expected_visible_figure_count"] == 1
+    assert contract["actors"][0]["character"] == "林川"
+
+
+def test_character_sheet_reuse_is_bound_to_locked_candidate(app):
+    sheet = {
+        "meta": json.dumps({"source_candidate_asset_id": 11}),
+    }
+    same_candidate = {
+        "id": 101,
+        "meta": json.dumps({"candidate_asset_id": 11}),
+    }
+    changed_candidate = {
+        "id": 102,
+        "meta": json.dumps({"candidate_asset_id": 12}),
+    }
+    legacy_sheet = {"meta": "{}"}
+    manual_sheet = {
+        "meta": json.dumps({"source_identity_asset_id": 201}),
+    }
+    manual_identity = {"id": 201, "meta": "{}"}
+
+    matches = app.director._character_sheet_matches_locked_identity
+    assert matches(sheet, same_candidate)
+    assert not matches(sheet, changed_candidate)
+    assert not matches(legacy_sheet, same_candidate)
+    assert matches(manual_sheet, manual_identity)
+
+
+def test_character_sheet_reuse_rejects_silently_overwritten_file(app,
+                                                                  tmp_path):
+    sheet_path = tmp_path / "sheet.png"
+    sheet_path.write_bytes(b"registered candidate four")
+    sheet = {
+        "uri": str(sheet_path),
+        "meta": json.dumps({
+            "source_candidate_asset_id": 11,
+            "file_sha256": app.director._file_sha256(sheet_path),
+        }),
+    }
+    identity = {
+        "id": 101,
+        "meta": json.dumps({"candidate_asset_id": 11}),
+    }
+
+    matches = app.director._character_sheet_matches_locked_identity
+    assert matches(sheet, identity)
+
+    sheet_path.write_bytes(b"interrupted candidate three overwrite")
+    assert not matches(sheet, identity)
+
+
+def test_character_sheet_prompt_and_qc_share_minimal_contract(app):
+    design = {
+        "species": "人类", "gender": "男", "age_range": "24岁",
+        "appearance": "清正骨相，面白略带旅途风尘",
+        "hair": "明式束发，戴儒巾或幞头",
+        "makeup": "素颜；额角与鬓边、脸颊沾少许灰尘",
+        "occupation": "外卖小哥",
+        "costume": "本体：青灰粗布长衫；错穿：青色官服",
+        "visual_dna": {"face_structure": "清正骨相，面白略带旅途风尘"},
+    }
+    prompt = app.director._sheet_prompt(
+        "林川", "外卖小哥", "电影级半写实", "人物设定图", "legacy",
+        key="closeup", design=design,
+        locked_look={"hair": "明式束发，素色儒巾"})
+    contract = app.director._character_sheet_composition_contract(
+        "林川", "closeup", role="外卖小哥", design=design)
+    quality = contract["quality_requirements"]
+    assert "画面下缘到颈根" in prompt
+    assert "双肩" in prompt and "上胸" in prompt
+    assert "职业服装:" not in prompt  # closeup 不把全身职业装塞进面部图
+    assert "脸颊沾少许" not in prompt
+    assert "面白略带旅途风尘" not in prompt
+    assert all(part in prompt for part in quality["required"])
+    assert quality["required"] == app.director._sheet_quality_contract(
+        "closeup")["required"]
+    assert app.director._sheet_feedback_for_key(
+        "【质检原因】上胸露出；旧剧情要求官服和文匣；【自动优化修订】保留全身",
+        "closeup").startswith("只修正本资产")
+
+
+def test_workwear_only_applies_to_explicit_occupation(app):
+    assert app.director._sheet_workwear_line(
+        "主角", {"occupation": "学生"}) == ""
+    assert "外卖配送员工作服" in app.director._sheet_workwear_line(
+        "外卖小哥", {"occupation": "外卖小哥"})
+
+
+def test_story_bible_stays_in_continuity_but_not_shot_provider_prompt(app):
+    project = _preproduce(app, title="归途")
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    script, _ = app.projects.latest_document(episode["id"], "script")
+    continuity, _ = app.projects.latest_document(
+        episode["id"], "continuity")
+    assert script["story_world"]["overview"]
+    assert script["story_background"]["core_conflict"]
+    assert all(character["introduction"]
+               for character in script["characters"])
+    assert continuity["story_world"] == script["story_world"]
+    assert continuity["story_background"] == script["story_background"]
+    assert continuity["characters"][0]["introduction"]
+
+    out_root = (app.workspace.artifacts_dir
+                / f"p{project['id']:03d}" / "e001")
+    plan = json.loads((out_root / "render_plan.json").read_text(
+        encoding="utf-8"))
+    shot = next(item for item in plan["items"]
+                if item["category"] == "shot_image")
+    assert "【镜头合同v2.2】" in shot["prompt"]
+    assert shot["prompt"].count("【定格状态】") == 1
+    assert all(
+        label not in shot["prompt"]
+        for label in ("【起点】", "【单一主动作】", "【终点】"))
+    assert "故事世界硬约束" not in shot["prompt"]
+    assert "本集故事背景" not in shot["prompt"]
+
+
+def test_background_extras_skip_design_and_generic_support_gets_one_candidate(app):
+    script = {
+        "project_title": "轻量角色测试",
+        "episode_number": 1,
+        "episode_title": "车站",
+        "logline": "林昭在车站找到线索。",
+        "characters": [
+            {"name": "林昭", "role": "主角"},
+            {"name": "小陈", "role": "配角"},
+            {"name": "站台路人", "role": "背景路人"},
+        ],
+        "scenes": [{
+            "scene_no": 1, "location": "车站", "action": "人群短暂让路",
+            "characters": ["林昭", "小陈", "站台路人"],
+            "lines": [
+                {"character": "林昭", "dialogue": "线索就在这里。"},
+                {"character": "小陈", "dialogue": "我去确认。"},
+                {"character": "站台路人", "dialogue": "借过。"},
+            ],
+        }],
+    }
+    summary = app.director.produce(
+        "轻量角色测试", 1, script=script, pause_for_confirm=True)
+    assert summary["status"] == "awaiting_script"
+    summary = app.director.produce(
+        "轻量角色测试", 1, pause_for_confirm=True)
+    assert summary["status"] == "awaiting_cast"
+    project = app.projects.get_project("轻量角色测试")
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    saved, _ = app.projects.latest_document(episode["id"], "script")
+    extra = next(c for c in saved["characters"]
+                 if c["name"] == "站台路人")
+    assert extra["crowd_function"]
+    assert "introduction" not in extra
+    assert app.assets.latest(
+        project["id"], "character", "站台路人") is None
+    extra_candidates = [
+        row for row in app.assets.list(
+            project["id"], "character_candidate")
+        if app.assets.meta(row).get("character") == "站台路人"
+    ]
+    assert extra_candidates == []
+
+    selection = app.director.character_selection_status(
+        project["id"], saved["characters"])
+    by_name = {item["character"]: item
+               for item in selection["characters"]}
+    assert set(by_name) == {"林昭", "小陈"}
+    assert by_name["林昭"]["candidate_target"] == 4
+    assert by_name["小陈"]["candidate_target"] == 4
+
+
+def test_character_suite_generated(app):
+    """定版后生成审核板、四张独立母资产及细节套件。"""
+    project = _preproduce(app, asset_mode="full")
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    script, _ = app.projects.latest_document(episode["id"], "script")
+    assert len(CHARACTER_SHEETS) == 9
+    assert [key for key, _label, _desc in CHARACTER_SHEETS[:5]] == [
+        "turnaround", "closeup", "front", "profile", "back"]
+    for character in script["characters"]:
+        name = character["name"]
+        for key, label, _desc in CHARACTER_SHEETS:
+            row = app.assets.latest(
+                project["id"], "character_sheet", f"{name}:{key}")
+            assert row is not None, f"缺少 {name}:{key}"
+            meta = json.loads(row["meta"])
+            assert meta["label"] == label
+            if key == "turnaround":
+                assert meta["review_only"] is True
+                assert meta["aspect"] == "16:9"
+            if key in ("closeup", "front", "profile", "back"):
+                assert meta["canonical"] is True
+    # 生产清单同步登记(看板/图片清单可见)
+    out_root = (app.workspace.artifacts_dir
+                / f"p{project['id']:03d}" / "e001")
+    plan = json.loads((out_root / "render_plan.json").read_text(
+        encoding="utf-8"))
+    sheet_items = [i for i in plan["items"]
+                   if i["category"] == "character_sheet"]
+    assert len(sheet_items) == len(script["characters"]) * 9
+    assert all(i["status"] in ("done", "reused") for i in sheet_items)
+
+
+def test_scene_and_character_sheets_share_one_parallel_batch(
+        app, monkeypatch):
+    """无依赖的场景图和人物母资产必须同批开工，不能先 1 路再 N 路。"""
+    batches = []
+    original = app.director._run_parallel
+
+    def record_batch(ctx, tasks, line="出图产线", **kwargs):
+        categories = {
+            str(task.get("item_id") or "").split(":", 1)[0]
+            for task in tasks
+        }
+        if categories & {"scene", "sheet"}:
+            batches.append({"categories": categories, "line": line})
+        return original(ctx, tasks, line=line, **kwargs)
+
+    monkeypatch.setattr(app.director, "_run_parallel", record_batch)
+    _preproduce(app, title="同批并发测试", asset_mode="full")
+
+    # 第一批仍把无依赖的人物/场景母资产同批开工；第二批场景多视角必须
+    # 等主视角完成后才能以它为参考，属于有依赖的后续批次。
+    assert len(batches) == 2
+    assert batches[0]["categories"] >= {"scene", "sheet"}
+    assert batches[0]["line"] == "人物/场景独立资产"
+    assert batches[1]["categories"] == {"scene"}
+    assert batches[1]["line"] == "场景多视角母版"
+
+
+def test_auto_character_asset_policy_is_conservative():
+    simple = resolve_character_asset_policy({"mode": "auto"}, {
+        "characters": [{"name": "林昭", "role": "主角"}],
+        "scenes": [{"location": "书房", "action": "对镜头说一句话"}],
+    })
+    assert simple["resolved_mode"] == "simple"
+    complex_policy = resolve_character_asset_policy({"mode": "auto"}, {
+        "characters": [
+            {"name": "林昭", "role": "主角"},
+            {"name": "周鹿", "role": "重要配角"},
+        ],
+        "scenes": [{"location": "书房", "action": "两人对话"}],
+    })
+    assert complex_policy["resolved_mode"] == "full"
+
+
+def test_simple_character_assets_skip_all_sheets_and_keep_identity_qc(app):
+    """简化版真正省掉全部四视图/细节图，不削弱最终立绘门禁。"""
+    project = _preproduce(app, title="单人短片", asset_mode="simple")
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    policy = app.director.character_asset_policy(episode["id"])
+    assert policy["mode"] == "simple"
+    assert policy["resolved_mode"] == "simple"
+    assert policy["generate_sheets"] is False
+    assert app.assets.active_list(project["id"], "character_sheet") == []
+    out_root = (app.workspace.artifacts_dir
+                / f"p{project['id']:03d}" / "e001")
+    plan = json.loads((out_root / "render_plan.json").read_text(
+        encoding="utf-8"))
+    assert not [item for item in plan["items"]
+                if item["category"] == "character_sheet"]
+    script, _ = app.projects.latest_document(episode["id"], "script")
+    hero = script["characters"][0]["name"]
+    refs = app.director._art_refs(
+        {"project": dict(project), "character_asset_policy": policy},
+        [hero], "")
+    assert any(item["kind"] == "character_identity"
+               for item in refs["asset_matches"])
+    assert not any(item["kind"] == "character_sheet"
+                   for item in refs["asset_matches"])
+    with pytest.raises(AifosError, match="简化人物资产模式"):
+        app.director.regen_image(
+            project["title"], 1,
+            {"kind": "character_sheet", "name": f"{hero}:turnaround"})
+
+
+def test_simple_upload_shot_frames_never_reinject_old_turnaround(app):
+    """上传替换镜头重做首尾帧也必须遵守简化版参考链。"""
+    project = _preproduce(app, title="上传镜头", asset_mode="simple")
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    script, _ = app.projects.latest_document(episode["id"], "script")
+    hero = script["characters"][0]["name"]
+    old_turnaround = (app.workspace.artifacts_dir / "legacy-turnaround.png")
+    old_turnaround.write_bytes(PNG)
+    app.assets.register(
+        project["id"], "character_sheet", f"{hero}:turnaround",
+        uri=str(old_turnaround), meta={"image_quality": "high"})
+    storyboard, _ = app.projects.latest_document(episode["id"], "storyboard")
+    shot_no = next(shot["shot_no"] for shot in storyboard["shots"]
+                   if hero in shot.get("characters", []))
+    captured = {}
+
+    def fake_call(_ctx, capability, payload, _sub_dir):
+        assert capability == "frames"
+        captured.update(payload)
+        first = app.workspace.artifacts_dir / "uploaded-first.png"
+        last = app.workspace.artifacts_dir / "uploaded-last.png"
+        first.write_bytes(PNG)
+        last.write_bytes(PNG)
+        return ProviderResult(
+            provider="mock", model="mock", cost=0,
+            data={"first": str(first), "last": str(last)},
+            uri=str(first))
+
+    app.director._call = fake_call
+    app.director.import_image(
+        project["title"], 1, {"kind": "shot", "shot_no": shot_no},
+        PNG, ".png")
+    assert str(old_turnaround) not in captured.get("character_refs", [])
+    assert captured.get("identity_references")
+
+
+def test_character_asset_policy_rejects_active_persistent_run(app):
+    """即使内存 Job 尚未登记，持久运行记录也能阻断模式竞态。"""
+    app.director.produce("并发策略", 1, pause_for_confirm=True)
+    app.director.produce("并发策略", 1, pause_for_confirm=True)
+    project = app.projects.get_project("并发策略")
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    app.history.create_run(project["title"], 1, action="regen_image")
+    with pytest.raises(AifosError, match="正在生产"):
+        app.director.update_character_asset_policy(
+            episode["id"], "simple")
+
+
+def test_legacy_sheet_plan_migrates_to_full_without_silent_downgrade(app):
+    project, _ = app.projects.get_or_create_project("旧项目")
+    episode, _ = app.projects.get_or_create_episode(project["id"], 1)
+    ctx = {"project": dict(project), "episode": dict(episode),
+           "out_root": app.director._episode_dir(project, episode)}
+    app.director._plan_write(ctx, {"items": [{
+        "id": "sheet:林昭:turnaround", "category": "character_sheet",
+        "status": "done",
+    }]})
+    policy = app.director.character_asset_policy(episode["id"])
+    assert policy["mode"] == "full"
+    assert policy["source"] == "legacy_migration"
+    assert policy["generate_sheets"] is True
+
+
+def test_switching_to_simple_keeps_history_but_excludes_old_turnaround(app):
+    """切到简化版不删旧资产，但旧四视图不再污染后续参考链。"""
+    app.director.produce("保留历史", 1, pause_for_confirm=True)
+    app.director.produce("保留历史", 1, pause_for_confirm=True)
+    project = app.projects.get_project("保留历史")
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    script, _ = app.projects.latest_document(episode["id"], "script")
+    hero = script["characters"][0]["name"]
+    candidate = app.assets.latest(
+        project["id"], "character_candidate", f"{hero}:01")
+    app.assets.register(
+        project["id"], "character_sheet", f"{hero}:turnaround",
+        uri=candidate["uri"], meta={"image_quality": "high"})
+    for character in script["characters"]:
+        app.director.select_character_candidate(
+            project["title"], 1, character["name"], 1)
+    app.director.update_character_asset_policy(episode["id"], "simple")
+    app.director.produce(project["title"], 1, pause_for_confirm=True)
+    policy = app.director.character_asset_policy(episode["id"])
+    refs = app.director._art_refs(
+        {"project": dict(project), "character_asset_policy": policy},
+        [hero], "")
+    assert len(app.assets.active_list(
+        project["id"], "character_sheet")) == 1
+    assert not any(item["kind"] == "character_sheet"
+                   for item in refs["asset_matches"])
+
+
+def test_character_suite_reused_across_episodes(app):
+    """资产套件是项目级资产,第二集不再重画。"""
+    project = _preproduce(app)
+    first = {r["name"]: r["uri"]
+             for r in app.assets.list(project["id"], "character_sheet")}
+    assert first
+    _preproduce(app, number=2)
+    after = {r["name"]: r["uri"]
+             for r in app.assets.list(project["id"], "character_sheet")}
+    for name, uri in first.items():
+        assert after[name] == uri
+
+
+def test_reference_upload_and_injection(app):
+    """参考图按单一用途注入；全局画风不混入人物/服装参考列表。"""
+    project = _preproduce(app)
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    script, _ = app.projects.latest_document(episode["id"], "script")
+    hero = script["characters"][0]["name"]
+    other = "不存在的角色"
+    app.director.add_reference(project["title"], "官方设定", PNG, ".png",
+                               attach_to=hero, reference_role="identity")
+    app.director.add_reference(
+        project["title"], "画风参考", PNG, ".png",
+        reference_role="style")
+    app.director.add_reference(project["title"], "别人的图", PNG, ".png",
+                               attach_to=other)
+    uris = app.director._reference_uris(project["id"], [hero])
+    names = [u.split("/")[-1] for u in uris]
+    assert any("官方设定" in n or n.startswith("____") for n in names)
+    assert len(uris) == 1
+    # 画风作为独立 style_ref，不得伪装成人物/服装参考。
+    ctx = {"project": dict(project)}
+    refs = app.director._art_refs(ctx, [hero], "")
+    # 用户身份图是脸/发型/妆造的最高标准，直接替换最终立绘所占的
+    # 唯一身份槽，不能作为第六张可选 reference_images 被预算淘汰。
+    assert not refs.get("reference_images")
+    assert refs["identity_references"][0]["uri"] == uris[0]
+    assert refs["identity_references"][0][
+        "identity_anchor_type"] == "user_reference"
+    assert refs.get("style_ref")
+    # 删除后不再注入
+    app.director.delete_reference(project["title"], "画风参考")
+    assert len(app.director._reference_uris(project["id"], [hero])) == 1
+    with pytest.raises(AifosError):
+        app.director.delete_reference(project["title"], "画风参考")
+
+
+def test_produced_image_soft_delete_preserves_history(app):
+    """资产中心删图写墓碑版本，不物理删除历史文件。"""
+    project = _preproduce(app)
+    row = app.assets.active_list(project["id"], "scene_art")[0]
+    stats_before = {
+        item["kind"]: dict(item) for item in app.assets.stats(project["id"])}
+    original = Path(row["uri"])
+    history_before = len(app.assets.history(
+        project["id"], row["kind"], row["name"]))
+    result = app.director.delete_image_asset(project["title"], row["id"])
+    latest = app.assets.latest(
+        project["id"], row["kind"], row["name"], include_deleted=True)
+    assert result["history_preserved"] is True
+    assert app.assets.is_deleted(latest)
+    assert latest["uri"] == ""
+    assert original.exists()
+    assert len(app.assets.history(
+        project["id"], row["kind"], row["name"])) == history_before + 1
+    assert row["name"] not in {
+        item["name"] for item in app.assets.active_list(
+            project["id"], "scene_art")}
+    stats_after = {
+        item["kind"]: dict(item) for item in app.assets.stats(project["id"])}
+    assert (stats_after[row["kind"]]["total"]
+            == stats_before[row["kind"]]["total"] - 1)
+    with pytest.raises(AifosError):
+        app.director.delete_image_asset(project["title"], row["id"])
+
+
+def test_corrected_asset_supersedes_old_version_without_deleting_history(app):
+    """修正版进入当前资产，错误旧图只隐藏并保留可回溯关系。"""
+    project = _preproduce(app, title="修正版替代")
+    active_before = app.assets.active_list(project["id"], "scene_art")
+    total_before = {
+        item["kind"]: item["total"]
+        for item in app.assets.stats(project["id"])}["scene_art"]
+    old = active_before[0]
+    replacement = app.assets.register(
+        project["id"], "scene_art", old["name"], uri=old["uri"],
+        meta={"revision": 2}, new_version=True)
+    superseded = app.assets.mark_superseded(
+        old["id"], replacement["id"], reason="scene_revision")
+
+    active_after = app.assets.active_list(project["id"], "scene_art")
+    assert len(active_after) == len(active_before)
+    assert replacement in active_after
+    assert old not in active_after
+    metadata = app.assets.meta(superseded)
+    assert metadata["superseded"] is True
+    assert metadata["superseded_by_asset_id"] == replacement["id"]
+    assert Path(old["uri"]).exists()
+    assert len(app.assets.history(
+        project["id"], "scene_art", old["name"])) == 2
+    total_after = {
+        item["kind"]: item["total"]
+        for item in app.assets.stats(project["id"])}["scene_art"]
+    assert total_after == total_before
+
+
+def test_video_references_are_versioned_and_used(app):
+    """按镜头选择资产图后，视频资产记录实际引用的 asset_id。"""
+    project = _preproduce(app)
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    storyboard, _ = app.projects.latest_document(episode["id"], "storyboard")
+    shot = storyboard["shots"][0]
+    shot_no = shot["shot_no"]
+    scene = app.assets.latest(
+        project["id"], "character_sheet",
+        f"{shot['characters'][0]}:turnaround")
+    document = app.director.set_video_references(
+        episode["id"], shot_no, [scene["id"]])
+    assert document["shots"][str(shot_no)][0]["asset_id"] == scene["id"]
+    summary = app.director.produce(project["title"], 1)
+    assert summary["status"] == "done"
+    video = app.assets.latest(
+        project["id"], "video", f"e001_shot{shot_no:03d}")
+    meta = json.loads(video["meta"])
+    assert any(
+        item["asset_id"] == scene["id"]
+        for item in meta["reference_assets"])
+    effective = app.director.effective_video_references(episode["id"])
+    if effective["shots"][str(shot_no)]["spatial_reference_required"]:
+        assert meta["reference_assets"][0]["kind"] == "spatial_blocking"
+        assert meta["reference_manifest"][0]["index"] == 3
+
+
+def test_shot_generation_keeps_structural_anchors_before_old_matched_images(
+        app):
+    project = _preproduce(app)
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    storyboard, _ = app.projects.latest_document(episode["id"], "storyboard")
+    script, _ = app.projects.latest_document(episode["id"], "script")
+    shot = storyboard["shots"][0]
+    location = next(scene["location"] for scene in script["scenes"]
+                    if scene["scene_no"] == shot["scene_no"])
+    ctx = {"project": dict(project)}
+    refs = app.director._art_refs(
+        ctx, shot["characters"], location, shot_no=9999)
+    assert refs["scene_ref"]
+    assert refs["identity_references"]
+    # 任意“同人物/同场景”旧图不再优先于人物身份和物理场景母图；跨镜
+    # 连续性由紧邻上一镜的显式 chain_first_uri 负责，避免旧合同污染。
+    assert len({
+        *(refs.get("character_refs") or []),
+        *(refs.get("reference_images") or []),
+        *(refs.get("prop_refs") or []),
+        refs.get("scene_ref"),
+        *(row["uri"] for row in refs["identity_references"]),
+    } - {None, ""}) <= 5
+    trace = app.director._reference_inputs(refs)
+    assert any(item["source"] == "asset_center" for item in trace["items"])
+
+
+def test_regen_character_sheet_with_prompt(app):
+    """套件单张可按自定义提示词重画,清单标记已改词。"""
+    project = _preproduce(app)
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    script, _ = app.projects.latest_document(episode["id"], "script")
+    name = script["characters"][0]["name"]
+    before = app.assets.latest(
+        project["id"], "character_sheet", f"{name}:makeup")
+    app.director.regen_image(
+        project["title"], 1,
+        {"kind": "character_sheet", "name": f"{name}:makeup"},
+        prompt_override="烟熏妆,银色眼影,唇色枣红")
+    after = app.assets.latest(
+        project["id"], "character_sheet", f"{name}:makeup")
+    assert after["version"] == before["version"] + 1
+    out_root = (app.workspace.artifacts_dir
+                / f"p{project['id']:03d}" / "e001")
+    plan = json.loads((out_root / "render_plan.json").read_text(
+        encoding="utf-8"))
+    item = next(i for i in plan["items"]
+                if i["id"] == f"sheet:{name}:makeup")
+    assert item["custom_prompt"] is True
+    assert "烟熏妆" in item["prompt"]
+
+
+def test_codex_instruction_covers_sheets_and_references(tmp_path):
+    """Codex 出图指令包含套件目标文件与用户参考图。"""
+    instruction, targets, data = build_instruction("image", {
+        "character_sheet": "turnaround", "sheet_label": "四视图",
+        "art_name": "周鹿", "prompt": "角色四视图:周鹿",
+        "character_refs": ["/tmp/portrait.png"],
+        "reference_images": ["/tmp/ref1.png"],
+        "width": 1080, "height": 1920,
+    }, tmp_path)
+    assert "四视图" in instruction
+    assert "用户参考图 /tmp/ref1.png" in instruction
+    assert "人物设定图 /tmp/portrait.png" in instruction
+    assert targets[0].name == "sheet_周鹿_turnaround.png"
+    assert data["sheet"] == "turnaround"
+
+
+def test_modern_otome_instruction_does_not_force_2d(tmp_path):
+    instruction, _, _ = build_instruction("image", {
+        "portrait": True, "art_name": "周鹿", "role": "主角",
+        "style": "现代都市乙女游戏CG，精致3D半写实；禁止古装、汉服",
+        "width": 1080, "height": 1920,
+    }, tmp_path)
+    assert "现代都市乙女游戏CG" in instruction
+    assert "禁止古装、汉服" in instruction
+    assert "2D 动画质感" not in instruction
+
+
+def test_codex_bridge_declares_managed_model(monkeypatch, tmp_path):
+    from aifos.adapters import codex_image
+
+    target = tmp_path / "portrait_周鹿.png"
+
+    class FakePopen:
+        def __init__(self, args, **_kwargs):
+            self.args = args
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            target.write_bytes(PNG)
+            return "", ""
+
+    monkeypatch.setattr(codex_image.subprocess, "Popen", FakePopen)
+    # 本测试不依赖本机真的装了 codex(CI/沙盒环境同样可跑)
+    monkeypatch.setattr(codex_image.shutil, "which",
+                        lambda _cmd: "/usr/bin/codex")
+    reply = codex_image.run({
+        "capability": "image",
+        "payload": {"portrait": True, "art_name": "周鹿"},
+        "out_dir": str(tmp_path),
+    }, "codex", 30, [])
+    assert reply["ok"] is True
+    assert reply["model"] == "gpt-image-2 (Codex 内置 image_gen)"
+
+
+def test_codex_bridge_accepts_fresh_image_when_prompt_warning_is_echoed(
+        monkeypatch, tmp_path):
+    """A rendered PNG wins over capability-warning text echoed from input."""
+    from aifos.adapters import codex_image
+
+    target = tmp_path / "portrait_周鹿.png"
+
+    class FakePopen:
+        def __init__(self, args, **_kwargs):
+            self.args = args
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            target.write_bytes(PNG)
+            return (
+                "提示词回显：如果完全没有图像生成能力，打印错误并退出。"
+                "\n已使用内置 imagegen 生成目标图片。",
+                "",
+            )
+
+    monkeypatch.setattr(codex_image.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(codex_image.shutil, "which",
+                        lambda _cmd: "/usr/bin/codex")
+
+    reply = codex_image.run({
+        "capability": "image",
+        "payload": {"portrait": True, "art_name": "周鹿"},
+        "out_dir": str(tmp_path),
+    }, "codex", 30, [])
+
+    assert reply["ok"] is True
+    assert reply["uri"] == str(target)
+    assert reply["model"] == "gpt-image-2 (Codex 内置 image_gen)"
+
+
+def test_codex_bridge_surfaces_missing_imagegen_capability(
+        monkeypatch, tmp_path):
+    from aifos.adapters import codex_image
+
+    class FakePopen:
+        def __init__(self, args, **_kwargs):
+            self.args = args
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            return (
+                "错误：当前会话未提供可调用的内置 `image_gen` "
+                "图像生成能力，未生成图片。",
+                "",
+            )
+
+    monkeypatch.setattr(codex_image.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(codex_image.shutil, "which",
+                        lambda _cmd: "/usr/bin/codex")
+    reply = codex_image.run({
+        "capability": "image",
+        "payload": {"portrait": True, "art_name": "周鹿"},
+        "out_dir": str(tmp_path),
+    }, "codex", 30, [])
+
+    assert reply == {
+        "ok": False,
+        "error": "codex 子会话缺少内置 image_gen 图像生成能力",
+    }
+
+
+def test_codex_frames_reuse_keyframe_and_lock_space(tmp_path):
+    keyframe = tmp_path / "shot_001.keyframe.png"
+    keyframe.write_bytes(PNG)
+    (tmp_path / "frames").mkdir()
+    instruction, targets, data = build_instruction("frames", {
+        "shot_no": 1, "image_uri": str(keyframe), "prompt": "三人走进大厅",
+        "characters": ["甲", "乙", "丙"], "character_count": 3,
+        "frame_target": {"phase": "start", "state": "三人刚走进大厅"},
+        "spatial_constraint": "空间调度锁：严格 3 人；P01 左→中；机位不越轴。",
+        "width": 1080, "height": 1920,
+    }, tmp_path / "frames")
+    assert targets[0].read_bytes() == PNG
+    assert data["first_source"] == "keyframe"
+    assert "只生成本镜尾帧" in instruction
+    assert "最终画面不得画出坐标、节点、箭头" in instruction
+    assert "$imagegen" in instruction
+
+
+def test_codex_frames_end_keyframe_is_last_never_first(tmp_path):
+    keyframe = tmp_path / "shot_002.keyframe.png"
+    keyframe.write_bytes(PNG)
+    out_dir = tmp_path / "frames"
+    out_dir.mkdir()
+
+    instruction, targets, data = build_instruction("frames", {
+        "shot_no": 2,
+        "image_uri": str(keyframe),
+        "prompt": "女人从车门外走向远处",
+        "frame_prompt_compacts": {
+            "first_frame": "FIRST_PHASE_ONLY_未穿外套在床上仰躺",
+            "last_frame": "LAST_PHASE_ONLY_穿外套走向远处",
+        },
+        "frame_target": {"phase": "end", "state": "女人已经走远"},
+        "start_state": {"女人": {"position": "刚站在车门外"}},
+        "end_state": {"女人": {"position": "已经走远"}},
+        "width": 1080,
+        "height": 1920,
+    }, out_dir)
+
+    first, last = targets
+    assert not first.exists()
+    assert last.read_bytes() == PNG
+    assert data["first_source"] == "generated"
+    assert data["last_source"] == "keyframe"
+    assert data["keyframe_phase"] == "end"
+    assert "尾帧已直接复用动作终点关键图" in instruction
+    assert "只产出首帧这一个文件" in instruction
+    assert "首帧已直接复用" not in instruction
+    assert "FIRST_PHASE_ONLY_未穿外套在床上仰躺" in instruction
+    assert "LAST_PHASE_ONLY_穿外套走向远处" not in instruction
+    assert "不得把尾帧服装" in instruction
+
+
+def test_codex_final_still_instruction_does_not_revive_hidden_prop_or_old_text(
+        tmp_path):
+    """发送层不得把整镜审计字段重新追加到当前静态相位合同。"""
+    projected = (
+        "【镜头合同v1】当前相位=终点；虞寻歌看向床上的弟弟；"
+        "画面中不出现手机，不显示任何可读文字。"
+    )
+    instruction, _, _ = build_instruction("image", {
+        "shot_no": 4,
+        "prompt": "整镜原文",
+        "prompt_compact": projected,
+        "prompt_contract_complete": True,
+        "characters": ["虞寻歌", "虞寻欢"],
+        "camera": "整镜旧机位",
+        "readable_text": {
+            "required": True,
+            "carrier": "手机锁屏",
+            "whitelist": ["02:21:59"],
+        },
+        "end_state": {
+            "虞寻歌": {"prop": "手机已收入口袋"},
+        },
+    }, tmp_path)
+
+    assert projected in instruction
+    assert "手机已收入口袋" not in instruction
+    assert "02:21:59" not in instruction
+    assert "整镜旧机位" not in instruction
+
+
+def test_codex_final_frame_instructions_do_not_append_whole_take_prop_or_text(
+        tmp_path):
+    """独立首尾帧合同后不能再拼接跨相位 start/end/readable_text。"""
+    instruction, _, _ = build_instruction("frames", {
+        "shot_no": 4,
+        "prompt": "整镜原文包含旧手机时间",
+        "prompt_compact": "合并审计提示，不用于边界事实补写",
+        "prompt_contract_complete": True,
+        "frame_prompt_compacts": {
+            "first_frame": "首帧合同：人物看向床；手机不可见，无可读文字",
+            "last_frame": "尾帧合同：人物走向门口；手机不可见，无可读文字",
+        },
+        "start_state": {
+            "虞寻歌": {"prop": "手机锁屏显示02:21:59"},
+        },
+        "end_state": {
+            "虞寻歌": {"prop": "手机已收入口袋"},
+        },
+        "readable_text": {
+            "required": True,
+            "carrier": "手机锁屏",
+            "whitelist": ["02:21:59"],
+        },
+    }, tmp_path)
+
+    assert "首帧合同：人物看向床" in instruction
+    assert "尾帧合同：人物走向门口" in instruction
+    assert "手机已收入口袋" not in instruction
+    assert "02:21:59" not in instruction
+
+
+@pytest.mark.parametrize("phase", ["freeze", "", "unexpected"])
+def test_codex_frames_non_boundary_keyframe_generates_both_frames(
+        tmp_path, phase):
+    keyframe = tmp_path / f"shot_{phase or 'unknown'}.keyframe.png"
+    keyframe.write_bytes(PNG)
+    out_dir = tmp_path / f"frames_{phase or 'unknown'}"
+    out_dir.mkdir()
+    target = {"state": "代表性构图"}
+    if phase:
+        target["phase"] = phase
+
+    instruction, targets, data = build_instruction("frames", {
+        "shot_no": 3,
+        "image_uri": str(keyframe),
+        "prompt": "人物从站立到坐下",
+        "frame_target": target,
+    }, out_dir)
+
+    assert not any(path.exists() for path in targets)
+    assert data["first_source"] == "generated"
+    assert data["last_source"] == "generated"
+    assert data["keyframe_phase"] == phase
+    assert "生成首帧与尾帧" in instruction
+
+
+def test_codex_frames_chain_start_and_end_keyframe_are_local_noop(tmp_path):
+    previous_tail = tmp_path / "previous_tail.png"
+    end_keyframe = tmp_path / "shot_004.keyframe.png"
+    previous_tail.write_bytes(b"previous-tail")
+    end_keyframe.write_bytes(b"authored-end")
+    out_dir = tmp_path / "frames_chain_end"
+    out_dir.mkdir()
+    payload = {
+        "shot_no": 4,
+        "prompt": "人物从门边走到走廊尽头",
+        "chain_first_uri": str(previous_tail),
+        # 新 director 不再把 end 图塞进只代表首帧的 image_uri。
+        "keyframe_reference_uri": str(end_keyframe),
+        "keyframe_last_uri": str(end_keyframe),
+        "keyframe_boundary_phase": "end",
+        # 显式边界裁决优先于可能残留的旧字段。
+        "frame_target": {"phase": "freeze", "state": "旧代表帧字段"},
+    }
+
+    instruction, targets, data = build_instruction(
+        "frames", payload, out_dir)
+
+    first, last = targets
+    assert first.read_bytes() == b"previous-tail"
+    assert last.read_bytes() == b"authored-end"
+    assert data["first_source"] == "previous_tail"
+    assert data["last_source"] == "keyframe"
+    assert data["generation_noop"] is True
+    assert "不得调用 imagegen" in instruction
+    assert "$imagegen" not in instruction
+
+    # 本地两端都已合法落盘时，即使 Codex 命令不存在也必须直接成功；
+    # 这同时证明运行层没有发起 imagegen，也没有用新鲜度规则误判旧图。
+    reply = run_codex_image({
+        "capability": "frames",
+        "payload": payload,
+        "out_dir": str(out_dir),
+    }, "/definitely/missing/codex", 1, [])
+    assert reply["ok"] is True
+    assert reply["model"] == "AIFOS 本地首尾帧相位复用"
+    assert reply["cost"] == 0.0
+    assert reply["data"]["generation_noop"] is True
+    assert Path(reply["data"]["first"]).read_bytes() == b"previous-tail"
+    assert Path(reply["data"]["last"]).read_bytes() == b"authored-end"
+
+
+def test_production_board_images_are_selectable():
+    """直播看板和图片清单都应支持选中、键盘操作与大图预览。"""
+    root = Path(__file__).resolve().parents[1]
+    app_js = (root / "aifos/web/static/app.js").read_text(encoding="utf-8")
+    css = (root / "aifos/web/static/style.css").read_text(encoding="utf-8")
+    assert 'data-plan-select="${esc(item.id)}"' in app_js
+    assert 'role="button" tabindex="0" aria-pressed="false"' in app_js
+    assert "function bindPlanSelection" in app_js
+    assert "function showPlanItemPreview" in app_js
+    assert "bindPlanSelection(app, data, episodeId)" in app_js
+    assert "bindPlanSelection(overlay, data, episodeId)" in app_js
+    assert ".plan-selectable.selected" in css
+    assert ".plan-preview-main" in css
+
+
+def test_batch_redraw_is_live_and_auditable_on_mobile():
+    """图片清单必须实时展示批量进度、自动改词与实际参考图。"""
+    root = Path(__file__).resolve().parents[1]
+    app_js = (root / "aifos/web/static/app.js").read_text(encoding="utf-8")
+    css = (root / "aifos/web/static/style.css").read_text(encoding="utf-8")
+    assert "function watchBatchRedraw" in app_js
+    assert "function updateBatchRedrawProgress" in app_js
+    assert "function refreshOpenPlanOverlay" in app_js
+    assert "提示词已自动修正" in app_js
+    assert "本次实际交给出图产线的参考图" in app_js
+    assert ".batch-job-progress" in css
+    assert ".plan-trace" in css
+
+
+def test_regen_always_produces_new_image(app):
+    """重画必然产生新画面:同一意见连续重画两次,内容也不能相同。
+    (占位产线是确定性生成,靠 payload 里的 revision 保证变化。)"""
+    from pathlib import Path
+    project = _preproduce(app)
+    name = app.assets.list(project["id"], "scene_art")[0]["name"]
+    target = {"kind": "scene_art", "name": name}
+    before = Path(app.assets.latest(
+        project["id"], "scene_art", name)["uri"]).read_text(
+        encoding="utf-8")
+    app.director.regen_image(project["title"], 1, target,
+                             feedback="换成红色衣服")
+    first = Path(app.assets.latest(
+        project["id"], "scene_art", name)["uri"]).read_text(
+        encoding="utf-8")
+    app.director.regen_image(project["title"], 1, target,
+                             feedback="换成红色衣服")
+    second = Path(app.assets.latest(
+        project["id"], "scene_art", name)["uri"]).read_text(
+        encoding="utf-8")
+    assert before != first
+    assert first != second      # 同意见再画一次也必须换新画面
+
+
+def test_character_designs_enrich_prompts(app):
+    """编剧 AI 人物设定:性格/外貌/服装细节进入立绘与套件提示词。"""
+    project = _preproduce(app)
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    script, _ = app.projects.latest_document(episode["id"], "script")
+    name = script["characters"][0]["name"]
+    design = app.director._character_design(project["id"], name)
+    assert design, "人物设定未生成"
+    for field in ("personality", "appearance", "costume", "makeup",
+                  "palette", "signature"):
+        assert design.get(field), f"设定缺少 {field}"
+    plan = json.loads(
+        (app.workspace.artifacts_dir / f"p{project['id']:03d}" / "e001"
+         / "render_plan.json").read_text(encoding="utf-8"))
+    portrait = next(i for i in plan["items"] if i["id"] == f"char:{name}")
+    assert design["personality"] in portrait["prompt"]
+    assert design["costume"] in portrait["prompt"]
+    makeup = next(i for i in plan["items"]
+                  if i["id"] == f"sheet:{name}:makeup")
+    assert design["makeup"] in makeup["prompt"]
+    detail = next(i for i in plan["items"]
+                  if i["id"] == f"sheet:{name}:costume_detail")
+    assert design["costume_detail"] in detail["prompt"]
+
+
+def test_character_designs_reused_across_episodes(app):
+    """人物设定项目级复用:第二集不重新生成,形象稳定。"""
+    project = _preproduce(app)
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    script, _ = app.projects.latest_document(episode["id"], "script")
+    name = script["characters"][0]["name"]
+    first = app.director._character_design(project["id"], name)
+    _preproduce(app, number=2)
+    assert app.director._character_design(project["id"], name) == first
+
+
+def test_design_prompt_and_validation(tmp_path):
+    """Claude 设定提示词与校验:名单齐全,空泛设定被拒。"""
+    from aifos.adapters.claude_script import (build_prompt,
+                                              validate_script)
+    payload = {"character_design": True, "project_title": "雪夜狐仙",
+               "style": "水墨国风",
+               "characters": [{"name": "洛尘", "role": "主角"}]}
+    prompt = build_prompt("script", payload)
+    assert "人物设定" in prompt and "洛尘" in prompt and "designs" in prompt
+    assert "第1项必须是首次登场前" in prompt
+    assert "人物定角4张候选必须复用第1项" in prompt
+    assert "禁止官服等后续换装、淋湿、泥污、血迹、伤口或死亡态" in prompt
+    ok = {"designs": [{"name": "洛尘", "personality": "外冷内热",
+                       "appearance": "瓜子脸冷白皮", "costume": "交领长衫"}]}
+    assert validate_script(ok, payload) is None
+    assert ok["designs"][0]["makeup"] == ""      # 缺省字段自动补空
+    bad = {"designs": [{"name": "洛尘", "personality": "好"}]}
+    assert "空泛" in validate_script(bad, payload)
+    missing = {"designs": [{"name": "别人", "personality": "x",
+                            "appearance": "y", "costume": "z"}]}
+    assert "缺少角色设定" in validate_script(missing, payload)
+
+
+def test_asset_center_has_design_and_lightbox():
+    """资产中心展示人物设定,图片可点击放大。"""
+    root = Path(__file__).resolve().parents[1]
+    app_js = (root / "aifos/web/static/app.js").read_text(encoding="utf-8")
+    css = (root / "aifos/web/static/style.css").read_text(encoding="utf-8")
+    assert "function designHtml" in app_js
+    assert "function showImageLightbox" in app_js
+    assert "bindLightbox(app)" in app_js
+    assert ".lightbox-box img" in css
+    assert "cursor: zoom-in" in css
+
+
+def test_character_portrait_is_not_reused_as_cross_character_style_ref(app):
+    """主角立绘只决定生成顺序，不得把主角脸污染其他人物和场景。"""
+    payloads = []
+    original = app.director.router.call
+
+    def recording(capability, payload, out_dir, cancel=None):
+        if capability == "image":
+            payloads.append(dict(payload))
+        return original(capability, payload, out_dir, cancel=cancel)
+
+    app.director.router.call = recording
+    project = _preproduce(app)
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    script, _ = app.projects.latest_document(episode["id"], "script")
+    anchor = app.director._anchor_character(project["id"])
+    assert anchor  # 主角优先
+    portraits = [p for p in payloads if p.get("portrait")]
+    from aifos.director import character_candidate_target
+    expected = sum(character_candidate_target(c) for c in script["characters"])
+    assert len(portraits) == expected
+    assert all(p.get("portrait_candidate") for p in portraits)
+    for p in payloads:
+        if p.get("character_sheet") or p.get("scene_art"):
+            assert not p.get("style_ref")
+    # 分镜画面由项目文字画风、人物最终立绘与场景基准共同约束，
+    # 不再额外上传另一个角色的脸作为“画风图”。
+    shots = [p for p in payloads if p.get("shot_no")]
+    assert shots and all(not p.get("style_ref") for p in shots)
+
+
+def test_restyle_project_regenerates_all_art(app):
+    """换画风:旧身份失效，按角色重要度重生成候选并等待人工定版。"""
+    project = _preproduce(app)
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    script, _ = app.projects.latest_document(episode["id"], "script")
+    before = {(r["kind"], r["name"]): r["version"]
+              for r in app.assets.list(project["id"])
+              if r["kind"] in ("character_candidate", "character_sheet",
+                               "scene_art", "character_identity")}
+    summary = app.director.restyle_project(
+        project["title"], 1, style="赛博朋克霓虹,冷紫主色")
+    assert summary["status"] == "awaiting_cast"
+    assert summary["style"] == "赛博朋克霓虹,冷紫主色"
+    assert app.projects.get_project(
+        project["title"])["style"] == "赛博朋克霓虹,冷紫主色"
+    after = {(r["kind"], r["name"]): r["version"]
+             for r in app.assets.list(project["id"])
+             if r["kind"] in ("character_candidate", "character_sheet",
+                              "scene_art", "character_identity")}
+    # 历史候选槽位继续保留为版本记录；有效候选数量由角色重要度控制。
+    assert set(before).issubset(after)
+    for key, version in before.items():
+        # 作废墓碑和新产物都保留版本审计，因此一次全新重做可能跨两版。
+        assert after[key] > version, f"{key} 未重做"
+    selection = app.director.character_selection_status(
+        project["id"], script["characters"])
+    assert all(item["candidate_count"] == character_candidate_target(
+        next(c for c in script["characters"]
+             if c["name"] == item["character"]))
+               for item in selection["characters"])
+    # 新画风必须重新人工定版，不能自动覆盖最终立绘
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    assert episode["status"] == "awaiting_cast"
+    # 新画风进入清单提示词
+    plan = json.loads(
+        (app.workspace.artifacts_dir / f"p{project['id']:03d}" / "e001"
+         / "render_plan.json").read_text(encoding="utf-8"))
+    item = next(i for i in plan["items"]
+                if i["category"] == "character_candidate")
+    assert "赛博朋克霓虹" in item["prompt"]
+
+
+def test_codex_instruction_includes_style_anchor(tmp_path):
+    """Codex 指令包含风格基准图硬约束。"""
+    instruction, _, _ = build_instruction("image", {
+        "portrait": True, "art_name": "石头", "role": "同伴",
+        "prompt": "角色立绘:石头", "style_ref": "/tmp/anchor.png",
+        "width": 1080, "height": 1920,
+    }, tmp_path)
+    assert "风格基准图 /tmp/anchor.png" in instruction
+    assert "禁止任何风格漂移" in instruction

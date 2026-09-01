@@ -1,0 +1,1084 @@
+"""内置 Mock Provider:确定性占位生成。
+
+作用:在未接入 Codex / 即梦 CLI / 剪映 / API 的环境中,让完整生产流程
+(剧本→分镜→图片→首尾帧→视频→配音→剪辑→封面)端到端可运行、可测试。
+所有产物均为确定性内容(相同输入 → 相同输出),媒体类产物以 JSON/SVG
+占位描述文件落盘,由真实 Provider 接入后替换为真实媒体。
+"""
+
+import copy
+import hashlib
+import json
+import re
+from html import escape
+from pathlib import Path
+
+from ..adapters.claude_script import normalize_script_bible
+from ..identity_facts import explicit_age_range, explicit_gender
+from ..story_analysis import build_story_analysis
+from .base import Provider, ProviderResult
+from .cinematic import render_cover, render_portrait, render_shot
+
+
+def _safe_name(name):
+    return "".join(c if c.isalnum() else "_" for c in str(name))[:40]
+
+SURNAMES = ["林", "苏", "顾", "沈", "陆", "叶", "秦", "白"]
+GIVEN = ["昭", "砚", "青", "澈", "离", "澜", "霁", "衡"]
+PARTNERS = ["小狐", "阿禾", "墨童", "云雀", "石头"]
+VILLAINS = ["蚀骨妖王", "夜枭真君", "赤瞳魔尊", "幽泉老祖"]
+LOCATIONS = ["古镇长街", "藏经阁", "迷雾山谷", "断桥残雪", "妖市地穴", "青云峰顶"]
+CAMERAS = ["远景推近", "特写", "过肩镜头", "俯拍全景", "手持跟拍", "环绕运镜"]
+
+# AI 虚拟偶像模板素材池
+IDOL_TOPICS = ["新歌翻唱", "今日穿搭", "粉丝问答", "日常vlog", "舞蹈挑战"]
+IDOL_SPOTS = ["直播间", "天台夕阳", "便利店门口", "录音棚", "地铁站台"]
+IDOL_MEMBERS = ["林小鹿", "夏栀", "程果", "阿柒", "白桃", "乐乐"]
+GROUP_TOPICS = ["首秀舞台", "新歌打歌", "团综日常", "练习室初舞台"]
+
+# 题材关键词 → 模板;开工时未明确类型则按 标题+前提+风格 自动识别
+GENRE_KEYWORDS = {
+    "idol": ("女团", "男团", "偶像", "爱豆", "打歌", "出道", "组合",
+             "主播", "虚拟人"),
+    "urban": ("都市", "职场", "公司", "白领", "创业", "办公室"),
+    "campus": ("校园", "同学", "高中", "大学", "社团", "毕业"),
+    "xianxia": ("仙侠", "修仙", "妖", "灵", "剑", "封印", "宗门"),
+}
+
+# 剧情短剧题材素材(三幕:发现 → 对峙 → 解决)
+DRAMA_FLAVORS = {
+    "xianxia": {
+        "locations": LOCATIONS,
+        "partners": PARTNERS,
+        "villains": VILLAINS,
+        "beats": [
+            ("{hero}察觉{loc}妖气异动,循迹而至。", [
+                ("{hero}", "这股妖气……和《{title}》里记载的一模一样。"),
+                ("{partner}", "{hero},小心!它就藏在附近。")]),
+            ("{villain}现身{loc},双方对峙。", [
+                ("{villain}", "区区凡人,也敢窥探《{title}》的秘密?"),
+                ("{hero}", "第{number}页的封印,今天必须取回!"),
+                ("{partner}", "我来引开它,你去取封印!")]),
+            ("{hero}在{loc}完成封印,收获新一页图录。", [
+                ("{hero}", "《{title}》第{number}页,收录完成。"),
+                ("{partner}", "下一站,我们去哪儿?")]),
+        ],
+        "logline": "{hero}与{partner}在{loc}追查《{title}》的线索,直面{villain}。",
+    },
+    "urban": {
+        "locations": ["写字楼大厅", "深夜办公室", "咖啡店", "天台",
+                      "会议室", "地铁站"],
+        "partners": ["同事阿凯", "实习生小雨", "闺蜜安安", "老同学大树"],
+        "villains": ["竞对周总", "甲方王总", "空降李总监"],
+        "beats": [
+            ("{hero}在{loc}发现项目出了大问题。", [
+                ("{hero}", "这份数据不对劲,方案要出事。"),
+                ("{partner}", "{hero},现在改还来得及吗?")]),
+            ("{villain}在{loc}施压,气氛剑拔弩张。", [
+                ("{villain}", "明早交不出方案,这单就归我了。"),
+                ("{hero}", "第{number}版方案,今晚一定拿下!"),
+                ("{partner}", "我陪你通宵,资料我来整!")]),
+            ("{hero}在{loc}漂亮翻盘,赢得掌声。", [
+                ("{hero}", "《{title}》第{number}关,通关!"),
+                ("{partner}", "走,庆功奶茶我请!")]),
+        ],
+        "logline": "{hero}和{partner}在{loc}迎战{villain},一夜逆风翻盘。",
+    },
+    "campus": {
+        "locations": ["教室", "操场", "天台", "社团活动室", "图书馆", "小卖部"],
+        "partners": ["同桌小七", "学委安然", "篮球队阿豪"],
+        "villains": ["隔壁班学霸", "毒舌评委", "神秘转学生"],
+        "beats": [
+            ("{hero}在{loc}接下了一个大挑战。", [
+                ("{hero}", "这次比赛,我想试试。"),
+                ("{partner}", "{hero},我们都陪你练!")]),
+            ("{villain}在{loc}放话,火药味十足。", [
+                ("{villain}", "就凭你们,也想赢?"),
+                ("{hero}", "第{number}轮,见真章!"),
+                ("{partner}", "别怕,我们练的比谁都多!")]),
+            ("{hero}在{loc}稳稳拿下,全场欢呼。", [
+                ("{hero}", "《{title}》第{number}战,赢了!"),
+                ("{partner}", "说好的,一起去吃火锅!")]),
+        ],
+        "logline": "{hero}带着{partner}在{loc}迎战{villain},青春全力一搏。",
+    },
+}
+
+
+def _detect_genre(payload):
+    """开工未明确类型时,按 标题+前提+风格 关键词识别题材。"""
+    if payload.get("template") == "idol":
+        return "idol"
+    # 标题和剧情前提决定故事题材；视觉风格只做最后兜底。否则现代默认
+    # 画风中的“都市”会盖过《万妖图录》标题里的“妖”。
+    for fields in (("project_title", "premise"), ("style",)):
+        text = " ".join(str(payload.get(k) or "") for k in fields)
+        for genre, keywords in GENRE_KEYWORDS.items():
+            if any(k in text for k in keywords):
+                return genre
+    return "xianxia"
+
+
+def _persona_from_title(title):
+    """「苏念的一天」→「苏念」:标题带『X的…』时取 X 作人设名。"""
+    match = re.match(r"^(.{1,4}?)的.+", title or "")
+    return match.group(1) if match else (title or "小艾")
+
+
+def _strip_genre_words(text):
+    out = text or ""
+    for words in GENRE_KEYWORDS.values():
+        for w in words:
+            out = out.replace(w, "")
+    return out.strip(" ,,、的")
+
+
+def _dims(payload, default_w=1080, default_h=1920):
+    return (int(payload.get("width", default_w)),
+            int(payload.get("height", default_h)))
+
+
+def _digest(payload):
+    blob = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(blob.encode("utf-8")).digest()
+
+
+def _pick(seq, seed, salt):
+    return seq[(seed[salt % len(seed)] + salt) % len(seq)]
+
+
+def _svg(path, lines, seed, width=960, height=540):
+    r, g, b = 40 + seed[0] % 120, 40 + seed[1] % 120, 40 + seed[2] % 120
+    texts = "".join(
+        f'<text x="40" y="{90 + i * 48}" font-size="30" fill="#ffffff">'
+        f"{escape(line)}</text>"
+        for i, line in enumerate(lines)
+    )
+    content = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
+        f'height="{height}"><rect width="100%" height="100%" '
+        f'fill="rgb({r},{g},{b})"/>{texts}</svg>'
+    )
+    Path(path).write_text(content, encoding="utf-8")
+    return str(path)
+
+
+def _json_artifact(path, data):
+    Path(path).write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return str(path)
+
+
+class MockProvider(Provider):
+    def generate(self, capability, payload, out_dir, cancel=None):
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        handler = getattr(self, f"_gen_{capability}", None)
+        if handler is None:
+            raise ValueError(f"mock 不支持能力: {capability}")
+        data, uri = handler(payload, out_dir)
+        return ProviderResult(
+            provider=self.name, cost=self.cost_per_call, data=data, uri=uri)
+
+    # ---- 图片质检:占位版按标记回应(真实核验需 Claude 产线) ----
+    def _gen_image_qc(self, payload, out_dir):
+        blob = json.dumps(payload, ensure_ascii=False)
+        if "质检必挂" in blob:
+            return {"pass": False,
+                    "identity_checked": bool(
+                        payload.get("identity_references")),
+                    "identity_match": True,
+                    "gender_checked": bool(
+                        payload.get("identity_references")),
+                    "gender_match": True,
+                    "wardrobe_checked": True,
+                    "wardrobe_match": True,
+                    "count_checked": True,
+                    "count_match": True,
+                    "overlay_count_checked": True,
+                    "overlay_count_match": True,
+                    "detected_overlay_count": payload.get(
+                        "expected_overlay_count", 0),
+                    "physical_logic_checked": True,
+                    "physical_logic_match": True,
+                    "spatial_logic_checked": True,
+                    "spatial_logic_match": True,
+                    "detected_count": payload.get("count", 0),
+                    "issues": ["测试触发:画面与要求不符"],
+                    "image_error": {
+                        "summary": "画面与当前镜头要求不符",
+                        "categories": ["composition"],
+                        "evidence": ["mock 质检标记触发"],
+                    },
+                    "prompt_diagnosis": {
+                        "status": "needs_patch",
+                        "issues": ["当前镜头约束需要进一步明确"],
+                        "irrelevant_or_conflicting_sections": [],
+                    },
+                    "reference_diagnosis": {
+                        "status": "correct",
+                        "issues": [],
+                        "missing_roles": [],
+                    },
+                    "targeted_prompt_patch": {
+                        "instructions": ["只修正当前镜头构图与动作"],
+                        "preserve": ["人物身份", "场景", "画风"],
+                        "max_scope": "current_shot_only",
+                    },
+                    "reference_adjustments": []}, ""
+        return {"pass": True,
+                "identity_checked": (not payload.get("identity_required")
+                                     or bool(payload.get("identity_references"))),
+                "identity_match": True,
+                "gender_checked": (not payload.get("gender_required")
+                                    or bool(payload.get("identity_references"))),
+                "gender_match": True,
+                "wardrobe_checked": True,
+                "wardrobe_match": True,
+                "count_checked": True,
+                "count_match": True,
+                "overlay_count_checked": True,
+                "overlay_count_match": True,
+                "detected_overlay_count": payload.get(
+                    "expected_overlay_count", 0),
+                "physical_logic_checked": True,
+                "physical_logic_match": True,
+                "spatial_logic_checked": True,
+                "spatial_logic_match": True,
+                "detected_count": payload.get("count", 0),
+                "issues": [],
+                "image_error": {
+                    "summary": "", "categories": [], "evidence": []},
+                "prompt_diagnosis": {
+                    "status": "correct", "issues": [],
+                    "irrelevant_or_conflicting_sections": []},
+                "reference_diagnosis": {
+                    "status": "correct", "issues": [], "missing_roles": []},
+                "targeted_prompt_patch": {
+                    "instructions": [], "preserve": [],
+                    "max_scope": "current_shot_only"},
+                "reference_adjustments": []}, ""
+
+    # ---- 剧本:按题材分流(偶像/都市/校园/仙侠) ----
+    def _gen_script(self, payload, out_dir):
+        if payload.get("story_analysis"):
+            analysis = build_story_analysis(
+                payload.get("script") or {}, payload.get("style", ""),
+                source="mock")
+            # Offline/mock runs still exercise the autonomous cast gate.  A
+            # placeholder such as “剧本未明示” would incorrectly turn a
+            # provider fallback into a manual confirmation checkpoint, so the
+            # mock acts like a successful second-pass character analyst and
+            # returns explicit drawable identity facts.
+            for index, character in enumerate(
+                    analysis.get("characters") or []):
+                if not isinstance(character, dict):
+                    continue
+                if not explicit_gender(character.get("gender")):
+                    name = str(character.get("name") or "")
+                    character["gender"] = (
+                        "女性" if any(token in name for token in (
+                            "小狐", "小鹿", "栀", "桃", "雨", "安然"))
+                        else "男性")
+                if not explicit_age_range(character.get("age_range")):
+                    character["age_range"] = (
+                        "18-24" if index < 2 else "25-35")
+                character["identity_status"] = "ready"
+                character["identity_missing_fields"] = []
+            if payload.get("creative_direction"):
+                analysis["creative_direction"] = payload[
+                    "creative_direction"]
+            uri = _json_artifact(
+                out_dir / "story_analysis.json", analysis)
+            return analysis, uri
+        if payload.get("asset_prompt"):
+            return self._gen_asset_prompt(payload, out_dir)
+        if payload.get("character_design"):
+            return self._gen_character_design(payload, out_dir)
+        if (payload.get("source_material_adaptation")
+                and isinstance(payload.get("previous_script"), dict)):
+            # 测试/离线占位也要遵守真实编剧的“保留核心人物、地点与事件”
+            # 约束，不能用随机模板把用户导入素材整体替换掉。
+            script = copy.deepcopy(payload["previous_script"])
+            normalize_script_bible(script, payload)
+            uri = _json_artifact(out_dir / "adapted_script.json", script)
+            return script, uri
+        genre = _detect_genre(payload)
+        if genre == "idol":
+            return self._gen_idol_script(payload, out_dir)
+        return self._gen_drama_script(payload, out_dir, genre)
+
+    # ---- 人物设定:占位版也给出具体可画的丰富描述 ----
+    DESIGN_POOLS = {
+        "species": ["人类", "人类", "人类", "人类"],
+        "personality": ["外冷内热,神态克制,眼神却藏锋",
+                       "活泼张扬,嘴角常带笑,站姿重心随性",
+                       "沉稳可靠,表情不多但目光坚定",
+                       "亦正亦邪,似笑非笑,气场压人"],
+        "temperament": ["清冷疏离", "明快灵动", "温润如玉", "凌厉威压"],
+        "appearance": ["瓜子脸,冷白皮,身形挺拔修长(八头身)",
+                      "圆脸带婴儿肥,健康小麦色,身形娇小灵活",
+                      "方正轮廓,古铜肤色,肩宽背直",
+                      "锋利下颌线,苍白肤色,清瘦高挑"],
+        "hair": ["墨黑长发高马尾,发尾微卷,额前碎发",
+                "栗色双丸子头,缀红绳", "银白短发,鬓角利落",
+                "深紫长发披肩,一缕挑染"],
+        "eyes": ["狭长丹凤眼,琥珀瞳,眼神清亮",
+                "圆杏眼,深棕瞳,笑时弯成月牙",
+                "细长剑眉压目,墨黑瞳", "上挑桃花眼,绯红瞳,妖气"],
+        "makeup": ["淡妆,眼尾一点朱砂,唇色豆沙",
+                  "元气妆,腮红明显,唇色蜜桃",
+                  "素面无妆,眉形浓正", "烟熏眼影,唇色暗红"],
+        "costume": ["交领束腰长衫,外罩纱质大氅,层次三层",
+                   "短打劲装配护腕,束腿裤,轻便利落",
+                   "宽袖道袍,腰悬玉牌,内衬素白",
+                   "玄色长袍金线滚边,高领半遮面"],
+        "costume_detail": ["袖口云纹刺绣,盘扣为铜钱式,靴面暗纹",
+                         "衣摆虎头补丁,草编腰带,布鞋",
+                         "领口锁子纹,玉牌刻符,云头履",
+                         "金线蟒纹,肩甲鎏金,长靴嵌铆钉"],
+        "accessories": ["青玉发簪,腕间佛珠", "红绳铃铛,背小竹篓",
+                       "铜制罗盘,腰间酒葫芦", "赤金耳坠,指骨戒"],
+        "palette": ["月白+黛青,点缀朱砂红", "藕荷+鹅黄,点缀草绿",
+                   "玄黑+石青,点缀鎏金", "绛紫+暗金,点缀猩红"],
+        "signature": ["左眼下泪痣", "笑起来的虎牙", "眉骨旧疤",
+                     "颈侧妖纹"],
+    }
+
+    STORY_COSTUME_POOLS = {
+        "xianxia": {
+            "costume": ["交领束腰长衫,外罩纱质大氅,层次三层",
+                        "短打劲装配护腕,束腿裤,轻便利落",
+                        "宽袖道袍,腰悬玉牌,内衬素白"],
+            "detail": ["袖口云纹刺绣,玉扣与软底云靴",
+                       "护腕有旧战痕,腰封藏符,轻便布靴",
+                       "领口锁子纹,玉牌刻符,云头履"],
+            "palette": ["月白+黛青,点缀朱砂红", "玄黑+石青,点缀鎏金",
+                        "藕荷+鹅黄,点缀草绿"],
+            "variants": [
+                {"label": "行旅探查", "costume": "耐磨短打与轻便斗篷",
+                 "props": "铜制罗盘与符纸", "temperament": "警觉克制"},
+                {"label": "对战冲突", "costume": "收袖劲装与护腕护膝",
+                 "props": "佩剑与破损护符", "temperament": "锋利决绝"},
+                {"label": "封印仪式", "costume": "宽袖法袍与层叠披帛",
+                 "props": "发光玉牌与朱砂阵笔", "temperament": "肃穆坚定"},
+            ],
+        },
+        "urban": {
+            "costume": ["剪裁利落的深色西装与真丝衬衫",
+                        "简洁针织上衣配高腰直筒裤和短外套",
+                        "真实可辨认的外卖配送制服与反光条"],
+            "detail": ["金属袖扣,窄版皮带,通勤皮鞋",
+                       "织物纹理清晰,帆布包与低跟鞋",
+                       "品牌区域留空,保温箱、头盔和工牌"],
+            "palette": ["炭灰+冷白,点缀酒红", "奶油白+雾蓝,点缀焦糖",
+                        "制服蓝+荧光黄,点缀黑色"],
+            "variants": [
+                {"label": "工作身份", "costume": "符合职业的制服或工装",
+                 "props": "工牌、职业装备与随身包", "temperament": "专注可靠"},
+                {"label": "冲突加班", "costume": "卷袖衬衫、功能马甲与疲惫层次",
+                 "props": "文件夹、手机或工具箱", "temperament": "压迫中坚持"},
+                {"label": "关键会面", "costume": "为身份升级的正式造型",
+                 "props": "关键文件或象征性物件", "temperament": "克制有锋芒"},
+            ],
+        },
+        "campus": {
+            "costume": ["校服西装外套与百褶裙/长裤",
+                        "社团运动服配帆布鞋和校徽",
+                        "毕业典礼正装与校徽领带"],
+            "detail": ["校徽、课本和针织背心", "护腕、社团徽章和运动鞋",
+                       "学士帽、证书和整洁皮鞋"],
+            "palette": ["藏蓝+白,点缀红", "墨绿+米白,点缀橙",
+                        "黑色+象牙白,点缀金色"],
+            "variants": [
+                {"label": "日常上课", "costume": "合体校服与书包",
+                 "props": "课本、学生证", "temperament": "自然青涩"},
+                {"label": "社团行动", "costume": "社团运动服或排练服",
+                 "props": "社团徽章、球具或乐器", "temperament": "投入鲜活"},
+                {"label": "公开比赛", "costume": "比赛服或整洁正式校服",
+                 "props": "奖状、麦克风或比赛道具", "temperament": "紧张坚定"},
+            ],
+        },
+        "idol": {
+            "costume": ["主题舞台服与层叠亮片短外套",
+                        "练习室功能运动装与成员识别色",
+                        "打歌主舞台定制造型与耳麦"],
+            "detail": ["耳麦、成员色发饰和舞台靴", "护腕、毛巾和运动鞋",
+                       "水钻、流苏、耳返和舞台靴"],
+            "palette": ["黑银+成员色", "白灰+糖果色", "深紫+冷金"],
+            "variants": [
+                {"label": "练习室", "costume": "便于动作的功能练习服",
+                 "props": "耳机、毛巾和水瓶", "temperament": "专注真实"},
+                {"label": "后台准备", "costume": "半成品舞台服与外搭",
+                 "props": "耳返、麦克风和成员徽章", "temperament": "紧张兴奋"},
+                {"label": "主舞台", "costume": "与歌曲主题绑定的完整舞台服",
+                 "props": "麦克风与灯光反射饰件", "temperament": "耀眼自信"},
+            ],
+        },
+    }
+
+    @staticmethod
+    def _design_genre(payload, character):
+        text = " ".join(str(payload.get(key) or "") for key in (
+            "project_title", "premise", "style", "logline"))
+        text += " " + json.dumps(character, ensure_ascii=False)
+        if any(word in text for word in GENRE_KEYWORDS["idol"]):
+            return "idol"
+        if any(word in text for word in GENRE_KEYWORDS["campus"]):
+            return "campus"
+        if any(word in text for word in GENRE_KEYWORDS["urban"]):
+            return "urban"
+        return "xianxia"
+
+    def _gen_asset_prompt(self, payload, out_dir):
+        """资产工坊的离线占位提示词:把用户需求原样编成可执行结构。
+
+        占位产线不会凭空发明画面事实,只做「需求 + 该资产类型的常规
+        美术条款」的确定性拼接,让离线环境也能跑通整条工坊链路。
+        """
+        kind = str(payload.get("asset_type") or "character")
+        brief = str(payload.get("brief") or "").strip()
+        current = str(payload.get("current_prompt") or "").strip()
+        feedback = str(payload.get("feedback") or "").strip()
+        name = str(payload.get("asset_name") or "").strip()
+        style = str(payload.get("style") or "").strip()
+        rules = {
+            "character": "单人全身立绘,纯净无场景背景,五官清晰,自然光影,"
+                         "服装材质可辨,不出现文字与多余道具",
+            "style": "只表达媒介、笔触、色调、光影与材质质感,不绑定人物身份,"
+                     "不出现文字与拼图分格",
+            "scene": "空间结构与陈设清晰,主光方向明确,画面中不出现人物",
+            "prop": "单件物品居中展示,形制、结构、材质与磨损细节可辨,"
+                    "不出现人物与使用场景",
+        }.get(kind, "画面干净可复用,不出现文字、水印与边框")
+        parts = [part for part in (
+            f"{name}:" if name else "",
+            current or brief or "按资产名称执行",
+            f"修改要求:{feedback}" if feedback else "",
+            f"画风:{style}" if style else "",
+            rules,
+            "(占位产线拼接稿:未接入真实编剧产线,请人工确认后再出图)",
+        ) if part]
+        data = {
+            "image_prompt": "。".join(parts),
+            "negative_prompt": "文字、水印、Logo、边框、多余人物",
+            "notes": [item for item in (
+                f"需求「{brief}」原样保留" if brief else "",
+                f"修改意见「{feedback}」已写入" if feedback else "",
+                f"已补齐{kind}类资产的常规美术条款",
+            ) if item],
+        }
+        uri = _json_artifact(out_dir / "asset_prompt.json", data)
+        return data, uri
+
+    def _gen_character_design(self, payload, out_dir):
+        seed = _digest(payload)
+        designs = []
+        formal_names = [
+            str(character.get("name") or "")
+            for character in payload.get("characters", [])
+            if character.get("name")
+        ]
+        for idx, character in enumerate(payload.get("characters", [])):
+            design = {"name": character.get("name", "")}
+            for f_no, (field, pool) in enumerate(
+                    sorted(self.DESIGN_POOLS.items())):
+                design[field] = _pick(pool, seed, idx * 13 + f_no)
+            genre = self._design_genre(payload, character)
+            story_pool = self.STORY_COSTUME_POOLS[genre]
+            design["costume"] = _pick(
+                story_pool["costume"], seed, idx * 17 + 2)
+            design["costume_detail"] = _pick(
+                story_pool["detail"], seed, idx * 17 + 3)
+            design["palette"] = _pick(
+                story_pool["palette"], seed, idx * 17 + 4)
+            role = character.get("role") or "角色"
+            setting = character.get("era_setting") or (
+                "仙侠世界与古代地域" if genre == "xianxia" else
+                "当代城市与真实生活场景" if genre == "urban" else
+                "当代校园" if genre == "campus" else "当代舞台与练习室")
+            design.update({
+                "background_prompt": character.get(
+                    "background_prompt") or
+                    f"{character.get('name', '角色')}是{setting}中的{role};"
+                    f"其外冷内热/目标明确的性格通过眼神、站姿和{story_pool['variants'][0]['props']}外化;"
+                    "服装必须随剧情场合变化并保留身份辨识度",
+                "era_setting": character.get("era_setting") or setting,
+                "occupation": character.get("occupation") or role,
+                "motivation": character.get("motivation") or
+                    "在本集冲突中完成目标并保护重要关系",
+                "backstory": character.get("backstory") or
+                    "曾经历一次改变其信念的事件,因此形成当前性格",
+                "relationships": character.get("relationships") or
+                    "与同伴互相扶持,与对手存在目标冲突",
+                "costume_direction": character.get("costume_direction") or
+                    f"服装按{setting}、{role}与剧情场合区分,材质和装备必须可辨认",
+                "signature_props": character.get("signature_props") or
+                    story_pool["variants"][0]["props"],
+                "visual_variants": character.get("visual_variants") or
+                    story_pool["variants"],
+            })
+            design["character_analysis"] = (
+                character.get("character_analysis") or {
+                    "identity_and_class": (
+                        character.get("identity") or role),
+                    "age_and_presentation": character.get("age_range") or
+                        "以剧本人物表为准",
+                    "upbringing": character.get("backstory") or
+                        "关键经历塑造当前性格",
+                    "family_background": character.get(
+                        "family_background") or "剧本未明示，保守留白",
+                    "education_background": character.get(
+                        "education_background") or "剧本未明示，保守留白",
+                    "current_situation": (
+                        payload.get("premise") or "处于本集核心冲突中"),
+                    "core_desire": character.get("motivation") or
+                        "完成本集目标",
+                    "greatest_fear": character.get("greatest_fear") or
+                        "失去重要目标或关系",
+                    "formative_experiences": [
+                        character.get("backstory")
+                        or "一次改变信念的关键经历"],
+                    "strengths": ["目标明确", "能够行动"],
+                    "flaws": ["在压力下容易固执"],
+                    "behavior_habits": [
+                        character.get("signature_props")
+                        or "通过眼神、站姿和随身物件外化性格"],
+                })
+            design["visual_dna"] = character.get("visual_dna") or {
+                "face_structure": design["appearance"],
+                "hair_silhouette": design["hair"],
+                "body_or_occupation_marks": (
+                    f"{design['occupation']}形成的体态与使用痕迹"),
+                "clothing_structure": (
+                    f"{design['costume']}；{design['costume_detail']}"),
+                "clothing_wear_state": "整洁程度与当前处境和社会身份一致",
+                "story_visual_symbol": design["signature"],
+                "story_visual_symbol_origin": (
+                    f"来源于{design['backstory']}与{design['occupation']}"),
+                "signature_accessory": design["signature_props"],
+                "temperament_keywords": [
+                    design["temperament"], design["personality"], role],
+                "genre_system_mapping": {},
+            }
+            design["cast_dedup"] = character.get("cast_dedup") or {
+                "compared_with": [
+                    name for name in formal_names
+                    if name != character.get("name")],
+                "dimensions": [
+                    "hair_silhouette", "clothing_structure",
+                    "body_or_occupation_marks", "story_visual_symbol",
+                    "signature_accessory", "temperament_keywords",
+                ],
+                "overlap_threshold": 2,
+                "status": "passed",
+                "conflicts": [],
+                "redesign_if_overlap": True,
+            }
+            # 参考图为最高标准:脸部特征/发型/风格字段锁定到参考图
+            references = character.get("reference_images") or []
+            if references:
+                design["appearance"] = (
+                    "以参考图人物脸部特征为最高标准(脸型/五官比例/"
+                    "年龄感与参考图一致)," + design["appearance"])
+                design["hair"] = "发型发色以参考图为准," + design["hair"]
+                design["signature"] = ("与参考图同一人辨识特征,"
+                                       + design["signature"])
+                design["reference_locked"] = True
+                design["reference_images"] = list(references)
+            designs.append(design)
+        data = {"designs": designs}
+        uri = _json_artifact(out_dir / "character_designs.json", data)
+        return data, uri
+
+    def _enrich_script_characters(self, script, payload, genre=None):
+        """占位剧本也输出完整人物背景,让后续真实出图不靠默认都市模板。"""
+        source_text = " ".join(str(payload.get(key) or "") for key in (
+            "project_title", "premise", "style", "template"))
+        for index, character in enumerate(script.get("characters", [])):
+            genre_name = genre or self._design_genre(payload, character)
+            story_pool = self.STORY_COSTUME_POOLS[genre_name]
+            role = character.get("role") or "角色"
+            setting = ("仙侠世界与古代地域" if genre_name == "xianxia" else
+                       "当代城市与真实生活场景" if genre_name == "urban" else
+                       "当代校园" if genre_name == "campus" else
+                       "当代舞台与练习室")
+            name = character.get("name", "角色")
+            role_text = f"{name} {character.get('role') or ''}"
+            if any(token in role_text for token in (
+                    "皇帝", "太子", "父", "哥哥", "弟弟", "男主")):
+                gender = "男"
+            elif any(token in role_text for token in (
+                    "皇后", "公主", "母", "姐姐", "妹妹", "女主")):
+                gender = "女"
+            elif "女团" in source_text:
+                gender = "女"
+            elif "男团" in source_text:
+                gender = "男"
+            else:
+                # The mock author owns these invented characters, so it must
+                # declare their story identity instead of emitting a
+                # downstream placeholder. Imported user characters never pass
+                # through this authoring helper.
+                gender = "女" if index % 2 == 0 else "男"
+            age_range = {
+                "campus": "约16—18岁青少年",
+                "idol": "约20—26岁青年",
+                "urban": "约24—35岁青年",
+                "xianxia": "约20—35岁青年",
+            }.get(genre_name, "约20—35岁青年")
+            # 这些人物由 mock 编剧本身创造；如果模板先放入了“未指定/
+            # 以参考图为准”之类占位值，编剧必须在交稿前明确事实，不能让
+            # 下游人物图替它猜性别和年龄。
+            if not explicit_gender(character.get("gender")):
+                character["gender"] = gender
+            if not explicit_age_range(character.get("age_range")):
+                character["age_range"] = age_range
+            character.setdefault(
+                "background_prompt",
+                f"{name}是{setting}中的{role},带着一段改变信念的过往;"
+                "当前目标与本集冲突相连,外冷内热/目标明确的性格通过眼神、站姿、"
+                f"标志道具{story_pool['variants'][0]['props']}和服装层次外化")
+            character.setdefault("era_setting", setting)
+            character.setdefault("occupation", role)
+            character.setdefault("motivation", "完成本集目标并守护重要关系")
+            character.setdefault("backstory", "曾经历一次改变其信念的事件")
+            character.setdefault("relationships", "与同伴互相扶持,与对手存在目标冲突")
+            character.setdefault(
+                "costume_direction",
+                f"按{setting}、{role}和剧情场合设计,不同场合使用不同材质、"
+                "层次、配色和职业装备,不得套用现代都市便服")
+            character.setdefault("signature_props", story_pool["variants"][0]["props"])
+            character.setdefault("visual_variants", story_pool["variants"])
+        normalize_script_bible(script, payload)
+        return script
+
+    def _gen_drama_script(self, payload, out_dir, genre):
+        flavor = DRAMA_FLAVORS[genre]
+        seed = _digest(payload)
+        title = payload.get("project_title", "未命名")
+        number = payload.get("episode_number", 1)
+        premise = payload.get("premise", "")
+        hero = (_persona_from_title(title)
+                if _persona_from_title(title) != title
+                else _pick(SURNAMES, seed, 0) + _pick(GIVEN, seed, 1))
+        partner = _pick(flavor["partners"], seed, 2)
+        villain = _pick(flavor["villains"], seed, 3)
+        locations = [_pick(flavor["locations"], seed, 4 + i)
+                     for i in range(3)]
+        # 占位故事也要至少有一个可复用场景，确保场景母图达到正式参考质量，
+        # 后续关键帧能实际携带空间基准图而不是只在文字里声称“保持一致”。
+        if len(set(locations)) == len(locations):
+            locations[-1] = locations[0]
+        fmt = dict(hero=hero, partner=partner, villain=villain,
+                   title=title, number=number)
+        logline = (flavor["logline"].format(loc=locations[0], **fmt)
+                   + (f"背景:{premise}" if premise else ""))
+        scenes = []
+        for idx, (action_tpl, line_tpls) in enumerate(
+                flavor["beats"], start=1):
+            lines = [
+                {"character": who.format(**fmt),
+                 "dialogue": text.format(**fmt)}
+                for who, text in line_tpls
+            ]
+            scenes.append({
+                "scene_no": idx,
+                "location": locations[idx - 1],
+                "characters": sorted({ln["character"] for ln in lines}),
+                "action": action_tpl.format(loc=locations[idx - 1], **fmt),
+                "lines": lines,
+            })
+        script = {
+            "project_title": title,
+            "episode_number": number,
+            "episode_title": f"{villain}之章" if genre == "xianxia"
+            else f"对决{villain}",
+            "logline": logline,
+            "characters": [
+                {"name": hero, "role": "主角"},
+                {"name": partner, "role": "同伴"},
+                {"name": villain, "role": "反派"},
+            ],
+            "scenes": scenes,
+        }
+        self._enrich_script_characters(script, payload, genre)
+        uri = _json_artifact(out_dir / "script.json", script)
+        return script, uri
+
+    def _gen_idol_script(self, payload, out_dir):
+        """虚拟偶像:单人口播或女团/男团多成员,开场钩子 → 内容 → 引导关注。"""
+        seed = _digest(payload)
+        text = " ".join(str(payload.get(k) or "")
+                        for k in ("project_title", "premise", "style"))
+        group = any(k in text for k in ("女团", "男团", "组合", "团"))
+        raw = payload.get("persona") or payload.get("project_title", "小艾")
+        idol = _persona_from_title(raw)
+        number = payload.get("episode_number", 1)
+        premise = payload.get("premise", "")
+        topic = (_strip_genre_words(premise)
+                 or (_pick(GROUP_TOPICS, seed, 0) if group
+                     else _pick(IDOL_TOPICS, seed, 0)))
+        if group:
+            return self._gen_idol_group_script(
+                payload, out_dir, idol, number, topic, seed)
+        spot = _pick(IDOL_SPOTS, seed, 1)
+        scenes = [
+            {"scene_no": 1, "location": "直播间",
+             "characters": [idol],
+             "action": f"{idol}对镜头挥手开场",
+             "lines": [
+                 {"character": idol,
+                  "dialogue": f"哈喽大家好,我是{idol}!今天聊聊{topic}~"},
+             ]},
+            {"scene_no": 2, "location": spot,
+             "characters": [idol],
+             "action": f"{idol}在{spot}展示{topic}",
+             "lines": [
+                 {"character": idol,
+                  "dialogue": f"这次{topic}我准备了一个小惊喜。"},
+                 {"character": idol,
+                  "dialogue": "三、二、一,一起来看!"},
+             ]},
+            {"scene_no": 3, "location": "直播间",
+             "characters": [idol],
+             "action": f"{idol}比心收尾",
+             "lines": [
+                 {"character": idol,
+                  "dialogue": f"喜欢的话点个关注,第{number}期我们下期见!"},
+             ]},
+        ]
+        script = {
+            "project_title": payload.get("project_title", idol),
+            "episode_number": number,
+            "episode_title": f"{topic}篇",
+            "logline": f"{idol}的第{number}期:{topic}。",
+            "characters": [{"name": idol, "role": "主角"}],
+            "scenes": scenes,
+        }
+        self._enrich_script_characters(script, payload, "idol")
+        uri = _json_artifact(out_dir / "script.json", script)
+        return script, uri
+
+    def _gen_idol_group_script(self, payload, out_dir, lead, number,
+                               topic, seed):
+        """女团/男团:队长带队,练习室 → 舞台 → 后台三幕。"""
+        pool = [m for m in IDOL_MEMBERS if m != lead]
+        m2 = _pick(pool, seed, 1)
+        m3 = _pick([m for m in pool if m != m2], seed, 2)
+        members = [lead, m2, m3]
+        roles = ["队长", "主唱", "舞担"]
+        m1 = lead
+        scenes = [
+            {"scene_no": 1, "location": "练习室",
+             "characters": members,
+             "action": f"清晨的练习室,{m1}带队热身,镜面墙映出三人身影",
+             "lines": [
+                 {"character": m1,
+                  "dialogue": f"今天{topic},大家状态怎么样?"},
+                 {"character": m2, "dialogue": "早就准备好了,走一遍!"},
+                 {"character": m3, "dialogue": "音乐起,五、六、七、八!"},
+             ]},
+            {"scene_no": 2, "location": "舞台",
+             "characters": members,
+             "action": f"灯光亮起,{topic}正式开始,三人走位干净利落",
+             "lines": [
+                 {"character": m1, "dialogue": f"这一段副歌,交给{m2}!"},
+                 {"character": m2, "dialogue": "看我的,高音稳住!"},
+                 {"character": m3, "dialogue": "队形变换,跟上节奏!"},
+             ]},
+            {"scene_no": 3, "location": "后台",
+             "characters": members,
+             "action": "演出结束,三人击掌相拥,汗水与笑容",
+             "lines": [
+                 {"character": m1,
+                  "dialogue": f"第{number}期{topic},圆满完成!"},
+                 {"character": m2,
+                  "dialogue": "喜欢我们就点关注,别错过下一期!"},
+             ]},
+        ]
+        script = {
+            "project_title": payload.get("project_title", lead),
+            "episode_number": number,
+            "episode_title": f"{topic}篇",
+            "logline": f"{m1}、{m2}、{m3}的第{number}期:{topic}。",
+            "characters": [
+                {"name": name, "role": role}
+                for name, role in zip(members, roles)
+            ],
+            "scenes": scenes,
+        }
+        self._enrich_script_characters(script, payload, "idol")
+        uri = _json_artifact(out_dir / "script.json", script)
+        return script, uri
+
+    # ---- 分镜 ----
+    def _gen_storyboard(self, payload, out_dir):
+        script = payload["script"]
+        seed = _digest(payload)
+        shots = []
+        shot_no = 0
+        for scene in script["scenes"]:
+            # 每场:1 个环境镜头 + 每句台词 1 个对白镜头
+            shot_no += 1
+            shots.append({
+                "shot_no": shot_no,
+                "scene_no": scene["scene_no"],
+                "kind": "environment",
+                "description": scene["action"],
+                "camera": _pick(CAMERAS, seed, shot_no),
+                # 离线契约模拟必须服从真实 Seedance 契约(最短4秒):
+                # 曾因写 2.5/3.0 秒,全链路测试在视频层被真实 fail-closed
+                # 拦下、静默回退 mock,报错却指向产线而不是这里。
+                "duration": 5.0,
+                "characters": scene["characters"],
+                "dialogue": None,
+                "prompt": (
+                    f"漫剧风格,{scene['location']},{scene['action']}"
+                    f",镜头:{_pick(CAMERAS, seed, shot_no)}"
+                ),
+            })
+            for line in scene["lines"]:
+                shot_no += 1
+                shots.append({
+                    "shot_no": shot_no,
+                    "scene_no": scene["scene_no"],
+                    "kind": "dialogue",
+                    "description": f"{line['character']}说话",
+                    "camera": _pick(CAMERAS, seed, shot_no),
+                    "duration": 6.0,
+                    "characters": [line["character"]],
+                    "dialogue": line,
+                    "prompt": (
+                        f"漫剧风格,{scene['location']},{line['character']}"
+                        f"正在说:「{line['dialogue']}」"
+                        f",镜头:{_pick(CAMERAS, seed, shot_no)}"
+                    ),
+                })
+        storyboard = {"episode_title": script.get("episode_title", ""),
+                      "shots": shots}
+        for shot in storyboard["shots"]:
+            names = shot.get("characters") or []
+            action = shot.get("description") or "保持当前动作"
+            shot["physical_logic"] = (
+                f"{'、'.join(names) or '空镜'}位于当前场景有效支撑面内；"
+                f"动作“{action}”的朝向、接触点、视线与道具使用方向可达")
+            subject = "、".join(names) or "空镜环境"
+            start_state = (
+                f"{subject}位于各自起始标记位，身体朝向、视线与姿态"
+                "定格为一个稳定可见状态")
+            end_state = (
+                f"{subject}位于各自终点标记位，身体朝向、视线与表情"
+                "定格为一个稳定可见状态")
+            # Mock 是上游分镜提供者，也必须像真实 AI 一样在交稿时明确
+            # 三种静帧目标；不能把决定拖到关键帧编译时再从动作文字猜。
+            shot["frame_targets"] = {
+                "keyframe": {
+                    "phase": "end", "state": end_state,
+                    "fallback": False,
+                },
+                "first_frame": {
+                    "phase": "start", "state": start_state,
+                    "fallback": False,
+                },
+                "last_frame": {
+                    "phase": "end", "state": end_state,
+                    "fallback": False,
+                },
+            }
+        uri = _json_artifact(out_dir / "storyboard.json", storyboard)
+        return storyboard, uri
+
+    # ---- 镜头关键图(电影感分镜画面) ----
+    def _shot_svg(self, payload, variant):
+        seed = int.from_bytes(_digest(payload)[:4], "big")
+        width, height = _dims(payload)
+        return render_shot(
+            width, height, seed,
+            payload.get("location", "")
+            or self._location_from_prompt(payload.get("prompt", "")),
+            characters=payload.get("characters", []),
+            dialogue=payload.get("dialogue"),
+            shot_no=payload.get("shot_no", 0),
+            camera=payload.get("camera", ""),
+            action=payload.get("action", ""),
+            variant=variant,
+            watermark=False,   # 镜头画面禁一切文字(无字幕母版)
+        )
+
+    @staticmethod
+    def _location_from_prompt(prompt):
+        # 分镜 Prompt 形如「漫剧风格,<地点>,<内容>…」,取地点段
+        parts = (prompt or "").split(",")
+        return parts[1] if len(parts) > 1 else ""
+
+    def _gen_image(self, payload, out_dir):
+        seed = int.from_bytes(_digest(payload)[:4], "big")
+        width, height = _dims(payload)
+        if payload.get("studio_asset"):
+            name = payload.get("art_name", "")
+            kind = str(payload["studio_asset"])
+            path = out_dir / f"studio_{kind}_{_safe_name(name)}.svg"
+            path.write_text(
+                render_portrait(
+                    width, height, seed, name,
+                    payload.get("studio_asset_label", "自建资产")),
+                encoding="utf-8")
+            return {"name": name, "studio_asset": kind}, str(path)
+        if payload.get("prop_candidate"):
+            name = payload.get("art_name", "")
+            path = out_dir / f"prop_{_safe_name(name)}.svg"
+            path.write_text(
+                render_portrait(
+                    width, height, seed, name, "核心道具候选"),
+                encoding="utf-8")
+            return {
+                "name": name,
+                "prop": payload.get("prop_name", ""),
+            }, str(path)
+        if payload.get("portrait"):
+            name = payload.get("art_name", "")
+            path = out_dir / f"portrait_{_safe_name(name)}.svg"
+            path.write_text(
+                render_portrait(width, height, seed, name,
+                                payload.get("role", "")),
+                encoding="utf-8")
+            return {"name": name}, str(path)
+        if payload.get("character_sheet"):
+            name = payload.get("art_name", "")
+            key = payload["character_sheet"]
+            path = out_dir / f"sheet_{_safe_name(name)}_{key}.svg"
+            path.write_text(
+                render_portrait(width, height, seed, name,
+                                payload.get("sheet_label", key)),
+                encoding="utf-8")
+            return {"name": name, "sheet": key}, str(path)
+        if payload.get("scene_art"):
+            name = payload.get("art_name", "")
+            path = out_dir / f"scene_{_safe_name(name)}.svg"
+            path.write_text(
+                render_shot(width, height, seed, name,
+                            action=payload.get("action", ""),
+                            variant="key"),
+                encoding="utf-8")
+            return {"name": name}, str(path)
+        shot_no = payload["shot_no"]
+        path = out_dir / f"shot_{shot_no:03d}.keyframe.svg"
+        path.write_text(self._shot_svg(payload, "key"), encoding="utf-8")
+        return {"shot_no": shot_no}, str(path)
+
+    # ---- 首尾帧(带轻微位移,连播产生动感) ----
+    def _gen_frames(self, payload, out_dir):
+        shot_no = payload["shot_no"]
+        first = out_dir / f"shot_{shot_no:03d}.first.svg"
+        last = out_dir / f"shot_{shot_no:03d}.last.svg"
+        chain_first = payload.get("chain_first_uri", "")
+        if chain_first and Path(chain_first).exists():
+            # 帧链:首帧 = 上一镜尾帧(两段视频拼接处画面连贯)
+            first.write_text(Path(chain_first).read_text(encoding="utf-8"),
+                             encoding="utf-8")
+        else:
+            first.write_text(self._shot_svg(payload, "first"),
+                             encoding="utf-8")
+        last.write_text(self._shot_svg(payload, "last"), encoding="utf-8")
+        return {"first": str(first), "last": str(last)}, str(first)
+
+    # ---- 视频 ----
+    def _gen_video(self, payload, out_dir):
+        shot_no = payload["shot_no"]
+        duration = float(payload.get("duration", 5.0))
+        uri = _json_artifact(out_dir / f"shot_{shot_no:03d}.video.json", {
+            "type": "mock-video",
+            "shot_no": shot_no,
+            "duration": duration,
+            "first_frame": payload.get("first", ""),
+            "last_frame": payload.get("last", ""),
+            "prompt": payload.get("prompt", ""),
+            "prompt_compact": payload.get("prompt_compact", ""),
+            "prompt_full": payload.get("prompt_full", payload.get("prompt", "")),
+            "voice": payload.get("voice", "jimeng_builtin"),
+            "lip_sync": bool(payload.get("lip_sync", True)),
+            "forbid_subtitles": bool(payload.get("forbid_subtitles", True)),
+            "video_quality": payload.get("video_quality", "medium"),
+            "video_resolution": payload.get("video_resolution", "720p"),
+            "reference_images": list(payload.get("reference_images") or []),
+            "reference_assets": list(payload.get("reference_assets") or []),
+            "reference_manifest": list(
+                payload.get("reference_manifest") or []),
+        })
+        return {
+            "shot_no": shot_no, "duration": duration,
+            "voice": payload.get("voice", "jimeng_builtin"),
+            "lip_sync": bool(payload.get("lip_sync", True)),
+            "forbid_subtitles": bool(payload.get("forbid_subtitles", True)),
+            "video_quality": payload.get("video_quality", "medium"),
+            "video_resolution": payload.get("video_resolution", "720p"),
+            "reference_images_used": list(
+                payload.get("reference_images") or []),
+            "reference_assets": list(payload.get("reference_assets") or []),
+            "reference_manifest": list(
+                payload.get("reference_manifest") or []),
+        }, uri
+
+    # ---- 配音 ----
+    def _gen_voice(self, payload, out_dir):
+        line_no = payload["line_no"]
+        text = payload.get("text", "")
+        duration = round(max(1.0, len(text) * 0.18), 2)
+        uri = _json_artifact(out_dir / f"line_{line_no:03d}.voice.json", {
+            "type": "mock-voice",
+            "line_no": line_no,
+            "character": payload.get("character", ""),
+            "text": text,
+            "duration": duration,
+        })
+        return {"line_no": line_no, "duration": duration}, uri
+
+    # ---- 剪辑(剪映草稿 + 成片) ----
+    def _gen_edit(self, payload, out_dir):
+        shots = payload.get("shots", [])
+        voices = payload.get("voices", [])
+        subtitles = payload.get("subtitles", [])
+        video_track, t = [], 0.0
+        for shot in shots:
+            video_track.append({
+                "material": shot["uri"],
+                "start": round(t, 2),
+                "duration": shot["duration"],
+            })
+            t += shot["duration"]
+        audio_track = [
+            {"material": v["uri"], "line_no": v["line_no"],
+             "duration": v["duration"]}
+            for v in voices
+        ]
+        draft = {
+            "type": "jianying-draft",
+            "tracks": {
+                "video": video_track,
+                "audio": audio_track,
+                "subtitle": subtitles,
+            },
+            "total_duration": round(t, 2),
+        }
+        draft_uri = _json_artifact(out_dir / "draft_content.json", draft)
+        final_uri = _json_artifact(out_dir / "episode.final.json", {
+            "type": "mock-final-video",
+            "draft": draft_uri,
+            "total_duration": round(t, 2),
+            "shot_count": len(video_track),
+        })
+        return {"draft": draft_uri, "total_duration": round(t, 2)}, final_uri
+
+    # ---- 封面 ----
+    def _gen_cover(self, payload, out_dir):
+        seed = int.from_bytes(_digest(payload)[:4], "big")
+        width, height = _dims(payload, 1080, 1920)
+        path = out_dir / "cover.svg"
+        path.write_text(
+            render_cover(width, height, seed,
+                         payload.get("title", ""),
+                         payload.get("episode", 0),
+                         payload.get("tagline", "")),
+            encoding="utf-8")
+        return {}, str(path)

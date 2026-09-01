@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#151515">
+<meta name="color-scheme" content="dark">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="AIFOS">
+<meta name="format-detection" content="telephone=no">
+<meta name="description" content="AIFOS AI 精品漫剧工业化生产工作台">
+<meta property="og:title" content="AIFOS · AI 漫剧生产工作台">
+<meta property="og:description" content="AI 精品漫剧工业化生产、审片、资产与制作标准工作台">
+<meta property="og:type" content="website">
+<meta property="og:image" content="/static/assets/aifos-launch.png">
+<title>AIFOS V3.2 · AI 漫剧生产工作台</title>
+<link rel="stylesheet" href="/static/style.css?v=20260811-scene-truth-1">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/static/assets/apple-touch-icon.png">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%233987e5'/%3E%3Ctext x='16' y='22' font-size='16' text-anchor='middle' fill='%23fff' font-family='sans-serif'%3E片%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<header id="topbar">
+  <div class="topbar-main">
+    <a class="brand" href="#/">
+      <span class="brand-mark">AIFOS</span>
+      <span class="brand-sub">V3.2 · AI 漫剧工业生产系统</span>
+    </a>
+    <nav class="main-nav" aria-label="主导航">
+      <a href="#/" data-nav="dashboard"><span class="nav-icon" aria-hidden="true">⌂</span><span>生产总览</span></a>
+      <a href="#/history" data-nav="history"><span class="nav-icon" aria-hidden="true">◷</span><span>历史记录</span></a>
+      <a href="#/assets" data-nav="assets" title="人物资产套件/场景概念图/参考图,可复用可重画"><span class="nav-icon" aria-hidden="true">◇</span><span>资产中心</span></a>
+      <a href="#/standards/production" data-nav="standards"><span class="nav-icon" aria-hidden="true">✓</span><span>制作标准</span></a>
+      <a href="#/settings" data-nav="settings" title="各环节 AI 使用 CLI 或 API，自由配置"><span class="nav-icon" aria-hidden="true">⚙</span><span>AI 设置</span></a>
+    </nav>
+  </div>
+  <button class="mobile-install-trigger" id="mobile-access-global" type="button" title="在手机打开或安装 AIFOS">
+    <span aria-hidden="true">▣</span><span>手机打开</span>
+  </button>
+  <div id="topbar-right"></div>
+</header>
+<main id="app">
+  <div class="loading">加载中…</div>
+</main>
+<script src="/static/app.js?v=20260811-scene-truth-1"></script>
+</body>
+</html>

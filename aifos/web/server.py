@@ -1,0 +1,7796 @@
+"""AIFOS Web 服务:http.server 实现的 JSON API + 静态页面 + 产物文件服务。
+
+启动:python3 -m aifos serve [--host 127.0.0.1] [--port 8619]
+
+API:
+  GET  /api/overview            全局看板(项目/剧集/成本/额度/任务)
+  GET  /api/episode/<id>        单集详情(阶段/剧本/分镜/质检/产物索引)
+  GET  /api/episode/<id>/status 单集轻量变更摘要(用于手机端轮询)
+  GET  /api/episode/<id>/prompts 逐镜最高规则提示词与 PASS/WARN/BLOCK
+  GET  /api/project/<id>/rules  项目跨集创作规则包
+  GET  /api/episode/<id>/rules  本集临时创作规则包
+  GET  /api/episode/<id>/rule-stack?shot_no=N 当前镜头生效规则栈
+  GET  /api/scene3d?episode=N  物理场景、分区、物体与 revision
+  GET  /api/assets?project=T    项目资产列表
+  GET  /api/logs?limit=N        最近日志
+  GET  /api/jobs  /api/jobs/<id>后台制作任务
+  GET  /api/history             持久生产历史(跨重启)
+  GET  /api/history/<id>        单次生产详情与阶段记录
+  GET  /api/standards           当前制作标准 + 版本历史
+  GET  /api/standards/export    导出不含密钥的制作标准包
+  POST /api/produce             {"sentence": "开始制作《万妖图录》第15集"}
+  PATCH /api/scene3d            按 object_id 追加一版三维场景编辑
+  POST /api/scene3d/appearance  从全景补齐材质/灯光，不改几何
+  POST /api/standards/save|activate|reset|import
+静态:
+  GET  /                        控制台单页应用
+  GET  /artifacts/<path>        workspace/artifacts 下的产物(防目录穿越)
+"""
+
+import base64
+import binascii
+import copy
+import gzip
+import hashlib
+import ipaddress
+import json
+import math
+import os
+import re
+import shutil
+import socket
+import sqlite3
+import subprocess
+import threading
+import time
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
+
+from .. import __version__
+from ..app import App, Workspace
+from ..asset_center import IMAGE_KINDS
+from ..continuity_graph import build_keyframe_continuity_plan
+from ..db import Database
+from ..history_center import HistoryCenter
+from ..job_center import ACTIVE_JOB_STATUSES, JobCenter
+from ..lessons import project_lessons, set_lesson_approval
+from ..updater import (check_and_update, current_build, repo_root,
+                       restart_process, start_auto_updater)
+from ..errors import AifosError
+from ..quality_policy import normalize_quality, normalize_quality_policy
+from ..project_center import DocumentConflictError
+from ..rule_governance import MANDATORY_GATE_IDS
+from ..rule_scope import RuleScopeError, normalize_rule_applicability
+from ..selection_mode import (
+    CANDIDATES_PER_SHOT,
+    MAX_CANDIDATE_ROUNDS,
+    REPAIR_CANDIDATES_PER_BATCH,
+    build_selection_policy,
+)
+from ..prompt_review import build_episode_prompt_review
+from ..scene_identity import canonical_scene_location, scene_family_groups
+from ..scene_model import (MOUNT_TYPES, apply_scene_appearance,
+                           normalize_scene_model_contract,
+                           refresh_scene_model_geometry,
+                           validate_scene_model)
+from ..scene_render import build_scene_render_contract
+from ..smart_input import resolve_produce_target
+from ..standard_center import StandardConflictError, StandardValidationError
+from ..story_context import attach_shot_story_context
+from ..story_intelligence import (
+    build_storyboard_review_documents,
+    derive_episode_continuity_input,
+    review_document,
+)
+from ..workflow import production_profile
+
+STATIC_DIR = Path(__file__).parent / "static"
+
+# 当前代码版本(git 短哈希):前端据此发现服务已自动更新并自动刷新页面
+BUILD = current_build()
+
+MIME = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".json": "application/json; charset=utf-8",
+    ".webmanifest": "application/manifest+json; charset=utf-8",
+    ".jsonl": "application/x-ndjson; charset=utf-8",
+    ".log": "text/plain; charset=utf-8",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".mp4": "video/mp4",
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+}
+
+# 可按需 gzip 的文本类型(二进制媒体压缩无收益,不参与)
+GZIP_EXTS = frozenset({
+    ".html", ".js", ".css", ".json", ".svg", ".webmanifest",
+    ".jsonl", ".log", ".txt",
+})
+GZIP_MIN_SIZE = 1024
+_GZIP_CACHE = {}
+_GZIP_CACHE_MAX = 32
+
+
+def _gzipped(path, body):
+    """按 (路径, mtime, 大小) 缓存压缩结果;静态界面文件反复请求时
+    不为每个连接重复压缩。文件内容变化(mtime/size)自动失效。"""
+    key = (str(path), path.stat().st_mtime, len(body))
+    hit = _GZIP_CACHE.get(key)
+    if hit is None:
+        hit = gzip.compress(body, compresslevel=6)
+        if len(_GZIP_CACHE) >= _GZIP_CACHE_MAX:
+            _GZIP_CACHE.clear()
+        _GZIP_CACHE[key] = hit
+    return hit
+
+
+def _gzip_bytes(body):
+    """动态负载(JSON)按内容哈希缓存压缩结果;内容未变的轮询请求
+    直接命中,避免每 2.5s 重复压缩 260KB 的看板数据。"""
+    key = hashlib.sha256(body).hexdigest()
+    hit = _GZIP_CACHE.get(key)
+    if hit is None:
+        hit = gzip.compress(body, compresslevel=6)
+        if len(_GZIP_CACHE) >= _GZIP_CACHE_MAX:
+            _GZIP_CACHE.clear()
+        _GZIP_CACHE[key] = hit
+    return hit
+
+
+def _parse_range(header, size):
+    """解析单范围 Range 头。
+
+    返回 (start, end) 闭区间;None 表示按 RFC 9110 忽略该头回全量
+    (语法非法或多范围);"unsatisfiable" 表示语法合法但不可满足(416)。
+    """
+    unit, _, spec = (header or "").partition("=")
+    if unit.strip() != "bytes":
+        return None
+    spec = spec.strip()
+    if "," in spec:
+        return None
+    first, _, last = spec.partition("-")
+    try:
+        if first == "":
+            suffix = int(last)
+            if suffix <= 0:
+                return "unsatisfiable"
+            return (max(size - suffix, 0), size - 1)
+        start = int(first)
+        end = size - 1 if last == "" else min(int(last), size - 1)
+    except ValueError:
+        return None
+    if start >= size or start > end or start < 0:
+        return "unsatisfiable"
+    return (start, end)
+
+CREATIVE_RULE_PACK_SCHEMA = "aifos.creative-rule-pack/v1"
+PROJECT_RULE_SCOPE = "project_series"
+EPISODE_RULE_SCOPE = "episode_temporary"
+_RULE_REQUEST_META = frozenset({
+    "expected_version", "project_id", "episode_id", "version", "content",
+})
+_PROTECTED_RULE_PREFIXES = ("technical", "provider", "quality.gate")
+_DISABLE_WORDS = frozenset({
+    "disable", "disabled", "off", "false", "skip", "bypass", "suppress",
+    "suppressed", "override", "replace", "warning", "warn", "advisory",
+})
+
+
+def _rule_identifier(value):
+    return re.sub(r"[^a-z0-9]+", ".", str(value or "").strip().lower()).strip(".")
+
+
+def _protected_rule_target(value):
+    identifier = _rule_identifier(value)
+    if not identifier:
+        return False
+    if identifier in MANDATORY_GATE_IDS:
+        return True
+    if any(identifier == prefix or identifier.startswith(prefix + ".")
+           for prefix in _PROTECTED_RULE_PREFIXES):
+        return True
+    parts = identifier.split(".")
+    return bool(set(parts) & MANDATORY_GATE_IDS
+                and any(part in ("gate", "gates", "quality", "quality_gate")
+                        for part in parts))
+
+
+def _rule_attempts_disable_or_override(rule):
+    if not isinstance(rule, dict):
+        return False
+    if rule.get("enabled") is False or rule.get("value") is False:
+        return True
+    for key in ("disabled", "disable", "bypass", "suppress", "override",
+                "replace"):
+        if rule.get(key):
+            return True
+    severity = rule.get("severity")
+    if severity is not None and str(severity).strip().lower() != "block":
+        return True
+    for key in ("action", "effect", "mode", "operation", "value"):
+        value = rule.get(key)
+        if (isinstance(value, str)
+                and value.strip().lower() in _DISABLE_WORDS):
+            return True
+    return False
+
+
+def _validate_protected_gate_overrides(value, path="content"):
+    """拒绝规则包中任何关闭/降级系统技术硬门的结构化表达。"""
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _validate_protected_gate_overrides(item, f"{path}.{index}")
+        return
+    if not isinstance(value, dict):
+        return
+
+    target = value.get("key") or value.get("id") or value.get("target")
+    category = value.get("category")
+    if ((_protected_rule_target(target) or _protected_rule_target(category))
+            and _rule_attempts_disable_or_override(value)):
+        raise AifosError(
+            f"{path} 不能关闭、降级或覆盖系统技术硬门: "
+            f"{target or category}")
+
+    # 同时兼容 quality_gates: [{id,...}] 和 quality_gates: {people: ...}。
+    for key, child in value.items():
+        child_path = f"{path}.{key}"
+        if (_protected_rule_target(key)
+                and ((child is False)
+                     or _rule_attempts_disable_or_override(
+                         child if isinstance(child, dict)
+                         else {"value": child}))):
+            raise AifosError(
+                f"{child_path} 不能关闭、降级或覆盖系统技术硬门")
+        if key in ("quality_gates", "technical_gates", "provider_gates") \
+                and isinstance(child, dict):
+            for gate_id, setting in child.items():
+                if (_protected_rule_target(gate_id)
+                        and ((setting is False)
+                             or _rule_attempts_disable_or_override(
+                                 setting if isinstance(setting, dict)
+                                 else {"value": setting}))):
+                    raise AifosError(
+                        f"{child_path}.{gate_id} 不能关闭、降级或覆盖系统技术硬门")
+        _validate_protected_gate_overrides(child, child_path)
+
+
+def _normalize_creative_rule_pack(content, scope):
+    if not isinstance(content, dict):
+        raise AifosError("content 必须是创作规则包对象")
+    pack = copy.deepcopy(content)
+    schema = pack.get("schema", CREATIVE_RULE_PACK_SCHEMA)
+    if schema != CREATIVE_RULE_PACK_SCHEMA:
+        raise AifosError(f"规则包 schema 必须为 {CREATIVE_RULE_PACK_SCHEMA}")
+    submitted_scope = pack.get("scope", scope)
+    if submitted_scope != scope:
+        raise AifosError(f"规则包 scope 必须为 {scope}")
+    rules = pack.get("rules", [])
+    suppressions = pack.get("suppressions", [])
+    if not isinstance(rules, list):
+        raise AifosError("rules 必须是数组")
+    if not isinstance(suppressions, list):
+        raise AifosError("suppressions 必须是数组")
+    for index, rule in enumerate(rules):
+        if not isinstance(rule, dict):
+            raise AifosError(f"rules.{index} 必须是对象")
+        if "enabled" in rule and not isinstance(rule["enabled"], bool):
+            raise AifosError(f"rules.{index}.enabled 必须是布尔值")
+        if "applicability" in rule and "applies_to" in rule:
+            raise AifosError(
+                f"rules.{index} 只能使用 applicability 或 applies_to 其中一个")
+        selector_key = (
+            "applicability" if "applicability" in rule else
+            "applies_to" if "applies_to" in rule else None)
+        if selector_key is not None:
+            selector = rule[selector_key]
+            if not isinstance(selector, dict):
+                raise AifosError(
+                    f"rules.{index}.{selector_key} 必须是对象")
+            try:
+                normalize_rule_applicability(selector)
+            except RuleScopeError as exc:
+                raise AifosError(
+                    f"rules.{index}.{selector_key} 无效: {exc}") from exc
+    for index, suppression in enumerate(suppressions):
+        target = (suppression if isinstance(suppression, str) else
+                  (suppression.get("target") or suppression.get("key")
+                   or suppression.get("rule_key") or suppression.get("id"))
+                  if isinstance(suppression, dict) else "")
+        if not isinstance(suppression, (str, dict)):
+            raise AifosError(f"suppressions.{index} 必须是字符串或对象")
+        if isinstance(suppression, dict):
+            if ("applicability" in suppression
+                    and "applies_to" in suppression):
+                raise AifosError(
+                    f"suppressions.{index} 只能使用 applicability 或 "
+                    "applies_to 其中一个")
+            selector_key = (
+                "applicability" if "applicability" in suppression else
+                "applies_to" if "applies_to" in suppression else None)
+            if selector_key is not None:
+                selector = suppression[selector_key]
+                if not isinstance(selector, dict):
+                    raise AifosError(
+                        f"suppressions.{index}.{selector_key} 必须是对象")
+                try:
+                    normalize_rule_applicability(selector)
+                except RuleScopeError as exc:
+                    raise AifosError(
+                        f"suppressions.{index}.{selector_key} 无效: "
+                        f"{exc}") from exc
+        if _protected_rule_target(target):
+            raise AifosError(
+                f"suppressions.{index} 不能抑制系统技术硬门: {target}")
+    pack["schema"] = CREATIVE_RULE_PACK_SCHEMA
+    pack["scope"] = scope
+    pack["rules"] = rules
+    pack["suppressions"] = suppressions
+    _validate_protected_gate_overrides(pack)
+    return pack
+
+
+def _creative_rule_request(body, scope):
+    if "content" in body:
+        raw = body["content"]
+    else:
+        raw = {key: value for key, value in body.items()
+               if key not in _RULE_REQUEST_META}
+    return _normalize_creative_rule_pack(raw, scope)
+
+
+def _creative_pack_binding_error(pack, project_id, episode_id=None):
+    """检查包及逐条旧式 binding；真正归属仍由数据库记录注入。"""
+    rows = [("content", pack)]
+    rows.extend(
+        (f"content.rules.{index}", rule)
+        for index, rule in enumerate(pack.get("rules") or [])
+        if isinstance(rule, dict))
+    rows.extend(
+        (f"content.suppressions.{index}", suppression)
+        for index, suppression in enumerate(pack.get("suppressions") or [])
+        if isinstance(suppression, dict))
+    for path, row in rows:
+        binding = row.get("binding")
+        binding = binding if isinstance(binding, dict) else {}
+        bound_project = row.get("project_id", binding.get("project_id"))
+        bound_episode = row.get("episode_id", binding.get("episode_id"))
+        if (bound_project is not None
+                and (isinstance(bound_project, bool)
+                     or str(bound_project).strip() != str(project_id))):
+            return f"{path}.project_id 与 URL/剧集所属项目不一致"
+        if episode_id is None:
+            if bound_episode is not None:
+                return f"{path}.episode_id 不能写入项目级规则包"
+        elif (bound_episode is not None
+              and (isinstance(bound_episode, bool)
+                   or str(bound_episode).strip() != str(episode_id))):
+            return f"{path}.episode_id 与 URL 剧集不一致"
+    return ""
+
+
+def _empty_rule_pack(scope):
+    return {
+        "schema": CREATIVE_RULE_PACK_SCHEMA,
+        "scope": scope,
+        "rules": [],
+        "suppressions": [],
+    }
+
+
+def _rule_pack_payload(content, version, *, project_id, episode_id=None,
+                       kind):
+    pack = copy.deepcopy(content) if isinstance(content, dict) \
+        else _empty_rule_pack(
+            EPISODE_RULE_SCOPE if episode_id is not None else PROJECT_RULE_SCOPE)
+    payload = {
+        "project_id": int(project_id),
+        "kind": kind,
+        "version": int(version or 0),
+        "content": pack,
+        # 展平常用字段，GET 后可直接编辑并原样 POST；content 保留稳定信封。
+        "schema": pack.get("schema", CREATIVE_RULE_PACK_SCHEMA),
+        "scope": pack.get("scope"),
+        "rules": copy.deepcopy(pack.get("rules") or []),
+        "suppressions": copy.deepcopy(pack.get("suppressions") or []),
+    }
+    if episode_id is not None:
+        payload["episode_id"] = int(episode_id)
+    return payload
+
+
+def _private_lan_addresses():
+    """返回可供同一局域网手机访问的本机 IPv4 地址。"""
+    addresses = set()
+    try:
+        infos = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+        addresses.update(info[4][0] for info in infos)
+    except OSError:
+        pass
+    # UDP connect 不发送数据，但能可靠取到当前默认网卡地址。
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("10.255.255.255", 1))
+        addresses.add(probe.getsockname()[0])
+    except OSError:
+        pass
+    finally:
+        probe.close()
+    result = []
+    for address in addresses:
+        try:
+            ip = ipaddress.ip_address(address)
+        except ValueError:
+            continue
+        if ip.version == 4 and ip.is_private and not ip.is_loopback:
+            result.append(address)
+    return sorted(set(result))
+
+
+def access_payload(bound_host, port, workspace=None):
+    """构造桌面与手机端都能理解的访问/安装信息。"""
+    lan_enabled = bound_host in ("0.0.0.0", "::", "")
+    hostname = socket.gethostname().split(".")[0]
+    lan_urls = ([f"http://{address}:{port}/"
+                 for address in _private_lan_addresses()]
+                if lan_enabled else [])
+    hostname_url = (f"http://{hostname}.local:{port}/"
+                    if lan_enabled and hostname else None)
+    # 外网地址(cloudflared 隧道):`aifos tunnel` 起隧道后写入 workspace,
+    # 网页据此显示二维码,手机扫码即得最新地址(免去手动粘贴/猜网址)
+    public = None
+    if workspace is not None:
+        from ..app import Workspace
+        from .. import tunnel
+        public = tunnel.read_public_url(Workspace(workspace).root)
+    return {
+        "lan_enabled": lan_enabled,
+        "local_url": f"http://127.0.0.1:{port}/",
+        "lan_urls": lan_urls,
+        "hostname_url": hostname_url,
+        "same_wifi_required": True,
+        "public_url": public["url"] if public else None,
+        "public": public,
+        "install": {
+            "ios": "用 Safari 打开后点分享，再选‘添加到主屏幕’",
+            "android": "用 Chrome 打开后点菜单，再选‘安装应用’或‘添加到主屏幕’",
+        },
+    }
+
+
+# 整集生产:并行 worker 正在改整份 render_plan,此时改单张镜头不安全,
+# 必须让用户显式暂停。其余单点任务(单图重画、单图质检)不属于这一类——
+# 它们只该互相排队,不该互相拒绝,更不该互相打断。
+PRODUCTION_ACTIONS = frozenset({
+    "produce", "force_rebuild", "script_import", "series_next",
+    "confirm_script", "image_acceleration_resume", "image_selection_resume",
+    # 单图编辑返修会作废当前正式关键帧及其下游链，必须与整集生产、
+    # 旧单图重画等入口互斥；同一集内仍由串行队列按提交顺序执行。
+    "regenerate_shot_candidates",
+})
+
+
+class JobRegistry:
+    """produce 后台任务:制作可能耗时(真实产线更久),Web 端异步执行。"""
+
+    PRODUCTION_ACTIONS = PRODUCTION_ACTIONS
+    LEASE_SECONDS = 120.0
+    HEARTBEAT_SECONDS = 20.0
+
+    def __init__(self, workspace):
+        self.workspace = workspace
+        self._jobs = {}
+        # 单集串行队列:同一集的单点任务共享 render_plan.json 和相邻镜头
+        # 边界,不能并行;但也不该互相拒绝——否则用户改完一张必须盯着等它
+        # 跑完才能提交下一张。按提交顺序排队,逐个执行。
+        self._queues = {}
+        self._lock = threading.Lock()
+        self._seq = 0
+        ledger_workspace = Workspace(self.workspace)
+        ledger_workspace.ensure()
+        self._ledger_db = Database(ledger_workspace.db_path)
+        self._history_center = HistoryCenter(
+            self._ledger_db, artifacts_root=ledger_workspace.artifacts_dir)
+        owner_host = socket.gethostname()
+        self._owner_id = (
+            f"{owner_host}:{os.getpid()}:{uuid.uuid4().hex}")
+        self._job_center = JobCenter(
+            self._ledger_db, owner_id=self._owner_id,
+            owner_pid=os.getpid(), owner_host=owner_host,
+            lease_seconds=self.LEASE_SECONDS)
+        recovered = self._job_center.bootstrap_interrupt(return_jobs=True)
+        self._hydrate_jobs()
+        self._lease_stop = threading.Event()
+        self._lease_thread = None
+        if recovered:
+            self._refresh_recovered_jobs(recovered)
+        self._history_center.bootstrap(
+            protected_run_ids=self._active_durable_run_ids(),
+            stale_before=time.time() - self.LEASE_SECONDS)
+        self._ensure_lease_heartbeat()
+
+    @staticmethod
+    def _durable_job_payload(row):
+        request = dict(row.get("request") or {})
+        job = {
+            "id": row["id"],
+            "status": row["status"],
+            "title": str(request.get("title") or ""),
+            "episode": int(request.get("episode") or 0),
+            "action": row.get("action") or "adjustment",
+            "force": bool(request.get("force", False)),
+            "started_at": row.get("started_at") or row.get("created_at")
+            or time.time(),
+            "run_id": row.get("run_id"),
+            "recoverable": row.get("status") == "interrupted",
+        }
+        if row.get("finished_at") is not None:
+            job["finished_at"] = row["finished_at"]
+        if row.get("progress"):
+            job["progress"] = dict(row["progress"])
+        if row.get("result"):
+            job["summary"] = dict(row["result"])
+            # 作业状态与业务检查点是两层事实：awaiting_confirm 表示 worker
+            # 成功停在检查点，所以外层仍为 done（兼容轮询契约），同时通过
+            # outcome_status 明示真实业务终态。failed 则必须是外层 failed。
+            if str(row.get("status") or "") == "done":
+                outcome_status, summary_error = (
+                    JobRegistry._summary_job_outcome(
+                        row["result"]))
+                job["outcome_status"] = outcome_status
+                if outcome_status == "failed":
+                    # 兼容升级前遗留的“ledger=done、summary=failed”记录。
+                    # 旧数据不能继续在 /api/jobs 冒充成功，否则页面仍会
+                    # 显示假卡/已完成，真正失败原因也会消失。
+                    job["status"] = "failed"
+                    if summary_error:
+                        job["error"] = summary_error
+        if row.get("error"):
+            job["error"] = row["error"]
+        if row.get("queue_position") is not None:
+            job["queue_position"] = row["queue_position"]
+        if row.get("cancel_requested"):
+            job["cancel_requested"] = True
+        return job
+
+    @staticmethod
+    def _summary_job_outcome(summary):
+        """Translate a Director summary into the Web-visible job outcome.
+
+        ``production_jobs`` intentionally has a small durable state machine,
+        while Director summaries also expose review checkpoints.  A worker
+        returning normally is therefore not synonymous with successful
+        production: ``status=failed`` must remain failed, and checkpoint
+        states are preserved separately as ``outcome_status``.
+        """
+        if not isinstance(summary, dict):
+            return "done", ""
+        result_status = str(summary.get("status") or "").strip().lower()
+        if result_status in {"failed", "qc_failed"}:
+            reason = str(summary.get("error") or "").strip()
+            if not reason:
+                for stage in reversed(list(summary.get("stages") or [])):
+                    if not isinstance(stage, dict):
+                        continue
+                    if str(stage.get("status") or "").lower() not in {
+                            "failed", "qc_failed"}:
+                        continue
+                    detail = stage.get("detail") or {}
+                    reason = str(
+                        stage.get("error")
+                        or (detail.get("error")
+                            if isinstance(detail, dict) else "")
+                        or (detail.get("reason")
+                            if isinstance(detail, dict) else "")
+                        or "").strip()
+                    if reason:
+                        break
+            return "failed", reason or "生产任务返回失败状态"
+        if result_status in {
+                "paused", "awaiting_script", "awaiting_cast",
+                "awaiting_confirm", "queued_script", "created", "stopped"}:
+            return result_status, ""
+        return "done", ""
+
+    def _hydrate_jobs(self):
+        """Restore visible task facts; Python closures are never replayed."""
+        rows = self._job_center.list(limit=500, include_links=True)
+        for row in rows:
+            job = self._durable_job_payload(row)
+            self._jobs[job["id"]] = job
+            match = re.fullmatch(r"j(\d+)", str(job["id"]))
+            if match:
+                self._seq = max(self._seq, int(match.group(1)))
+
+    def _active_durable_run_ids(self):
+        return {
+            int(row["run_id"])
+            for row in self._job_center.list(
+                statuses=ACTIVE_JOB_STATUSES, limit=500,
+                include_links=False)
+            if row.get("run_id") is not None
+        }
+
+    @staticmethod
+    def _job_request(title, number, request=None, **extra):
+        return {
+            "title": str(title), "episode": int(number),
+            **dict(request or {}), **extra,
+        }
+
+    def _persist_job_create(self, job, request):
+        links = []
+        run_row = (
+            self._ledger_db.query_one(
+                "SELECT episode_id FROM production_runs WHERE id=?",
+                (job.get("run_id"),))
+            if job.get("run_id") is not None else None)
+        episode_id = (
+            int(run_row["episode_id"])
+            if run_row is not None and run_row["episode_id"] is not None
+            else None)
+        shot = (request or {}).get("shot_no")
+        item_id = str((request or {}).get("item_id") or "")
+        if shot is not None or item_id.startswith(("shot:", "frames:")):
+            links.append({
+                "relation_type": "shot",
+                "relation_id": str(shot if shot is not None else item_id),
+                "role": str(job.get("action") or ""),
+            })
+        self._job_center.create(
+            job["id"], run_id=job.get("run_id"),
+            episode_id=episode_id,
+            action=job.get("action") or "adjustment",
+            status=job.get("status") or "queued",
+            request=request, progress=job.get("progress") or {},
+            queue_key=f"{job.get('title')}:{int(job.get('episode') or 0)}",
+            queue_position=job.get("queue_position"), links=links)
+        self._ensure_lease_heartbeat()
+
+    def _ensure_lease_heartbeat(self):
+        """Renew owned leases and retire foreign rows once they turn stale."""
+        thread = self._lease_thread
+        if thread is not None and thread.is_alive():
+            return
+
+        def heartbeat():
+            while not self._lease_stop.wait(self.HEARTBEAT_SECONDS):
+                try:
+                    self._job_center.renew_owned_leases()
+                    recovered = self._job_center.bootstrap_interrupt(
+                        "任务 owner 已死亡或租约过期，后台任务已中断",
+                        return_jobs=True)
+                    if recovered:
+                        self._refresh_recovered_jobs(recovered)
+                    self._history_center.recover_stale(
+                        protected_run_ids=self._active_durable_run_ids(),
+                        stale_before=time.time() - self.LEASE_SECONDS)
+                except (AifosError, sqlite3.Error, TypeError, ValueError):
+                    # A transient SQLite error must not terminate production.
+                    # The next heartbeat retries before the 120-second lease.
+                    continue
+
+        self._lease_thread = threading.Thread(
+            target=heartbeat, daemon=True,
+            name="aifos-job-lease-heartbeat")
+        self._lease_thread.start()
+
+    def _refresh_recovered_jobs(self, rows):
+        """Sync lease recovery into history, memory and the serial queue."""
+        queue_keys = set()
+        for row in rows:
+            if row.get("run_id") is not None:
+                self._history_center.recover_run(
+                    row["run_id"], row.get("error")
+                    or "任务 owner 已失联，运行已中断")
+        with self._lock:
+            for row in rows:
+                current = self._jobs.get(row["id"])
+                if (current is not None
+                        and current.get("status") in {"queued", "running",
+                                                      "cancelling"}):
+                    queue_keys.add((
+                        current.get("title"), int(current.get("episode") or 0)))
+                    self._jobs[row["id"]] = self._durable_job_payload(row)
+                for key, pending in list(self._queues.items()):
+                    filtered = [entry for entry in pending
+                                if entry[0] != row["id"]]
+                    if len(filtered) != len(pending):
+                        queue_keys.add(key)
+                    if filtered:
+                        self._queues[key] = filtered
+                        self._renumber_queue(key)
+                    else:
+                        self._queues.pop(key, None)
+        for title, episode in queue_keys:
+            if title:
+                self._drain_serial(title, episode)
+
+    def _persist_job_state(self, job_id, status, *, result=None, error=None):
+        try:
+            kwargs = {}
+            if result is not None:
+                kwargs["result"] = result if isinstance(result, dict) else {
+                    "result": result}
+            if error is not None:
+                kwargs["error"] = str(error)
+            self._job_center.set_state(job_id, status, **kwargs)
+        except Exception as exc:
+            job = self._jobs.get(job_id)
+            if job is not None:
+                job["ledger_error"] = str(exc)[:300]
+
+    def _create_history(self, title, number, action, force=False,
+                        request=None):
+        app = App(self.workspace)
+        try:
+            return app.history.create_run(
+                title, number, action=action, force=force,
+                request=request, source="web")
+        finally:
+            app.close()
+
+    def start(self, title, number, premise="", style="", force=False,
+              script=None, review=False, kind=None, action="produce",
+              unique=False, style_pack_id="", auto_select_assets=True,
+              fresh_assets=False, resume_after_preflight=False):
+        """启动生产；unique=True 时同一集重复提交复用正在运行的任务。
+
+        检查、创建历史和登记 job 必须处在同一把锁内，否则两个浏览器标签
+        同时点「确认」仍可能各自通过检查，重复消耗 Seedance/生图额度。
+        """
+        with self._lock:
+            if unique:
+                existing = next((
+                    job for job in self._jobs.values()
+                    if job["status"] == "running"
+                    and job["title"] == title
+                    and int(job["episode"]) == int(number)), None)
+                if existing is not None:
+                    return existing["id"]
+            run_id = self._create_history(
+                title, number, action, force=force,
+                request={"premise": premise, "style": style,
+                         "style_pack_id": style_pack_id,
+                         "review": bool(review), "kind": kind,
+                         "script_supplied": script is not None,
+                         "auto_select_assets": bool(auto_select_assets),
+                         "fresh_assets": bool(fresh_assets),
+                         "resume_after_preflight": bool(
+                             resume_after_preflight)})
+            self._seq += 1
+            job_id = f"j{self._seq}"
+            job = {
+                "id": job_id, "status": "running",
+                "title": title, "episode": number, "force": force,
+                "action": action,
+                "started_at": time.time(), "run_id": run_id,
+            }
+            self._jobs[job_id] = job
+            self._persist_job_create(job, self._job_request(
+                title, number, {
+                    "premise": premise, "style": style,
+                    "style_pack_id": style_pack_id,
+                    "review": bool(review), "kind": kind,
+                    "script_supplied": script is not None,
+                    "auto_select_assets": bool(auto_select_assets),
+                    "fresh_assets": bool(fresh_assets),
+                    "resume_after_preflight": bool(
+                        resume_after_preflight),
+                }, force=bool(force)))
+
+        def task(app):
+            return app.director.produce(
+                title, number, premise=premise, style=style, force=force,
+                script=script, pause_for_confirm=review, kind=kind,
+                run_id=run_id, style_pack_id=style_pack_id,
+                auto_select_assets=auto_select_assets,
+                fresh_assets=fresh_assets,
+                resume_after_preflight=resume_after_preflight)
+
+        self._run(job_id, task)
+        return job_id
+
+    def start_task(self, title, number, task, action="adjustment",
+                   request=None, tracked=False, unique=False, queue=False,
+                   unique_action=False):
+        """通用后台任务(打磨重写/重画)。
+
+        普通任务签名为 ``task(app, run_id)``；tracked=True 时额外传入
+        ``report(**fields)``，让长批次把逐项进度写进 job，前端无需猜测。
+        ``unique_action=True`` 只合并同一集、同一 action 的运行/排队任务，
+        用于“最后一镜选完后恢复生产”这类必须 exactly-once 排队的动作；
+        它不会像旧 ``unique`` 那样误复用本集另一个无关任务。
+        """
+        with self._lock:
+            if unique_action:
+                existing = next((
+                    job for job in self._jobs.values()
+                    if job["status"] in {"running", "queued"}
+                    and job["title"] == title
+                    and int(job["episode"]) == int(number)
+                    and str(job.get("action") or "") == str(action)
+                ), None)
+                if existing is not None:
+                    return existing["id"]
+            elif unique:
+                existing = next((
+                    job for job in self._jobs.values()
+                    if job["status"] == "running"
+                    and job["title"] == title
+                    and int(job["episode"]) == int(number)), None)
+                if existing is not None:
+                    return existing["id"]
+            run_id = self._create_history(
+                title, number, action, request=request)
+            self._seq += 1
+            job_id = f"j{self._seq}"
+            job = {
+                "id": job_id, "status": "queued" if queue else "running",
+                "title": title, "episode": number, "action": action,
+                "started_at": time.time(), "run_id": run_id,
+            }
+            self._jobs[job_id] = job
+            durable_request = self._job_request(
+                title, number, request, force=False)
+            self._persist_job_create(job, durable_request)
+        def report(**fields):
+            with self._lock:
+                job = self._jobs.get(job_id)
+                if job is None:
+                    return
+                progress = dict(job.get("progress") or {})
+                progress.update(fields)
+                progress["updated_at"] = time.time()
+                job["progress"] = progress
+                try:
+                    self._job_center.set_progress(job_id, progress)
+                except Exception as exc:
+                    job["ledger_error"] = str(exc)[:300]
+
+        callback = ((lambda app: task(app, run_id, report))
+                    if tracked else (lambda app: task(app, run_id)))
+
+        def accounted_runner(app):
+            project = app.projects.get_project(title)
+            episode = (app.db.query_one(
+                "SELECT * FROM episodes WHERE project_id=? AND number=?",
+                (project["id"], int(number)))
+                if project is not None else None)
+            before_episode_cost = float(
+                episode["cost"] or 0) if episode is not None else 0.0
+            before_task_cost = float((app.db.query_one(
+                "SELECT COALESCE(SUM(cost), 0) AS total FROM tasks "
+                "WHERE episode_id=?", (episode["id"],))
+                if episode is not None else {"total": 0})["total"] or 0)
+            summary = None
+            error = ""
+            try:
+                summary = callback(app)
+                return summary
+            except Exception as exc:
+                error = str(exc)
+                raise
+            finally:
+                if episode is not None:
+                    current = app.projects.get_episode(episode["id"])
+                    after_episode_cost = float(
+                        current["cost"] or 0) if current is not None else 0.0
+                    after_task_cost = float(app.db.query_one(
+                        "SELECT COALESCE(SUM(cost), 0) AS total FROM tasks "
+                        "WHERE episode_id=?", (episode["id"],))["total"] or 0)
+                    unassigned = round(max(
+                        0.0,
+                        (after_episode_cost - before_episode_cost)
+                        - (after_task_cost - before_task_cost),
+                    ), 4)
+                    if unassigned > 0:
+                        stage, name = {
+                            "regenerate_cast": ("cast", "人物/道具候选重做"),
+                            "revise_script": ("script", "剧本打磨重写"),
+                            "regen_image": ("images", "图片定向修改"),
+                            "reanalyze_story": ("script", "制作圣经重新分析"),
+                            "qc_all": ("qc", "图片批量复检"),
+                            "recheck_current_storyboard": (
+                                "qc", "当前分镜合同批量复检"),
+                            "image_selection_resume": (
+                                "images", "关键帧选片完成后断点续产"),
+                            "regenerate_shot_candidates": (
+                                "images", "关键帧单图编辑返修"),
+                            "redo_items": ("images", "图片批量重画"),
+                            "redo_video": ("videos", "视频定向修改"),
+                            "redo_placeholders": ("images", "占位图片补真"),
+                            "restyle": ("cast", "全剧视觉风格重做"),
+                        }.get(action, ("adjustment", "制作调整"))
+                        providers = ",".join(sorted(
+                            str(value) for value in
+                            getattr(app.director, "_task_providers", set())
+                            if str(value))) or "调整任务（Provider 未回传）"
+                        summary_dict = (
+                            summary if isinstance(summary, dict) else {})
+                        result_status = str(
+                            summary_dict.get("status") or "")
+                        task_status = (
+                            "failed" if error else
+                            "stopped" if result_status == "paused" else
+                            "done")
+                        ts = time.time()
+                        app.db.execute(
+                            "INSERT INTO tasks("
+                            "episode_id, run_id, stage, name, status, "
+                            "provider, cost, result, error, created_at, "
+                            "updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                            (
+                                episode["id"], run_id, stage, name,
+                                task_status, providers, unassigned,
+                                json.dumps(
+                                    summary_dict, ensure_ascii=False,
+                                    default=str)[:4000],
+                                error[:1000], ts, ts,
+                            ))
+
+        if queue:
+            self._submit_serial(job_id, title, number, accounted_runner)
+        else:
+            self._run(job_id, accounted_runner)
+        return job_id
+
+    def _episode_busy(self, title, number):
+        """调用方须持锁。本集是否已有任务在跑。"""
+        return any(
+            job["status"] == "running" and job["title"] == title
+            and int(job["episode"]) == int(number)
+            for job in self._jobs.values())
+
+    def _renumber_queue(self, key):
+        """调用方须持锁。刷新排队位次,界面据此显示"前面还有几张"。"""
+        for index, (queued_id, _) in enumerate(self._queues.get(key) or []):
+            job = self._jobs.get(queued_id)
+            if job is not None:
+                job["queue_position"] = index + 1
+                try:
+                    self._job_center.set_queue_position(
+                        queued_id, index + 1)
+                except Exception as exc:
+                    job["ledger_error"] = str(exc)[:300]
+
+    def _submit_serial(self, job_id, title, number, runner):
+        """本集空闲就立刻跑,否则排队,等前一个任务结束后自动接上。"""
+        key = (title, int(number))
+        with self._lock:
+            if self._episode_busy(title, number):
+                self._queues.setdefault(key, []).append((job_id, runner))
+                self._jobs[job_id]["status"] = "queued"
+                self._renumber_queue(key)
+                return
+            self._jobs[job_id]["status"] = "running"
+            self._jobs[job_id]["started_at"] = time.time()
+            self._persist_job_state(job_id, "running")
+        self._run(job_id, runner)
+
+    def _drain_serial(self, title, number):
+        """前一个任务结束后启动队首;已失效的条目顺延跳过。"""
+        key = (title, int(number))
+        while True:
+            with self._lock:
+                pending = self._queues.get(key)
+                if not pending:
+                    self._queues.pop(key, None)
+                    return
+                if self._episode_busy(title, number):
+                    return
+                job_id, runner = pending.pop(0)
+                if not pending:
+                    self._queues.pop(key, None)
+                self._renumber_queue(key)
+                job = self._jobs.get(job_id)
+                if (job is None or job.get("status") != "queued"
+                        or job.get("cancel_requested")):
+                    continue
+                job["status"] = "running"
+                job["started_at"] = time.time()
+                job.pop("queue_position", None)
+                self._persist_job_state(job_id, "running")
+            self._run(job_id, runner)
+            return
+
+    def queued_for(self, title, number):
+        with self._lock:
+            return [self._jobs[queued_id]
+                    for queued_id, _ in (
+                        self._queues.get((title, int(number))) or [])
+                    if queued_id in self._jobs]
+
+    def _run(self, job_id, task):
+        def run():
+            app = App(self.workspace)
+            follow_up = None
+            try:
+                summary = task(app)
+                outcome_status, summary_error = self._summary_job_outcome(
+                    summary)
+                durable_status = (
+                    "failed" if outcome_status == "failed" else "done")
+                with self._lock:
+                    self._jobs[job_id].update(
+                        status=durable_status, outcome_status=outcome_status,
+                        summary=summary,
+                        finished_at=time.time())
+                    if summary_error:
+                        self._jobs[job_id]["error"] = summary_error
+                self._persist_job_state(
+                    job_id, durable_status, result=summary,
+                    error=summary_error or None)
+                app.history.finish_run(
+                    self._jobs[job_id]["run_id"], summary=summary)
+                if isinstance(summary, dict) and summary.get("status") == "done":
+                    project = app.projects.get_project(summary.get("project"))
+                    episode = (app.db.query_one(
+                        "SELECT id FROM episodes WHERE project_id=? AND number=?",
+                        (project["id"], int(summary["episode"])))
+                        if project is not None else None)
+                    if episode is not None:
+                        try:
+                            follow_up = app.series.maybe_auto_advance(
+                                episode["id"])
+                        except Exception as exc:
+                            # 串行队列是当前成功运行的后续动作；推进失败只提示，
+                            # 不能把已经交付成功的本集和历史记录反写成失败。
+                            self._jobs[job_id]["series_advance_error"] = str(exc)
+            except Exception as exc:  # 后台任务兜底,错误进任务状态
+                with self._lock:
+                    self._jobs[job_id].update(
+                        status="failed", error=str(exc),
+                        finished_at=time.time())
+                self._persist_job_state(job_id, "failed", error=str(exc))
+                app.history.finish_run(
+                    self._jobs[job_id]["run_id"], error=str(exc))
+            finally:
+                app.close()
+                # 无论成败都要放行队首,否则一次失败就把整条队列卡死。
+                job = self._jobs.get(job_id) or {}
+                if job.get("title") is not None:
+                    try:
+                        self._drain_serial(job["title"], job["episode"])
+                    except Exception:
+                        pass
+            if follow_up and not follow_up.get("done"):
+                try:
+                    next_job = self.start_series_step(follow_up)
+                    self._jobs[job_id]["series_next"] = {
+                        "episode_id": follow_up["episode_id"],
+                        "episode": follow_up["number"],
+                        "job_id": next_job,
+                    }
+                except Exception as exc:
+                    # 当前集已经成功，自动准备下一集失败不应篡改当前结果。
+                    self._jobs[job_id]["series_advance_error"] = str(exc)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def start_series_step(self, step):
+        """逐集运行编剧总闸门；解析稿不得直接跳到人物/出图。"""
+        if step.get("done"):
+            return None
+        source_script = step.get("source_script")
+        if (step.get("mode") == "script" and source_script is None
+                and not step.get("requires_writer_adaptation")):
+            # Compatibility for a legacy batch that already stored a formal
+            # script and intentionally waits at the review checkpoint.
+            return None
+        return self.start(
+            step["title"], int(step["number"]),
+            premise=step.get("premise", ""), review=True,
+            script=source_script,
+            action="series_next")
+
+    def get(self, job_id):
+        return self._jobs.get(job_id)
+
+    def request_cancel(self, job_id, reason="用户请求停止生产"):
+        """Persist cancellation intent while the live worker remains active."""
+        queue_keys = set()
+        cancelled_while_queued = False
+        run_id = None
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            previous_status = str(job.get("status") or "")
+            run_id = job.get("run_id")
+            job["cancel_requested"] = True
+            job["cancel_reason"] = str(reason)
+            try:
+                durable = self._job_center.request_cancel(job_id, reason)
+            except Exception as exc:
+                job["ledger_error"] = str(exc)[:300]
+                durable = None
+            if previous_status == "queued":
+                cancelled_while_queued = True
+                for key, pending in list(self._queues.items()):
+                    filtered = [entry for entry in pending
+                                if entry[0] != job_id]
+                    if len(filtered) != len(pending):
+                        queue_keys.add(key)
+                    if filtered:
+                        self._queues[key] = filtered
+                        self._renumber_queue(key)
+                    else:
+                        self._queues.pop(key, None)
+                if durable is not None:
+                    self._jobs[job_id] = self._durable_job_payload(durable)
+                else:
+                    job.update(status="cancelled", finished_at=time.time())
+                    job.pop("queue_position", None)
+            result = dict(self._jobs[job_id])
+        if cancelled_while_queued:
+            self._history_center.cancel_run(run_id, reason)
+            for title, episode in queue_keys:
+                self._drain_serial(title, episode)
+        return result
+
+    def list(self):
+        return sorted(self._jobs.values(),
+                      key=lambda j: j["started_at"], reverse=True)
+
+    def production_running_for(self, title, number):
+        """只统计整集生产类任务;单图重画/质检不算"本集正在生产"。"""
+        return [job for job in self.running_for(title, number)
+                if str(job.get("action") or "") in self.PRODUCTION_ACTIONS]
+
+    def running_for(self, title, number):
+        with self._lock:
+            return [job for job in self._jobs.values()
+                    if job["status"] == "running"
+                    and job["title"] == title
+                    and int(job["episode"]) == int(number)]
+
+
+def _versioned(url, row):
+    """重画同名文件后靠版本参数破除浏览器缓存。"""
+    if url and url.startswith("/artifacts/"):
+        return f"{url}?v={row['version']}"
+    return url
+
+
+def _artifact_url(app, uri):
+    """文件系统路径 → /artifacts/ 相对 URL;远程 URL 原样;其余 None。"""
+    if not uri:
+        return None
+    if uri.startswith("http://") or uri.startswith("https://"):
+        return uri
+    try:
+        rel = Path(uri).resolve().relative_to(
+            app.workspace.artifacts_dir.resolve())
+    except ValueError:
+        return None
+    return "/artifacts/" + rel.as_posix()
+
+
+def _candidate_group_current_selection(item):
+    """返回当前候选组的有效明确选择；旧 token/迟到点击一律无效。"""
+    group = (item or {}).get("candidate_group") or {}
+    selection = group.get("selection") or {}
+    candidates = group.get("candidates") or []
+    if (not isinstance(group, dict) or not isinstance(selection, dict)
+            or group.get("complete") is not True
+            or group.get("technical_incomplete") is True):
+        return None
+    group_id = str(group.get("candidate_set_id") or "")
+    group_token = str(group.get("candidate_set_token") or "")
+    try:
+        group_revision = int(group.get("candidate_revision") or 0)
+        selected_revision = int(
+            selection.get("candidate_revision") or 0)
+        selected_index = int(selection.get("candidate_index") or 0)
+    except (TypeError, ValueError):
+        return None
+    if (not group_id or not group_token or group_revision < 1
+            or str(selection.get("candidate_set_id") or "") != group_id
+            or str(selection.get("candidate_set_token")
+                   or selection.get("token") or "") != group_token
+            or selected_revision != group_revision
+            or str(selection.get("source") or "") not in {"manual", "ai"}
+            or selected_index < 1):
+        return None
+    selected_id = str(selection.get("candidate_id") or "")
+    candidate = None
+    for row in candidates:
+        if not isinstance(row, dict):
+            continue
+        try:
+            row_index = int(row.get("candidate_index") or 0)
+        except (TypeError, ValueError):
+            continue
+        if (row_index == selected_index
+                and str(row.get("candidate_set_token") or "") == group_token
+                and (not selected_id
+                     or str(row.get("candidate_id") or "") == selected_id)):
+            candidate = row
+            break
+    if candidate is None:
+        return None
+    selected_locations = {
+        str(selection.get(key) or "").strip()
+        for key in ("selected_uri", "selected_url")
+        if str(selection.get(key) or "").strip()
+    }
+    candidate_locations = {
+        str(candidate.get(key) or "").strip()
+        for key in ("uri", "url")
+        if str(candidate.get(key) or "").strip()
+    }
+    if (selected_locations and candidate_locations
+            and selected_locations.isdisjoint(candidate_locations)):
+        return None
+    return selection
+
+
+def _selection_mode_enabled(app):
+    return _selection_mode_payload(app)["selection_mode"]
+
+
+def _selection_mode_best_effort_promoted(item):
+    """识别已由 AI 晋升的技术可用相对最优稿。
+
+    生产历史里这一标记经历过几种落盘位置。Web 层必须兼容读取，但只
+    把它解释为“非阻断风险”，不能把 ``qc.passed=false`` 再翻译成
+    二次失败或人工门禁。
+    """
+    item = item if isinstance(item, dict) else {}
+    group = item.get("candidate_group") or {}
+    group_selection = group.get("selection") or {}
+    item_selection = item.get("selection") or {}
+    qc = item.get("qc") or {}
+    selection_risk = item.get("selection_risk") or {}
+    return any(value is True for value in (
+        group.get("best_effort_promoted"),
+        group.get("best_effort_risk"),
+        group_selection.get("best_effort_promoted"),
+        group_selection.get("best_effort_risk"),
+        item_selection.get("best_effort_promoted"),
+        item_selection.get("best_effort_risk"),
+        qc.get("best_effort_promoted"),
+        qc.get("best_effort_risk"),
+        selection_risk.get("best_effort"),
+    ))
+
+
+def _selection_mode_has_technical_output(item):
+    """只判断是否至少有一张落盘/远程可读图，不做内容判断。"""
+    item = item if isinstance(item, dict) else {}
+
+    def valid(uri):
+        uri = str(uri or "").strip()
+        return bool(uri) and (
+            uri.startswith(("http://", "https://", "/artifacts/"))
+            or Path(uri).is_file())
+
+    if valid(item.get("output_uri")) or valid(item.get("output_url")):
+        return True
+    group = item.get("candidate_group") or {}
+    return any(
+        isinstance(row, dict)
+        and (valid(row.get("uri")) or valid(row.get("url")))
+        for row in group.get("candidates") or [])
+
+
+def _selection_mode_present_item(item):
+    """把旧阻断状态转换为选优模式的非人工状态（仅修改传入副本）。
+
+    有当前选片或 best-effort 晋升凭证的技术可用稿视为完成；旧版只有
+    ``qc=false``、却没有有效选片凭证的镜头交回系统：先由 Codex 汇总
+    问题、优化提示词与参考图，再以当前失败图为基底编辑返修一张。首轮计入总轮数，
+    最多十轮。零张技术产物才显示 ``technical_incomplete``。磁盘上的历史
+    计划不在这里改写，方便审计和后续 Director 续产接管。
+    """
+    if not isinstance(item, dict):
+        return item
+    category = str(item.get("category") or "")
+    if category not in {"shot_image", "frames"}:
+        return item
+    status = str(item.get("status") or "pending")
+    qc = item.get("qc") or {}
+    content_failure = (
+        status in {"awaiting_human", "failed"}
+        or qc.get("passed") is False)
+    if not content_failure:
+        return item
+
+    qc = dict(qc)
+    qc.update({
+        "awaiting_human": False,
+        "blocking": False,
+        "advisory_only": True,
+    })
+    item["qc"] = qc
+    technical_output = _selection_mode_has_technical_output(item)
+    has_selection = (
+        category == "shot_image"
+        and _candidate_group_current_selection(item) is not None)
+    best_effort = (
+        category == "shot_image"
+        and _selection_mode_best_effort_promoted(item))
+    legacy_reused = (
+        category == "shot_image"
+        and status == "reused"
+        and technical_output
+        and not item.get("invalidated_previous_output")
+        and not item.get("contract_recheck"))
+    # 正式资产是否存在由 progress 的资产中心校验负责；这里不能因为旧
+    # 清单漏写 output_uri 而抹掉已落盘的 AI 选优凭证。
+    if has_selection or best_effort or legacy_reused:
+        if status not in {"done", "reused"}:
+            item["status"] = "done"
+        item["nonblocking_risk"] = True
+        if legacy_reused and not (has_selection or best_effort):
+            # 兼容旧候选选优上线前已晋升进资产中心的正式图。旧清单没有
+            # candidate_group.selection，但 reused + 未失效技术产物仍是
+            # 明确的正式复用事实，不能把整集倒退成“待返修”。最终是否真有
+            # 正式资产仍由 _production_progress 的资产中心核验决定。
+            item["legacy_formal_reuse"] = True
+        item.pop("automatic_repair", None)
+        return item
+
+    if technical_output:
+        item["status"] = "pending"
+        strategy = (
+            "codex_optimize_prompt_refs_then_edit_1"
+            if category == "shot_image" else "regenerate_frames")
+        item["automatic_repair"] = {
+            "owner": "system",
+            "strategy": strategy,
+            "candidate_count": (
+                REPAIR_CANDIDATES_PER_BATCH
+                if category == "shot_image" else 0),
+            "max_candidate_rounds": (
+                MAX_CANDIDATE_ROUNDS if category == "shot_image" else 0),
+            "first_round_included": category == "shot_image",
+            "requires_human": False,
+            "label": (
+                "Codex自动归因并优化提示词与参考图；"
+                "每轮单图质检，局部问题编辑当前图；结构问题按锁定参考"
+                "重生1张，最多10轮"
+                if category == "shot_image" else "系统自动重生成首尾帧"),
+        }
+    else:
+        item["status"] = "technical_incomplete"
+        item["automatic_repair"] = {
+            "owner": "system",
+            "strategy": "retry_technical_generation",
+            "candidate_count": (
+                REPAIR_CANDIDATES_PER_BATCH
+                if category == "shot_image" else 0),
+            "max_candidate_rounds": (
+                MAX_CANDIDATE_ROUNDS if category == "shot_image" else 0),
+            "first_round_included": category == "shot_image",
+            "requires_human": False,
+            "label": "系统自动重试技术生成",
+        }
+    return item
+
+
+def _selection_mode_payload(app):
+    return _selection_mode_payload_from_config(app.config)
+
+
+def _selection_mode_payload_from_config(config):
+    """回显请求值和真正生效的非阻断质检/候选策略。"""
+    # 延迟导入避免 Web 启动时扩大 settings 的导入链；这里复用保存接口的
+    # 唯一布尔语义，不能再用 bool("false") 这种会误判为 True 的写法。
+    from ..settings import _coerce_bool
+
+    def flag(key, default):
+        return _coerce_bool(
+            key, config.get("defaults", key, default=default))
+
+    selection_mode = flag("selection_mode", True)
+    image_content_qc = flag("image_content_qc", True)
+    video_content_qc = flag("video_content_qc", True)
+    preview_qc_bypass = flag("preview_qc_bypass", False)
+    policy = build_selection_policy(
+        selection_mode,
+        image_content_qc_requested=(
+            image_content_qc and not preview_qc_bypass),
+        video_content_qc_requested=(
+            video_content_qc and not preview_qc_bypass),
+        initial_candidates_per_shot=CANDIDATES_PER_SHOT,
+        repair_candidates_per_batch=REPAIR_CANDIDATES_PER_BATCH,
+        max_candidate_rounds=MAX_CANDIDATE_ROUNDS,
+    )
+    return {
+        "selection_mode": selection_mode,
+        # 保留旧键作为用户请求值，另给 effective 字段避免客户端继续把
+        # “非阻断”误解成“未执行质检”。
+        "image_content_qc": image_content_qc,
+        "video_content_qc": video_content_qc,
+        "preview_qc_bypass": preview_qc_bypass,
+        "effective_image_content_qc": policy.image_content_qc_enabled,
+        "effective_video_content_qc": policy.video_content_qc_enabled,
+        "content_qc_blocking": policy.content_qc_blocking,
+        "content_qc_auto_retry": policy.content_qc_auto_retry,
+        "codex_repair_enabled": policy.prompt_review_enabled,
+        "reference_reselection_enabled": True,
+        "shot_candidate_count": policy.initial_candidates_per_shot,
+        "shot_repair_candidate_count": policy.repair_candidates_per_batch,
+        "max_candidate_rounds": policy.max_candidate_rounds,
+        "first_round_included": True,
+        "failure_blocks_other_shots": policy.failure_blocks_other_shots,
+        "failure_blocks_downstream_stage": (
+            policy.failure_blocks_downstream_stage),
+        "limit_behavior": "promote_best_with_nonblocking_risk",
+    }
+
+
+def _sanitize_candidate_group_urls(app, item):
+    """候选图只向浏览器暴露受控 URL，不泄露服务端文件系统路径。"""
+    def sanitize(group):
+        if not isinstance(group, dict):
+            return
+        for candidate in group.get("candidates") or []:
+            if not isinstance(candidate, dict):
+                continue
+            candidate["url"] = (
+                _artifact_url(app, str(candidate.get("uri") or ""))
+                or candidate.get("url"))
+            candidate.pop("uri", None)
+        selection = group.get("selection")
+        if isinstance(selection, dict):
+            selection["selected_url"] = (
+                _artifact_url(app, str(selection.get("selected_uri") or ""))
+                or selection.get("selected_url"))
+            selection.pop("selected_uri", None)
+        group.pop("manual_selection_request", None)
+
+    sanitize(item.get("candidate_group"))
+    sanitize(item.get("candidate_progress"))
+    for history_key in (
+            "candidate_group_history", "candidate_round_history"):
+        for group in item.get(history_key) or []:
+            sanitize(group)
+    progress = item.get("candidate_progress")
+    if isinstance(progress, dict):
+        # Exact resume payloads may contain local paths and internal callbacks'
+        # audit fields.  The browser needs the promoted prompt/token/count,
+        # not the process checkpoint itself.
+        progress.pop("resume_state", None)
+    # 生产中的人工预选在 candidate_progress.selection 已有安全副本；
+    # 顶层内部字段只供 worker 收口使用，不能把绝对路径发给浏览器。
+    item.pop("manual_candidate_selection", None)
+    uris = item.pop("candidate_uris", None)
+    if isinstance(uris, list):
+        item["candidate_urls"] = [
+            url for url in (
+                _artifact_url(app, str(uri or "")) for uri in uris)
+            if url
+        ]
+
+
+def _candidate_request_value(body, name, *aliases):
+    for key in (name, *aliases):
+        value = body.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _candidate_conflict(exc):
+    message = str(exc)
+    return any(marker in message for marker in (
+        "stale_candidate_set", "selection_conflict",
+        "候选组已更新", "候选组冲突",
+    ))
+
+
+_DIAGNOSTIC_FIELDS = (
+    "image_error", "prompt_diagnosis", "prompt_audit",
+    "reference_diagnosis", "reference_audit",
+    "frame_audit",
+    "targeted_prompt_patch", "reference_adjustments",
+    "diagnosis_complete",
+)
+_DIAGNOSTIC_FULL_PROMPT_KEYS = {
+    "prompt", "prompt_full", "full_prompt", "original_prompt",
+    "generation_prompt", "prompt_used", "revised_prompt", "final_prompt",
+    "prompt_before", "prompt_after",
+}
+
+
+def _safe_diagnostic_text(value, limit=800):
+    """诊断展示文本脱敏：不把服务器绝对路径或超长生成输入发给浏览器。"""
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return ""
+    try:
+        if Path(text).is_absolute():
+            return "[本地路径已隐藏]"
+    except (OSError, ValueError):
+        pass
+    # 兼容错误文本中夹带的 macOS/Linux 绝对路径；远程 URL 不是诊断卡
+    # 需要展示的内容，也一并收敛为不可点击的安全占位。
+    text = re.sub(
+        r"(?<![\w/])/(?:[^/\s,;，；]+/)+[^/\s,;，；]+",
+        "[本地路径已隐藏]", text)
+    text = re.sub(
+        r"\b[A-Za-z]:\\(?:[^\\\s,;，；]+\\)*[^\\\s,;，；]+",
+        "[本地路径已隐藏]", text)
+    if len(text) > limit:
+        text = text[:limit].rstrip() + "…"
+    return text
+
+
+def _safe_diagnostic_value(value, *, depth=0):
+    """仅保留可解释的结构化诊断，不透传 prompt、URI 或任意文件路径。"""
+    if depth > 5:
+        return None
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return _safe_diagnostic_text(value)
+    if isinstance(value, (list, tuple)):
+        return [
+            safe for item in list(value)[:24]
+            if (safe := _safe_diagnostic_value(
+                item, depth=depth + 1)) not in (None, "", [], {})
+        ]
+    if not isinstance(value, dict):
+        return _safe_diagnostic_text(value)
+    output = {}
+    for raw_key, raw_value in list(value.items())[:48]:
+        key = str(raw_key)
+        lowered = key.lower()
+        prompt_key_is_safe = any(token in lowered for token in (
+            "diagnosis", "audit", "hash", "changed", "patch",
+            "adjustment", "instruction", "delta", "status",
+        ))
+        if (lowered in _DIAGNOSTIC_FULL_PROMPT_KEYS
+                or ("prompt" in lowered and not prompt_key_is_safe)
+                or any(token in lowered for token in (
+                    "absolute_path", "local_path", "file_path",
+                    "output_uri", "source_uri", "image_uri",
+                    "video_uri", "reference_uri"))):
+            continue
+        safe = _safe_diagnostic_value(raw_value, depth=depth + 1)
+        if safe not in (None, "", [], {}):
+            output[key] = safe
+    return output
+
+
+def _generation_diagnostic_payload(item, qc=None):
+    """统一图片/视频问题项的安全诊断契约，兼容新旧字段命名。"""
+    item = item if isinstance(item, dict) else {}
+    qc = qc if isinstance(qc, dict) else {}
+    raw_input = (
+        qc.get("input_diagnosis")
+        or item.get("input_diagnosis")
+        or {})
+    raw_input = raw_input if isinstance(raw_input, dict) else {}
+    input_diagnosis = {}
+    for key in _DIAGNOSTIC_FIELDS:
+        for source in (raw_input, qc, item):
+            if key in source:
+                input_diagnosis[key] = source[key]
+                break
+
+    def first_value(*keys, default=None):
+        for source in (qc, item, raw_input):
+            for key in keys:
+                if key in source and source[key] is not None:
+                    return source[key]
+        return default
+
+    decision = first_value("retry_decision", default=None)
+    if not decision:
+        decision = first_value("decision", default={})
+    blocked_reason = first_value("retry_blocked_reason", default="")
+    if not blocked_reason and isinstance(decision, dict):
+        blocked_reason = (
+            decision.get("retry_blocked_reason")
+            or decision.get("blocked_reason")
+            or "")
+    return {
+        "input_diagnosis": _safe_diagnostic_value(input_diagnosis) or {},
+        "applied_changes": _safe_diagnostic_value(
+            first_value("applied_changes", default=[])) or [],
+        "attempt_history": _safe_diagnostic_value(
+            first_value("attempt_history", default=[])) or [],
+        "retry_decision": _safe_diagnostic_value(decision) or {},
+        "retry_blocked_reason": _safe_diagnostic_text(blocked_reason),
+        "codex_escalation": _safe_diagnostic_value(
+            first_value("codex_escalation", default={})) or {},
+    }
+
+
+def _image_asset_catalog(app, project_id):
+    """资产中心当前可见图片，补齐分类、作品、时间与提示词溯源。"""
+    labels = {
+        "character_candidate": "人物候选",
+        "character_art": "人物立绘", "character_sheet": "人物设定",
+        "prop_candidate": "道具候选", "prop_identity": "核心道具母资产",
+        "scene_art": "场景概念图", "image": "镜头关键图",
+        "first_frame": "首帧", "last_frame": "尾帧",
+        "cover": "封面", "reference": "上传参考图",
+        "spatial_blocking": "空间调度图",
+        "inner_persona": "内心Q版母资产",
+    }
+    category_labels = {
+        "character": "人物", "scene": "场景", "costume": "服装",
+        "shot": "镜头", "frame": "首尾帧", "cover": "封面",
+        "reference": "参考图", "inner_persona": "内心Q版",
+        "prop": "道具", "style": "画风",
+    }
+    # 资产工坊自建资产按它自己声明的类型归类,不跟着 reference 一起
+    # 堆在「参考图」里,否则自建人物形象会和上传素材混成一列。
+    studio_categories = {
+        "character": "character", "scene": "scene",
+        "prop": "prop", "style": "style",
+    }
+    project = app.db.query_one(
+        "SELECT id, title FROM projects WHERE id=?", (project_id,))
+    if project is None:
+        return []
+
+    episodes = [dict(row) for row in app.db.query(
+        "SELECT id, number, title, updated_at FROM episodes "
+        "WHERE project_id=? ORDER BY updated_at DESC, number DESC",
+        (project_id,))]
+    episode_by_number = {int(row["number"]): row for row in episodes}
+    prompts_by_episode = {}
+    project_prompts = {}
+    for episode in episodes:
+        plan_path = (app.workspace.artifacts_dir
+                     / f"p{project_id:03d}"
+                     / f"e{int(episode['number']):03d}"
+                     / "render_plan.json")
+        try:
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            plan = {"items": []}
+        for plan_item in plan.get("items", []):
+            item_id = str(plan_item.get("id") or "")
+            prompt = str(plan_item.get("prompt") or "").strip()
+            if not item_id or not prompt:
+                continue
+            prompts_by_episode.setdefault(
+                (int(episode["number"]), item_id), prompt)
+            project_prompts.setdefault(item_id, prompt)
+
+    active_rows = app.assets.active_list(project_id)
+    selected_candidate_ids = {
+        str(app.assets.meta(row).get("candidate_asset_id"))
+        for row in active_rows if row["kind"] in {
+            "character_identity", "prop_identity"}
+        and app.assets.meta(row).get("candidate_asset_id")
+    }
+    stored_prompts = {}
+    for row in active_rows:
+        if row["kind"] != "prompt":
+            continue
+        meta = app.assets.meta(row)
+        prompt = str(meta.get("prompt") or "").strip()
+        if prompt:
+            stored_prompts[row["name"]] = prompt
+
+    def category_for(kind, meta):
+        if kind in {
+                "character_candidate", "character_art", "inner_persona"}:
+            return "character"
+        if kind in {"prop_candidate", "prop_identity"}:
+            return "prop"
+        if kind == "character_sheet":
+            return ("costume" if meta.get("sheet") in {
+                "costume", "costume_detail"} else "character")
+        if kind == "scene_art":
+            return "scene"
+        if kind == "image":
+            return "shot"
+        if kind == "spatial_blocking":
+            return "shot"
+        if kind in {"first_frame", "last_frame"}:
+            return "frame"
+        return kind
+
+    def board_group_for(kind):
+        """资产画布的一级泳道:先区分是否会直接进入后续生产。"""
+        if kind in {"character_art", "scene_art", "image", "first_frame",
+                    "last_frame", "cover", "spatial_blocking",
+                    "inner_persona", "prop_identity"}:
+            return "production"
+        if kind == "character_sheet":
+            return "character_support"
+        if kind in {"character_candidate", "prop_candidate"}:
+            return "candidate"
+        if kind == "reference":
+            return "reference"
+        return "other"
+
+    board_group_labels = {
+        "production": "主生产资产",
+        "character_support": "人物辅助设定",
+        "candidate": "候选与历史",
+        "studio": "自建资产库",
+        "reference": "上传参考图",
+        "other": "其他资产",
+    }
+    studio_role_labels = {
+        "identity": "人物身份参考", "wardrobe": "服装/道具参考",
+        "scene": "场景空间参考", "composition": "构图/动作参考",
+        "style": "画风参考", "manual": "手动参考图",
+        "inner_persona": "内心Q版参考",
+    }
+
+    def usage_for(kind, row_id, selected=False):
+        if kind == "character_candidate":
+            return "已定版候选" if selected else "候选图·未定版不入镜头"
+        if kind == "prop_candidate":
+            return "已定版道具候选" if selected else "道具候选·未定版不入镜头"
+        return {
+            "character_art": "身份锚点·自动使用",
+            "scene_art": "场景锚点·自动使用",
+            "character_sheet": "辅助参考·按镜头调用",
+            "image": "镜头关键图·可入视频",
+            "first_frame": "首帧·视频必需",
+            "last_frame": "尾帧·视频必需",
+            "cover": "封面资产",
+            "reference": "上传参考·按关联调用",
+            "spatial_blocking": "多人/变机位镜头·Seedance 必传",
+            "inner_persona": "必要内心戏自动使用·不计现场真人",
+            "prop_identity": "核心道具锚点·相关镜头自动使用",
+        }.get(kind, "项目资产")
+
+    def prompt_key(row, meta, episode_number):
+        kind, name = row["kind"], row["name"]
+        if kind == "character_candidate":
+            character = meta.get("character") or name.rsplit(":", 1)[0]
+            index = int(meta.get("candidate_index") or name.rsplit(":", 1)[-1])
+            return f"candidate:{character}:{index}"
+        if kind == "prop_candidate":
+            prop = meta.get("prop") or name.rsplit(":", 1)[0]
+            index = int(
+                meta.get("candidate_index") or name.rsplit(":", 1)[-1])
+            return f"prop_candidate:{prop}:{index}"
+        if kind == "character_art":
+            index = meta.get("candidate_index")
+            return (f"candidate:{name}:{int(index)}" if index
+                    else f"char:{name}")
+        if kind == "character_sheet":
+            character = meta.get("character") or name.split(":", 1)[0]
+            sheet = meta.get("sheet") or name.split(":", 1)[-1]
+            return f"sheet:{character}:{sheet}"
+        if kind == "scene_art":
+            return f"scene:{name}"
+        if kind == "image":
+            return f"shot:{int(meta.get('shot_no') or name.rsplit('shot', 1)[-1])}"
+        if kind in {"first_frame", "last_frame"}:
+            return f"frames:{int(meta.get('shot_no') or name.rsplit('shot', 1)[-1])}"
+        return ""
+
+    items = []
+    for row in active_rows:
+        if row["kind"] not in IMAGE_KINDS:
+            continue
+        row_meta = app.assets.meta(row)
+        if row["kind"] == "character_candidate":
+            try:
+                legacy_index = int(
+                    row_meta.get("candidate_index") or 0)
+            except (TypeError, ValueError):
+                legacy_index = 0
+            if legacy_index > 4:
+                # 旧版第5张仍留在版本历史和文件中，但不再属于当前四选一。
+                continue
+        url = _versioned(_artifact_url(app, row["uri"]), row)
+        if not url:
+            continue
+        meta = row_meta
+        episode_number = meta.get(
+            "source_episode_number", meta.get("episode_number"))
+        match = re.match(r"^e(\d{3})(?:_|$)", row["name"])
+        if episode_number is None and match:
+            episode_number = int(match.group(1))
+        try:
+            episode_number = int(episode_number) if episode_number else None
+        except (TypeError, ValueError):
+            episode_number = None
+        episode = episode_by_number.get(episode_number)
+        direct_prompt = str(
+            meta.get("prompt") or meta.get("seedance_prompt") or "").strip()
+        key = ""
+        try:
+            key = prompt_key(row, meta, episode_number)
+        except (TypeError, ValueError):
+            key = ""
+        prompt = (direct_prompt or stored_prompts.get(row["name"]) or
+                  prompts_by_episode.get((episode_number, key)) or
+                  project_prompts.get(key) or "")
+        prompt_status = "recorded"
+        if not prompt:
+            if meta.get("uploaded") or row["kind"] == "reference":
+                prompt_status = "not_applicable"
+                prompt = "人工上传图片，无生成提示词"
+            else:
+                prompt_status = "legacy_missing"
+                prompt = "早期资产未留存完整提示词"
+        category = category_for(row["kind"], meta)
+        quality = meta.get("image_quality", "medium")
+        board_group = board_group_for(row["kind"])
+        selected = str(row["id"]) in selected_candidate_ids
+        studio = bool(meta.get("studio"))
+        studio_type = str(meta.get("studio_asset_type") or "")
+        studio_role = str(meta.get("reference_role") or "")
+        label = f"{labels[row['kind']]} · {row['name']}"
+        usage_label = usage_for(row["kind"], row["id"], selected)
+        if studio:
+            board_group = "studio"
+            category = studio_categories.get(studio_type, category)
+            label = (f"{meta.get('studio_asset_label') or '自建资产'}"
+                     f" · {row['name']}")
+            attached = str(meta.get("attach_to") or "")
+            usage_label = (
+                studio_role_labels.get(studio_role, "自建资产")
+                + "·" + (f"关联{attached}" if attached
+                         else ("全项目通用" if studio_role == "style"
+                               else "仅手动选择")))
+        items.append({
+            "asset_id": row["id"], "kind": row["kind"],
+            "name": row["name"], "version": row["version"],
+            "label": label,
+            "studio": studio,
+            "studio_asset_type": studio_type,
+            "studio_asset_label": str(meta.get("studio_asset_label") or ""),
+            "reference_role": studio_role,
+            "role_label": studio_role_labels.get(studio_role, ""),
+            "attach_to": str(meta.get("attach_to") or ""),
+            "real": bool(meta.get("real", True)),
+            "url": url, "quality": quality,
+            "usable_for_video": quality != "low",
+            "category": category,
+            "category_label": category_labels.get(category, category),
+            "board_group": board_group,
+            "board_group_label": board_group_labels[board_group],
+            "selected": selected,
+            "usage_label": usage_label,
+            "generated_at": row["created_at"],
+            "source_project": project["title"],
+            "source_episode": episode_number,
+            "source_episode_title": (episode or {}).get("title", ""),
+            "prompt": prompt,
+            "prompt_status": prompt_status,
+            "meta": meta,
+        })
+    items.sort(key=lambda item: (
+        item["category"], -float(item["generated_at"]), item["name"]))
+    return items
+
+
+def _collect_artifacts(app, project_id, ep_num):
+    """从资产表重建单集产物索引(按镜头/台词编号)。"""
+    prefix = f"e{ep_num:03d}"
+    rows = [row for row in app.assets.active_list(project_id)
+            if row["name"].startswith(prefix)]
+    shot_re = re.compile(rf"^{prefix}_shot(\d+)$")
+    line_re = re.compile(rf"^{prefix}_line(\d+)$")
+    clip_re = re.compile(rf"^{prefix}_scene(\d+)$")
+    out = {"images": {}, "first": {}, "last": {}, "videos": {},
+           "video_audio": {}, "video_providers": {}, "voices": {},
+           "cover": None, "final": None,
+           "titles": [], "clips": [], "review_board": None}
+    kind_map = {"image": "images", "first_frame": "first",
+                "last_frame": "last", "video": "videos"}
+    for row in rows:
+        kind, name = row["kind"], row["name"]
+        url = _versioned(_artifact_url(app, row["uri"]), row)
+        shot = shot_re.match(name)
+        if shot and kind in kind_map:
+            shot_no = int(shot.group(1))
+            out[kind_map[kind]][shot_no] = url
+            if kind == "video":
+                meta = json.loads(row["meta"] or "{}")
+                out["video_audio"][shot_no] = bool(
+                    meta.get("audio_in_video"))
+                out["video_providers"][shot_no] = meta.get("provider", "")
+            continue
+        line = line_re.match(name)
+        if line and kind == "voice":
+            out["voices"][int(line.group(1))] = url
+            continue
+        if kind == "cover" and name == prefix:
+            out["cover"] = url
+        elif kind == "edit" and name == f"{prefix}_final":
+            out["final"] = url
+        elif kind == "review_board" and name == prefix:
+            out["review_board"] = url
+        elif kind == "title" and name == prefix:
+            out["titles"] = json.loads(row["meta"]).get("candidates", [])
+        elif kind == "clip":
+            clip = clip_re.match(name)
+            if clip:
+                out["clips"].append(
+                    {"scene_no": int(clip.group(1)), "url": url})
+    out["clips"].sort(key=lambda c: c["scene_no"])
+    # 人物立绘与场景概念图(项目级资产,跨集复用)
+    def latest_rows(kind):
+        return app.assets.active_list(project_id, kind=kind)
+
+    designs = {
+        row["name"]: json.loads(row["meta"] or "{}").get("design")
+        for row in latest_rows("character")}
+    out["cast_art"] = [
+        {"asset_id": row["id"], "kind": row["kind"], "name": row["name"],
+         "url": _versioned(_artifact_url(app, row["uri"]), row),
+         "role": json.loads(row["meta"]).get("role", ""),
+         "design": designs.get(row["name"])}
+        for row in latest_rows("character_art")]
+    out["scene_art"] = [
+        {"asset_id": row["id"], "kind": row["kind"], "name": row["name"],
+         "url": _versioned(_artifact_url(app, row["uri"]), row)}
+        for row in latest_rows("scene_art")]
+    out["prop_art"] = [
+        {"asset_id": row["id"], "kind": row["kind"], "name": row["name"],
+         "url": _versioned(_artifact_url(app, row["uri"]), row),
+         "meta": json.loads(row["meta"] or "{}")}
+        for row in latest_rows("prop_identity")]
+    # 人物资产套件(四视图/特写/特征/妆容/服装/服装细节)按角色分组
+    sheets = {}
+    for row in latest_rows("character_sheet"):
+        meta = json.loads(row["meta"] or "{}")
+        sheets.setdefault(meta.get("character", ""), []).append({
+            "asset_id": row["id"], "kind": row["kind"],
+            "name": row["name"], "sheet": meta.get("sheet", ""),
+            "label": meta.get("label", ""),
+            "url": _versioned(_artifact_url(app, row["uri"]), row)})
+    out["character_sheets"] = sheets
+    out["references"] = [
+        {"asset_id": row["id"], "kind": row["kind"], "name": row["name"],
+         "attach_to": json.loads(row["meta"] or "{}").get("attach_to", ""),
+         "note": json.loads(row["meta"] or "{}").get("note", ""),
+         "reference_role": json.loads(row["meta"] or "{}").get(
+             "reference_role", ""),
+         "url": _versioned(_artifact_url(app, row["uri"]), row)}
+        for row in latest_rows("reference")]
+    out["inner_personas"] = [
+        {"asset_id": row["id"], "kind": row["kind"], "name": row["name"],
+         "url": _versioned(_artifact_url(app, row["uri"]), row),
+         "meta": json.loads(row["meta"] or "{}")}
+        for row in latest_rows("inner_persona")]
+    out["image_assets"] = _image_asset_catalog(app, project_id)
+    return out
+
+
+def _nonblocking_story_status(status, message, **extra):
+    """Return one fail-soft story-intelligence view status.
+
+    These values are deliberately review-only.  They must never be reused as
+    production task, gate, or episode status values.
+    """
+    return {
+        "kind": "review",
+        "production_blocking": False,
+        "available": status in {"ready", "advisory", "stale"},
+        "status": status,
+        "message": message,
+        **extra,
+    }
+
+
+def _saved_script_review_payload(app, episode_id, script_version):
+    """Expose an independently produced review without manufacturing one.
+
+    A detail GET has no reviewer run, evidence, or model call of its own, so it
+    may only read a saved review document.  Invalid and stale documents remain
+    visible as advice states and never become production failures.
+    """
+    saved, document_version = app.projects.latest_document(
+        episode_id, "script_review")
+    if saved is None:
+        return _nonblocking_story_status(
+            "pending", "待独立评审 · 不影响生产",
+            document_version=document_version)
+    try:
+        document = review_document(saved)
+        if (document.get("schema") == "aifos.story-review-pending/v1"
+                or document.get("status") == "pending"):
+            message = str(document.get("reason") or "").strip()
+            return _nonblocking_story_status(
+                "pending",
+                ((message + " · ") if message else "")
+                + "待独立评审 · 不影响生产",
+                document_version=document_version)
+        if document.get("schema") != "aifos.story-review/v1":
+            raise ValueError("独立评审 schema 不匹配")
+        generator_run = str(document.get("generator_run_id") or "").strip()
+        reviewer_run = str(document.get("reviewer_run_id") or "").strip()
+        reviewer_source = str(document.get("reviewer_source") or "").strip()
+        if not generator_run or not reviewer_run or generator_run == reviewer_run:
+            raise ValueError("独立评审必须来自不同于编剧生成的运行")
+        if reviewer_source.lower() in {
+                "", "generator", "self", "self_report", "生成器", "自评"}:
+            raise ValueError("独立评审来源无效")
+        dimensions = document.get("dimensions")
+        if not isinstance(dimensions, list) or len(dimensions) != 5:
+            raise ValueError("独立评审必须完整提供五维")
+    except (TypeError, ValueError) as exc:
+        return _nonblocking_story_status(
+            "invalid", f"独立评审记录无效：{exc} · 不影响生产",
+            document_version=document_version)
+
+    current_version = str(script_version or "")
+    review_version = str(document.get("script_version") or "")
+    if not current_version or review_version != current_version:
+        return _nonblocking_story_status(
+            "stale", "基于旧剧本 · 建议复评 · 不影响生产",
+            document_version=document_version, review=document)
+    return _nonblocking_story_status(
+        "ready", "已完成独立评审 · 非生产门禁",
+        document_version=document_version, review=document)
+
+
+def _previous_episode_continuity_payload(app, episode, project_id):
+    """Derive advice from the exact preceding episode, never a distant one."""
+    previous_number = int(episode["number"]) - 1
+    if previous_number < 1:
+        return _nonblocking_story_status(
+            "not_applicable", "本集没有前集 · 非生产门禁")
+    previous = app.db.query_one(
+        "SELECT id, number FROM episodes WHERE project_id=? AND number=?",
+        (project_id, previous_number))
+    if previous is None:
+        return _nonblocking_story_status(
+            "unavailable", "未找到紧邻前集 · 不影响生产",
+            previous_episode_number=previous_number)
+    previous_script, _ = app.projects.latest_document(
+        previous["id"], "script")
+    previous_storyboard, _ = app.projects.latest_document(
+        previous["id"], "storyboard")
+    previous_continuity, _ = app.projects.latest_document(
+        previous["id"], "continuity")
+    try:
+        document = review_document(derive_episode_continuity_input(
+            previous_episode_id=str(previous["id"]),
+            previous_script=previous_script or {},
+            previous_storyboard=previous_storyboard or {},
+            previous_continuity=previous_continuity or {},
+        ))
+    except (TypeError, ValueError) as exc:
+        return _nonblocking_story_status(
+            "unavailable", f"前集连续性暂不可用：{exc} · 不影响生产",
+            previous_episode_id=previous["id"],
+            previous_episode_number=previous["number"])
+    has_saved_facts = bool(
+        document.get("states") or document.get("unresolved_hooks"))
+    return _nonblocking_story_status(
+        "ready" if has_saved_facts else "advisory",
+        ("已读取前集出口状态 · 非生产门禁" if has_saved_facts
+         else "前集资料不完整，请人工核对 · 不影响生产"),
+        previous_episode_id=previous["id"],
+        previous_episode_number=previous["number"], review=document)
+
+
+def _story_intelligence_payload(
+        app, episode, project, storyboard, storyboard_version,
+        script_version, artifacts):
+    """Build deterministic, read-only story views for the episode payload."""
+    result = {
+        "schema": "aifos.story-intelligence-view/v1",
+        "kind": "review",
+        "production_blocking": False,
+        "status": "partial",
+        "director_review": None,
+        "nine_grid_browser": None,
+    }
+    # The grid may only receive browser-safe artifact URLs.  Absolute paths or
+    # non-artifact URLs are omitted rather than leaking into the review model.
+    safe_keyframes = {
+        shot_no: url for shot_no, url in (artifacts.get("images") or {}).items()
+        if isinstance(url, str) and url.startswith("/artifacts/")
+    }
+    try:
+        documents = build_storyboard_review_documents(
+            episode_id=str(episode["id"]),
+            storyboard=storyboard or {"shots": []},
+            keyframes=safe_keyframes,
+            storyboard_version=storyboard_version or "unknown",
+        )
+        result["director_review"] = review_document(
+            documents["director_review"])
+        result["nine_grid_browser"] = review_document(
+            documents["nine_grid_browser"])
+        result["status"] = "ready" if storyboard else "partial"
+    except (TypeError, ValueError) as exc:
+        result["director_review_status"] = _nonblocking_story_status(
+            "unavailable", f"全集导演摘要暂不可用：{exc} · 不影响生产")
+        result["nine_grid_status"] = _nonblocking_story_status(
+            "unavailable", f"九宫格暂不可用：{exc} · 不影响生产")
+
+    try:
+        result["cross_episode_continuity"] = (
+            _previous_episode_continuity_payload(
+                app, episode, project["id"]))
+    except Exception as exc:  # review enrichment must never break production GET
+        result["cross_episode_continuity"] = _nonblocking_story_status(
+            "unavailable", f"跨集连续性暂不可用：{exc} · 不影响生产")
+    try:
+        result["script_independent_review"] = _saved_script_review_payload(
+            app, episode["id"], script_version)
+    except Exception as exc:  # corrupt advisory data also fails soft
+        result["script_independent_review"] = _nonblocking_story_status(
+            "unavailable", f"独立剧本评审暂不可用：{exc} · 不影响生产")
+    return result
+
+
+def _current_render_plan_items(render_plan):
+    """返回当前有效清单，并屏蔽已废止的母资产历史 QC。"""
+    current = []
+    for item in (render_plan or {}).get("items") or []:
+        if item.get("category") == "character_candidate":
+            index = item.get("candidate_index")
+            if not index:
+                parts = str(item.get("id") or "").rsplit(":", 1)
+                index = parts[-1] if len(parts) == 2 else 0
+            try:
+                if int(index or 0) > 4:
+                    continue
+            except (TypeError, ValueError):
+                pass
+        visible = copy.deepcopy(item)
+        if visible.get("category") == "shot_image":
+            _promote_visible_candidate_progress(visible)
+        if visible.get("category") in {
+                "character_candidate", "character_art",
+                "character_sheet", "scene_art"}:
+            # 初始母资产不做视觉质检。旧计划里的失败 QC 只属于历史
+            # 运行记录，不得继续污染当前生产清单和失败徽标。
+            visible.pop("qc", None)
+        current.append(visible)
+    return current
+
+
+def _promote_visible_candidate_progress(item):
+    """Project a legacy stale plan row onto its newest resumable round.
+
+    This is read-only API reconciliation.  New workers persist the same
+    projection atomically in Director; this compatibility path makes already
+    paused episodes immediately truthful before their first resume.
+    """
+    progress = item.get("candidate_progress") or {}
+    if not isinstance(progress, dict):
+        return False
+    progress_id = str(progress.get("candidate_set_id") or "").strip()
+    progress_token = str(
+        progress.get("candidate_set_token") or "").strip()
+    if not progress_id or not progress_token:
+        return False
+    group = item.get("candidate_group") or {}
+    if not isinstance(group, dict):
+        group = {}
+    group_id = str(group.get("candidate_set_id") or "").strip()
+    group_token = str(
+        group.get("candidate_set_token")
+        or item.get("candidate_set_token") or "").strip()
+    try:
+        progress_round = max(
+            1, int(progress.get("generation_round") or 1))
+        group_round = max(
+            0, int(group.get("generation_round") or 0))
+        progress_revision = max(
+            1, int(progress.get("candidate_revision") or 1))
+        group_revision = max(
+            0, int(group.get("candidate_revision") or 0))
+    except (TypeError, ValueError):
+        return False
+    same_group = bool(
+        group_id == progress_id and group_token == progress_token)
+    if (str(item.get("status") or "") in {"done", "reused"}
+            and group.get("complete") is True):
+        # Final promotion happens after the last live callback and adds the
+        # authoritative AI/manual selection.  Never replace that completed
+        # group with its immediately preceding progress snapshot.
+        return False
+    active = str(item.get("status") or "") in {
+        "pending", "generating", "retrying", "technical_incomplete",
+        "failed",
+    }
+    if (not same_group and not (
+            active and (
+                progress_round > group_round
+                or progress_revision > group_revision))):
+        return False
+
+    if group and not same_group and group_id != progress_id:
+        history = list(item.get("candidate_group_history") or [])
+        identity = (group_id, group_token)
+        if not any(
+                isinstance(row, dict)
+                and (
+                    str(row.get("candidate_set_id") or ""),
+                    str(row.get("candidate_set_token") or ""),
+                ) == identity for row in history):
+            retired = copy.deepcopy(group)
+            retired.update({
+                "retired_reason": "superseded_by_new_candidate_round",
+                "replaced_by_candidate_set_id": progress_id,
+                "replaced_by_candidate_set_token": progress_token,
+                "render_qc": copy.deepcopy(item.get("qc")),
+            })
+            history.append(retired)
+            item["candidate_group_history"] = history
+
+    candidates = [
+        copy.deepcopy(row)
+        for row in (progress.get("candidates") or [])
+        if isinstance(row, dict)
+    ]
+    try:
+        count = int(progress.get("candidate_count")) \
+            if "candidate_count" in progress else len(candidates)
+    except (TypeError, ValueError):
+        count = len(candidates)
+    live_group = copy.deepcopy(progress)
+    state = live_group.pop("resume_state", None) or {}
+    live_group["progress_schema"] = str(
+        live_group.get("schema") or "")
+    live_group["schema"] = "aifos.shot-candidate-group/v1"
+    live_group["live_progress"] = True
+    live_group["candidate_count"] = count
+    live_group["candidates"] = candidates
+    round_history = (
+        state.get("round_history") if isinstance(state, dict) else []) or []
+    if round_history:
+        live_group["candidate_round_history"] = copy.deepcopy(
+            round_history)
+        item["candidate_round_history"] = copy.deepcopy(round_history)
+
+    resume_payload = (
+        state.get("resume_payload") if isinstance(state, dict) else {}) or {}
+    if not isinstance(resume_payload, dict):
+        resume_payload = {}
+    prompt = str(
+        progress.get("prompt_optimized")
+        or progress.get("prompt_used")
+        or progress.get("prompt")
+        or resume_payload.get("prompt_compact")
+        or resume_payload.get("prompt") or "").strip()
+    original = str(
+        progress.get("prompt_aifos_original")
+        or resume_payload.get("prompt_aifos_original")
+        or resume_payload.get("_reference_prompt_base")
+        or resume_payload.get("prompt") or prompt).strip()
+    item.update({
+        "candidate_group": live_group,
+        "candidate_set_id": progress_id,
+        "candidate_set_token": progress_token,
+        "candidate_revision": progress_revision,
+        "contract_revision": int(
+            progress.get("contract_revision") or 1),
+        "candidate_count": count,
+        "candidate_uris": [
+            str(row.get("uri") or "") for row in candidates
+            if str(row.get("uri") or "")],
+        "generation_round": progress_round,
+        "candidate_completed_count": int(
+            progress.get("completed_count") or 0),
+        "candidate_expected_count": int(
+            progress.get("expected_count") or CANDIDATES_PER_SHOT),
+        "candidate_generation_status": str(
+            progress.get("status") or "generating"),
+        "technical_incomplete": bool(
+            progress.get("technical_incomplete")),
+        "selection_required": bool(
+            progress.get("selection_required")),
+    })
+    if prompt:
+        item.update({
+            "prompt": prompt,
+            "prompt_optimized": prompt,
+            "prompt_used": prompt,
+            "prompt_aifos_original": original,
+            "prompt_used_hash": hashlib.sha256(json.dumps(
+                prompt, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":")).encode("utf-8")).hexdigest(),
+        })
+    if isinstance(progress.get("selection"), dict):
+        item["selection"] = copy.deepcopy(progress["selection"])
+    elif not same_group:
+        item.pop("selection", None)
+    if not same_group:
+        item.pop("qc", None)
+        item.pop("output_uri", None)
+    return True
+
+
+def _production_progress(app, episode, render_plan):
+    """把图片清单换算成可核验的实时进度。
+
+    render_plan 的 ``done`` 在资产登记前会短暂先落盘，历史异常中也可能
+    永久残留；因此完成数只认资产中心里仍有效且文件真实存在的正式资产，
+    不能仅凭清单状态把一张不存在的图展示为已完成。
+    """
+    project_id = int(episode["project_id"])
+    episode_id = int(episode["id"])
+    episode_number = int(episode["number"])
+    plan_items = _current_render_plan_items(render_plan)
+    running_task = app.db.query_one(
+        "SELECT stage, name, status, updated_at FROM tasks "
+        "WHERE episode_id=? AND status='running' "
+        "ORDER BY id DESC LIMIT 1", (episode_id,))
+    running_run = app.db.query_one(
+        "SELECT id, action FROM production_runs WHERE episode_id=? "
+        "AND status IN ('running', 'cancelling') "
+        "ORDER BY id DESC LIMIT 1", (episode_id,))
+    live_run = running_task is not None or running_run is not None
+    # 「整集生产中」与「有任务在跑」必须分开:单张重画也会建一条 run,
+    # 若混为一谈,提交第二张时前端会以为在生产而先发暂停,把第一张正在
+    # 重画的任务直接打断。
+    production_running = (
+        running_run is not None
+        and str(running_run["action"] or "") in PRODUCTION_ACTIONS)
+    selection_mode = _selection_mode_enabled(app)
+    if selection_mode:
+        plan_items = [
+            _selection_mode_present_item(copy.deepcopy(item))
+            for item in plan_items
+        ]
+    status_keys = (
+        "done", "reused", "pending", "generating", "retrying",
+        "awaiting_selection", "regenerating_candidates",
+        "technical_incomplete", "awaiting_human", "failed",
+    )
+    category_labels = {
+        "character_candidate": "人物候选",
+        "prop_candidate": "道具候选",
+        "character_art": "人物立绘",
+        "character_sheet": "人物设定图",
+        "scene_art": "场景图",
+        "shot_image": "关键帧",
+        "frames": "首尾帧",
+    }
+    assets = {
+        (row["kind"], row["name"]): row
+        for row in app.assets.active_list(project_id)
+    }
+
+    def valid_uri(uri):
+        uri = str(uri or "").strip()
+        return bool(uri) and (
+            uri.startswith(("http://", "https://")) or Path(uri).is_file())
+
+    def has_asset(kind, name):
+        row = assets.get((kind, name))
+        return row is not None and valid_uri(row["uri"])
+
+    def item_has_formal_asset(item):
+        """按 render_plan 项定位其唯一正式资产；失败稿 output_uri 不算。"""
+        category = str(item.get("category") or "")
+        shot_no = item.get("shot_no")
+        try:
+            shot_no = int(shot_no) if shot_no is not None else None
+        except (TypeError, ValueError):
+            shot_no = None
+        shot_name = (
+            f"e{int(episode_number):03d}_shot{shot_no:03d}"
+            if shot_no is not None else "")
+        if category == "shot_image":
+            return bool(shot_name) and has_asset("image", shot_name)
+        if category == "frames":
+            return bool(shot_name) and (
+                has_asset("first_frame", shot_name)
+                and has_asset("last_frame", shot_name))
+        if category == "character_art":
+            name = str(item.get("name") or item.get("id", "").split(
+                ":", 1)[-1])
+            return has_asset("character_art", name)
+        if category == "scene_art":
+            name = str(item.get("name") or item.get("id", "").split(
+                ":", 1)[-1])
+            return has_asset("scene_art", name)
+        if category == "character_sheet":
+            name = str(item.get("name") or "")
+            sheet = str(item.get("sheet") or "")
+            if not (name and sheet):
+                parts = str(item.get("id") or "").split(":")
+                if len(parts) >= 3:
+                    name, sheet = ":".join(parts[1:-1]), parts[-1]
+            return bool(name and sheet) and has_asset(
+                "character_sheet", f"{name}:{sheet}")
+        if category == "character_candidate":
+            name = str(item.get("name") or "")
+            index = item.get("candidate_index")
+            if not (name and index):
+                parts = str(item.get("id") or "").split(":")
+                if len(parts) >= 3:
+                    name, index = ":".join(parts[1:-1]), parts[-1]
+            try:
+                asset_name = f"{name}:{int(index):02d}"
+            except (TypeError, ValueError):
+                return False
+            return bool(name) and has_asset("character_candidate", asset_name)
+        if category == "prop_candidate":
+            name = str(item.get("name") or "")
+            index = item.get("candidate_index")
+            if not (name and index):
+                parts = str(item.get("id") or "").split(":")
+                if len(parts) >= 3:
+                    name, index = ":".join(parts[1:-1]), parts[-1]
+            try:
+                asset_name = f"{name}:{int(index):02d}"
+            except (TypeError, ValueError):
+                return False
+            return bool(name) and has_asset("prop_candidate", asset_name)
+        # 新分类可显式声明正式资产映射，避免默认相信 output_uri。
+        return bool(
+            item.get("asset_kind") and item.get("asset_name")
+            and has_asset(str(item["asset_kind"]), str(item["asset_name"])))
+
+    def item_is_downstream_usable(item, formal_asset):
+        """正式文件存在后仍须通过当前镜头合同，才能交给下游。
+
+        ``generated`` 与 ``usable`` 必须分开：前者回答“图是否已经画出”，
+        后者回答“当前版本是否已通过质检并能进入首尾帧/Seedance”。
+        初始人物和场景母资产没有逐图 QC，登记成功即可使用。
+        """
+        if not formal_asset:
+            return False
+        if str(item.get("category") or "") not in {"shot_image", "frames"}:
+            return True
+        if selection_mode:
+            if str(item.get("category") or "") == "shot_image":
+                # 选片模式的唯一门禁是：本轮候选 token 已被人工/AI 明确
+                # 选择，且该选择已经晋升为正式资产。内容 QC 仅作建议，
+                # 不能重新把产线变回阻断式。
+                return (
+                    _candidate_group_current_selection(item) is not None
+                    or _selection_mode_best_effort_promoted(item)
+                    or (
+                        str(item.get("status") or "") == "reused"
+                        and not item.get("invalidated_previous_output")
+                        and not item.get("contract_recheck")))
+            return not (
+                item.get("invalidated_previous_output")
+                or item.get("contract_recheck"))
+        qc = item.get("qc") or {}
+        if not qc:
+            return not (
+                item.get("invalidated_previous_output")
+                or item.get("contract_recheck"))
+        if qc.get("passed") is not True or qc.get("stale"):
+            return False
+        required = (
+            "identity_checked", "identity_match",
+            "gender_checked", "gender_match",
+            "count_checked", "count_match",
+            "physical_logic_checked", "physical_logic_match",
+            "spatial_logic_checked", "spatial_logic_match",
+        )
+        return all(qc.get(field) is True for field in required)
+
+    categories = {}
+    active_items = []
+    issues = []
+    timestamp = time.time()
+    for item in plan_items:
+        category = str(item.get("category") or "other")
+        stats = categories.setdefault(category, {
+            "category": category,
+            "label": category_labels.get(category, category),
+            "total": 0,
+            **{key: 0 for key in status_keys},
+            "usable": 0,
+            "generated": 0,
+            "awaiting_review": 0,
+            "needs_repair": 0,
+            "queued": 0,
+            "not_generated": 0,
+            "unverified_done": 0,
+            "percent": 0,
+        })
+        stats["total"] += 1
+        raw_status = str(item.get("status") or "pending")
+        status = {
+            "running": "generating",
+            "retry": "retrying",
+        }.get(raw_status, raw_status)
+        if status not in status_keys:
+            status = "pending"
+        active_statuses = {
+            "generating", "retrying", "regenerating_candidates"}
+        if status in active_statuses and not live_run:
+            issues.append({
+                "item_id": item.get("id", ""),
+                "category": category,
+                "shot_no": item.get("shot_no"),
+                "label": item.get("label", ""),
+                "status": "stale_active",
+                "issues": ["任务已经结束，此项不再生产中，已按待续产统计"],
+            })
+            status = "pending"
+        formal_asset = item_has_formal_asset(item)
+        output_exists = valid_uri(item.get("output_uri"))
+        candidate_outputs = [
+            row for row in ((item.get("candidate_group") or {}).get(
+                "candidates") or [])
+            if isinstance(row, dict) and valid_uri(row.get("uri"))]
+        candidate_generated = bool(candidate_outputs)
+        downstream_usable = item_is_downstream_usable(item, formal_asset)
+        if status in ("done", "reused"):
+            if formal_asset:
+                stats[status] += 1
+                stats["generated"] += 1
+                if downstream_usable:
+                    stats["usable"] += 1
+                else:
+                    stats["awaiting_review"] += 1
+            else:
+                stats["unverified_done"] += 1
+                issues.append({
+                    "item_id": item.get("id", ""),
+                    "category": category,
+                    "shot_no": item.get("shot_no"),
+                    "label": item.get("label", ""),
+                    "status": "unverified_done",
+                    "issues": ["清单标记完成，但未找到可用的正式资产"],
+                })
+        else:
+            stats[status] += 1
+            if formal_asset or output_exists or candidate_generated:
+                stats["generated"] += 1
+
+        if downstream_usable:
+            pass
+        elif status in active_statuses:
+            pass
+        elif status == "awaiting_selection":
+            stats["awaiting_review"] += 1
+        elif status == "technical_incomplete":
+            stats["needs_repair"] += 1
+        elif status in ("awaiting_human", "failed"):
+            stats["needs_repair"] += 1
+        elif formal_asset or output_exists:
+            stats["awaiting_review"] += (
+                0 if status in ("done", "reused") else 1)
+        elif status == "pending" and live_run:
+            stats["queued"] += 1
+        else:
+            stats["not_generated"] += 1
+
+        if status in active_statuses:
+            try:
+                started_at = float(item.get("started_at") or timestamp)
+            except (TypeError, ValueError):
+                started_at = timestamp
+            elapsed = round(max(0.0, timestamp - started_at), 1)
+            active_items.append({
+                "item_id": item.get("id", ""),
+                "category": category,
+                "category_label": stats["label"],
+                "shot_no": item.get("shot_no"),
+                "label": item.get("label", ""),
+                "status": status,
+                "started_at": started_at,
+                "elapsed": elapsed,
+                # 超过停滞阈值(1800s,与产线停滞检测同口径)仍在"生成中"
+                # 大概率是遗留认领——秒表继续走会误导用户"没卡住"。
+                "stale": elapsed > 1800,
+            })
+        if status in ("awaiting_human", "failed", "technical_incomplete"):
+            qc = item.get("qc") or {}
+            item_issues = list(qc.get("issues") or [])
+            if status == "technical_incomplete" and not item_issues:
+                errors = (item.get("candidate_group") or {}).get(
+                    "candidate_errors") or []
+                item_issues = [
+                    str(row.get("error") or "候选图技术生成失败")
+                    for row in errors if isinstance(row, dict)]
+            if not item_issues and item.get("error"):
+                item_issues = [item["error"]]
+            issues.append({
+                "item_id": item.get("id", ""),
+                "category": category,
+                "shot_no": item.get("shot_no"),
+                "label": item.get("label", ""),
+                "status": status,
+                "issues": item_issues,
+            })
+
+    overall = {
+        "total": 0,
+        **{key: 0 for key in status_keys},
+        "usable": 0,
+        "generated": 0,
+        "awaiting_review": 0,
+        "needs_repair": 0,
+        "queued": 0,
+        "not_generated": 0,
+        "unverified_done": 0,
+        "percent": 0,
+    }
+    ordered_categories = []
+    for category in categories.values():
+        category["percent"] = round(
+            category["usable"] * 100 / category["total"], 1
+        ) if category["total"] else 0
+        ordered_categories.append(category)
+        for key in (
+                "total", *status_keys, "usable", "generated",
+                "awaiting_review", "needs_repair", "queued",
+                "not_generated", "unverified_done"):
+            overall[key] += int(category[key])
+    overall["percent"] = round(
+        overall["usable"] * 100 / overall["total"], 1
+    ) if overall["total"] else 0
+    if running_task is not None:
+        current_stage = str(running_task["stage"])
+        current_stage_label = str(running_task["name"])
+    elif active_items:
+        current_stage = str(active_items[0]["category"])
+        current_stage_label = (
+            f"{active_items[0]['category_label']}生产")
+    elif running_run is not None:
+        current_stage = str(running_run["action"] or "production")
+        current_stage_label = {
+            "regen_image": "图片定向修改",
+            "redo_items": "批量补画",
+            "video_regen": "视频定向修改",
+            "produce": "继续制作",
+        }.get(current_stage, "生产任务")
+    else:
+        current_stage = str(episode["status"] or "")
+        current_stage_label = current_stage
+    def parallel_limit(key, default):
+        try:
+            value = int(app.config.get("defaults", key, default=default))
+        except (TypeError, ValueError):
+            value = default
+        return max(1, min(value, 8))
+
+    image_limit = parallel_limit("parallel_images", 3)
+    # parallel_images 是每条图片通道的容量。单 Codex 通道最多 8 路；
+    # A/B/C 三条独立登录通道就显示并实际提供 24 路。
+    try:
+        codex_ready_count = len(app.director._codex_parallel_profiles())
+    except (AttributeError, TypeError, ValueError):
+        codex_ready_count = 0
+    if codex_ready_count:
+        image_limit *= codex_ready_count
+    video_limit = parallel_limit("parallel_videos", 4)
+    image_active = sum(
+        1 for item in active_items
+        if item["category"] in {
+            "character_candidate", "character_art", "character_sheet",
+            "scene_art", "shot_image", "frames",
+        })
+    video_active = 0
+    if running_task is not None and current_stage == "videos":
+        shot_numbers = {
+            int(item["shot_no"]) for item in plan_items
+            if item.get("category") == "shot_image"
+            and item.get("shot_no") is not None
+        }
+        missing_videos = sum(
+            1 for shot_no in shot_numbers
+            if not has_asset(
+                "video",
+                f"e{episode_number:03d}_shot{shot_no:03d}"))
+        video_active = min(video_limit, missing_videos)
+    overall.update({
+        "running": live_run,
+        "production_running": production_running,
+        "current_stage": current_stage,
+        "current_stage_label": current_stage_label,
+        "parallelism": {
+            "image": {"active": image_active, "limit": image_limit},
+            "video": {"active": video_active, "limit": video_limit},
+        },
+    })
+    return {
+        "updated_at": (render_plan or {}).get("updated_at"),
+        "calculated_at": timestamp,
+        "overall": overall,
+        "categories": ordered_categories,
+        "active_items": active_items,
+        "issues": issues,
+    }
+
+
+def _failure_reason_from_payload(value):
+    """Extract one concise failure reason from stored task/run JSON."""
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return ""
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            return _safe_diagnostic_text(raw, limit=600)
+        return _failure_reason_from_payload(parsed)
+    if isinstance(value, list):
+        for row in reversed(value):
+            reason = _failure_reason_from_payload(row)
+            if reason:
+                return reason
+        return ""
+    if not isinstance(value, dict):
+        return ""
+    for key in ("error", "reason", "message", "summary"):
+        candidate = value.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            return _safe_diagnostic_text(candidate, limit=600)
+    for key in ("detail", "failure", "result"):
+        reason = _failure_reason_from_payload(value.get(key))
+        if reason:
+            return reason
+    for key in ("stages", "gates", "issues"):
+        rows = value.get(key)
+        if not isinstance(rows, list):
+            continue
+        failed_rows = [
+            row for row in rows if isinstance(row, dict)
+            and (str(row.get("status") or "").lower() in {
+                "failed", "qc_failed"} or row.get("passed") is False)]
+        reason = _failure_reason_from_payload(failed_rows or rows)
+        if reason:
+            return reason
+    return ""
+
+
+def _latest_production_failure(app, episode_id):
+    """Return the latest run's real failed stage, never stale plan metadata."""
+    # Single-image redraw/QC/settings jobs also create production_runs rows.
+    # They must neither masquerade as a whole-pipeline failure nor hide the
+    # latest actual production run merely because they finished afterwards.
+    guidance_actions = tuple(sorted(
+        PRODUCTION_ACTIONS - {"regenerate_shot_candidates"}))
+    placeholders = ",".join("?" for _ in guidance_actions)
+    run = app.db.query_one(
+        "SELECT id, action, status, last_stage, error, summary, updated_at "
+        f"FROM production_runs WHERE episode_id=? AND action IN "
+        f"({placeholders}) ORDER BY id DESC LIMIT 1",
+        (int(episode_id), *guidance_actions))
+    if run is None or str(run["status"] or "") != "failed":
+        return None
+    task = app.db.query_one(
+        "SELECT stage, name, error, result, updated_at FROM tasks "
+        "WHERE run_id=? AND status='failed' ORDER BY id DESC LIMIT 1",
+        (int(run["id"]),))
+    stage = str(
+        (task["stage"] if task is not None else "")
+        or run["last_stage"] or "production")
+    labels = {
+        "script": "剧本与制作圣经", "continuity": "连续性圣经",
+        "cast": "人物/场景资产", "storyboard": "五维分镜",
+        "blocking": "空间调度", "images": "关键帧",
+        "text_assets": "文字资产", "frames": "首尾帧",
+        "preflight": "生产门禁", "videos": "Seedance 视频",
+        "voices": "配音与口型", "edit": "剪辑", "qc": "成片质检",
+        "package": "交付包装", "production": "生产",
+    }
+    reason = ""
+    if task is not None:
+        reason = (
+            _failure_reason_from_payload(task["error"])
+            or _failure_reason_from_payload(task["result"]))
+    reason = (
+        reason or _failure_reason_from_payload(run["error"])
+        or _failure_reason_from_payload(run["summary"])
+        or f"{labels.get(stage, stage)}未通过，系统已停止继续消耗额度。")
+    return {
+        "run_id": int(run["id"]),
+        "stage": stage,
+        "stage_label": labels.get(stage, stage),
+        "reason": reason,
+        "action": str(run["action"] or "produce"),
+        "updated_at": (
+            float(task["updated_at"] or 0)
+            if task is not None else float(run["updated_at"] or 0)),
+    }
+
+
+def _keyframe_technical_reason_summary(plan_items):
+    """Summarize technical image failures by affected shots for the UI."""
+    buckets = {}
+    for item in plan_items or []:
+        if (not isinstance(item, dict)
+                or item.get("category") != "shot_image"):
+            continue
+        try:
+            shot_no = int(item.get("shot_no"))
+        except (TypeError, ValueError):
+            continue
+        values = []
+        if item.get("error"):
+            values.append(str(item["error"]))
+        group = item.get("candidate_group") or {}
+        if isinstance(group, dict):
+            values.extend(
+                str(row.get("error") or "")
+                for row in group.get("candidate_errors") or []
+                if isinstance(row, dict))
+        for value in values:
+            lowered = value.lower()
+            if ("pillow" in lowered or "像素解码" in value
+                    or "图片解码器" in value):
+                key = "候选图片已落盘，但旧版缺少本地像素解码器"
+            elif ("没有可用 provider" in lowered
+                  or "没有可用provider" in lowered):
+                key = "图片通道当前没有可用 Provider"
+            elif ("credit_balance_exhausted" in lowered
+                  or "no credits remaining" in lowered):
+                key = "OpenAI 图片 API 余额耗尽"
+            elif "billing_hard_limit_reached" in lowered:
+                key = "OpenAI 图片 API 达到账单硬上限"
+            elif ("incompleteread" in lowered
+                  or "timed out" in lowered or "timeout" in lowered):
+                key = "图片通道传输中断或超时"
+            elif ("codex审核" in value
+                  or ("提示词" in value and "审核" in value)):
+                key = "图片提示词审核尚未完成"
+            elif "等待同一连续" in value:
+                key = "等待上一镜 AI 定稿图作为连续性参考"
+            else:
+                continue
+            buckets.setdefault(key, set()).add(shot_no)
+    return [
+        {"reason": reason, "count": len(shots),
+         "shot_nos": sorted(shots)}
+        for reason, shots in buckets.items()
+    ]
+
+
+def _production_guidance(app, episode, storyboard, render_plan, progress):
+    """根据正式资产门禁给出下一步，而不是照抄可能过期的 episode.status。
+
+    关键帧、首尾帧、视频是严格串行的三道门。某一阶段即使已有部分产物，
+    只要上游没有全部形成可读取的正式资产，就只能展示为 blocked，不能
+    因为数据库曾被写成 awaiting_confirm 而误导用户进入 Seedance。
+    """
+    categories = {
+        item["category"]: item
+        for item in (progress or {}).get("categories", [])
+    }
+    plan_items = [
+        copy.deepcopy(item)
+        for item in (render_plan or {}).get("items") or []
+    ]
+    overall = (progress or {}).get("overall") or {}
+    live_run = bool(overall.get("running"))
+    current_stage = str(overall.get("current_stage") or "")
+    episode_number = int(episode["number"])
+    project_id = int(episode["project_id"])
+    selection_mode = _selection_mode_enabled(app)
+    if selection_mode:
+        plan_items = [
+            _selection_mode_present_item(item) for item in plan_items]
+    technical_reason_summary = _keyframe_technical_reason_summary(plan_items)
+    technical_reason_text = "；".join(
+        f"{row['count']}镜{row['reason']}"
+        for row in technical_reason_summary)
+
+    storyboard_shots = list((storyboard or {}).get("shots") or [])
+    storyboard_numbers = {
+        int(shot["shot_no"])
+        for shot in storyboard_shots
+        if shot.get("shot_no") is not None
+    }
+    plan_numbers = {
+        int(item["shot_no"])
+        for item in plan_items
+        if item.get("category") == "shot_image"
+        and item.get("shot_no") is not None
+    }
+    shot_numbers = storyboard_numbers or plan_numbers
+    total_shots = len(shot_numbers)
+    if not total_shots:
+        total_shots = max(
+            int(categories.get("shot_image", {}).get("total") or 0),
+            int(categories.get("frames", {}).get("total") or 0),
+        )
+
+    def valid_uri(uri):
+        uri = str(uri or "").strip()
+        return bool(uri) and (
+            uri.startswith(("http://", "https://")) or Path(uri).is_file())
+
+    active_assets = [
+        row for row in app.assets.active_list(project_id)
+        if valid_uri(row["uri"])
+    ]
+    asset_names = {}
+    for row in active_assets:
+        asset_names.setdefault(str(row["kind"]), set()).add(str(row["name"]))
+
+    def stage_from_category(key, label):
+        source = categories.get(key) or {}
+        total = max(int(source.get("total") or 0), total_shots)
+        usable = int(source.get("usable") or 0)
+        generating = int(source.get("generating") or 0)
+        retrying = int(source.get("retrying") or 0)
+        awaiting_human = int(source.get("awaiting_human") or 0)
+        failed = int(source.get("failed") or 0)
+        return {
+            "key": key,
+            "label": label,
+            "status": "paused",
+            "total": total,
+            "usable": usable,
+            "generated": int(source.get("generated") or usable),
+            "awaiting_review": int(source.get("awaiting_review") or 0),
+            "needs_repair": int(source.get("needs_repair") or (
+                awaiting_human + failed)),
+            "queued": int(source.get("queued") or 0),
+            "not_generated": int(source.get("not_generated") or 0),
+            "pending": int(source.get("pending") or 0),
+            "generating": generating,
+            "retrying": retrying,
+            "awaiting_selection": int(
+                source.get("awaiting_selection") or 0),
+            "regenerating_candidates": int(
+                source.get("regenerating_candidates") or 0),
+            "technical_incomplete": int(
+                source.get("technical_incomplete") or 0),
+            "awaiting_human": awaiting_human,
+            "failed": failed,
+            "remaining": max(0, total - usable),
+            "percent": round(usable * 100 / total, 1) if total else 0,
+            "blocked_by": [],
+            "reason": "",
+        }
+
+    keyframes = stage_from_category("shot_image", "关键帧")
+    frames = stage_from_category("frames", "首尾帧")
+    usable_keyframe_shots = set()
+    usable_frame_shots = set()
+    if shot_numbers:
+        plan_by_stage_and_shot = {
+            (str(item.get("category")), int(item["shot_no"])): item
+            for item in plan_items
+            if item.get("category") in ("shot_image", "frames")
+            and item.get("shot_no") is not None
+        }
+
+        def current_contract_passed(category, shot_no):
+            item = plan_by_stage_and_shot.get((category, int(shot_no)))
+            if not item or item.get("status") not in ("done", "reused"):
+                return False
+            if selection_mode:
+                if category == "shot_image":
+                    return (
+                        _candidate_group_current_selection(item) is not None
+                        or _selection_mode_best_effort_promoted(item)
+                        or (
+                            str(item.get("status") or "") == "reused"
+                            and not item.get("invalidated_previous_output")
+                            and not item.get("contract_recheck")))
+                return not (
+                    item.get("invalidated_previous_output")
+                    or item.get("contract_recheck"))
+            qc = item.get("qc") or {}
+            if not qc:
+                # 兼容明确关闭图片 QC 的历史项目；一旦条目标记过期或进入
+                # 当前合同重检，就绝不能再靠旧资产文件存在直接放行。
+                return not (
+                    item.get("invalidated_previous_output")
+                    or item.get("contract_recheck"))
+            if qc.get("passed") is not True or qc.get("stale"):
+                return False
+            # 新版人物/物理/空间门禁缺一项都不算当前合同正式通过。
+            required = (
+                "identity_checked", "identity_match",
+                "gender_checked", "gender_match",
+                "count_checked", "count_match",
+                "physical_logic_checked", "physical_logic_match",
+                "spatial_logic_checked", "spatial_logic_match",
+            )
+            return all(qc.get(field) is True for field in required)
+
+        usable_keyframe_shots = {
+            shot_no for shot_no in shot_numbers
+            if current_contract_passed("shot_image", shot_no)
+            and f"e{episode_number:03d}_shot{shot_no:03d}"
+            in asset_names.get("image", set())
+        }
+        usable_frame_shots = {
+            shot_no for shot_no in shot_numbers
+            if current_contract_passed("frames", shot_no)
+            and f"e{episode_number:03d}_shot{shot_no:03d}"
+            in asset_names.get("first_frame", set())
+            and f"e{episode_number:03d}_shot{shot_no:03d}"
+            in asset_names.get("last_frame", set())
+        }
+        keyframes["usable"] = len(usable_keyframe_shots)
+        frames["usable"] = len(usable_frame_shots)
+        for stage in (keyframes, frames):
+            stage["remaining"] = max(0, stage["total"] - stage["usable"])
+            stage["percent"] = round(
+                stage["usable"] * 100 / stage["total"], 1
+            ) if stage["total"] else 0
+            accounted = (
+                stage["generating"] + stage["retrying"]
+                + stage["awaiting_selection"]
+                + stage["regenerating_candidates"]
+                + stage["technical_incomplete"]
+                + stage["awaiting_human"] + stage["failed"])
+            stage["pending"] = max(
+                stage["pending"], stage["remaining"] - accounted)
+            bucketed = (
+                stage["usable"] + stage["awaiting_review"]
+                + stage["needs_repair"] + stage["generating"]
+                + stage["retrying"] + stage["queued"]
+                + stage["not_generated"])
+            if bucketed < stage["total"]:
+                stage["not_generated"] += stage["total"] - bucketed
+    script, _script_version = app.projects.latest_document(
+        int(episode["id"]), "script")
+    scene_locations = {
+        scene.get("scene_no"): str(
+            scene.get("physical_scene_id")
+            or scene.get("base_location")
+            or scene.get("location")
+            or "")
+        for scene in (script or {}).get("scenes", [])
+        if isinstance(scene, dict)
+    }
+    continuity_chains = len(build_keyframe_continuity_plan(
+        storyboard_shots, scene_locations)["groups"])
+    image_limit = int(
+        ((overall.get("parallelism") or {}).get("image") or {}).get(
+            "limit") or 1)
+    frames["continuity_chains"] = continuity_chains
+    frames["parallel_capacity"] = min(
+        image_limit, continuity_chains) if continuity_chains else 0
+    frames["note"] = (
+        "当前仅1条连续链，首尾帧将按链串行"
+        if continuity_chains == 1
+        else (
+            f"当前有{continuity_chains}条连续链，最多并行"
+            f"{frames['parallel_capacity']}路"
+            if continuity_chains else "尚未识别到可生产的连续链"
+        )
+    )
+
+    video_prefix = f"e{episode_number:03d}_shot"
+    usable_videos = sum(
+        1 for name in asset_names.get("video", set())
+        if name.startswith(video_prefix))
+    videos = {
+        "key": "videos",
+        "label": "Seedance 视频",
+        "status": "paused",
+        "total": total_shots,
+        "usable": min(usable_videos, total_shots),
+        "generated": min(usable_videos, total_shots),
+        "awaiting_review": 0,
+        "needs_repair": 0,
+        "queued": 0,
+        "not_generated": max(0, total_shots - usable_videos),
+        "pending": max(0, total_shots - usable_videos),
+        "generating": int(
+            ((overall.get("parallelism") or {}).get("video") or {}).get(
+                "active") or 0),
+        "retrying": 0,
+        "awaiting_human": 0,
+        "failed": 0,
+        "remaining": max(0, total_shots - usable_videos),
+        "percent": round(usable_videos * 100 / total_shots, 1)
+        if total_shots else 0,
+        "blocked_by": [],
+        "reason": "",
+    }
+
+    keyframe_assets = {
+        name for name in asset_names.get("image", set())
+    }
+    pending_shots = []
+    issue_shots = []
+    pending_item_ids = []
+    issue_item_ids = []
+    issue_details = []
+    planned_shots = set()
+    for item in plan_items:
+        if item.get("category") != "shot_image":
+            continue
+        try:
+            shot_no = int(item["shot_no"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        planned_shots.add(shot_no)
+        if shot_no in usable_keyframe_shots:
+            continue
+        status = str(item.get("status") or "pending")
+        qc = item.get("qc") or {}
+        if (not selection_mode and (
+                status in ("awaiting_human", "failed")
+                or qc.get("passed") is False)):
+            issue_shots.append(shot_no)
+            item_id = str(item.get("id") or f"shot:{shot_no}")
+            issue_item_ids.append(item_id)
+            hard_failure = qc.get("hard_failure") is not False
+            issue_details.append({
+                "item_id": item_id,
+                "shot_no": shot_no,
+                "hard_failure": hard_failure,
+                "severity": (
+                    "must_fix" if hard_failure else "review_or_accept"),
+                "issues": list(qc.get("issues") or (
+                    [item["error"]] if item.get("error") else [])),
+                "identity_match": qc.get("identity_match"),
+                "gender_match": qc.get("gender_match"),
+                "count_match": qc.get("count_match"),
+            })
+        else:
+            pending_shots.append(shot_no)
+            pending_item_ids.append(str(
+                item.get("id") or f"shot:{shot_no}"))
+    for shot_no in sorted(shot_numbers - planned_shots):
+        if shot_no not in usable_keyframe_shots:
+            pending_shots.append(shot_no)
+            pending_item_ids.append(f"shot:{shot_no}")
+    pending_shots = sorted(set(pending_shots))
+    issue_shots = sorted(set(issue_shots))
+    pending_item_ids = list(dict.fromkeys(pending_item_ids))
+    issue_item_ids = list(dict.fromkeys(issue_item_ids))
+    issue_details.sort(key=lambda item: item["shot_no"])
+    must_fix_issues = [
+        item for item in issue_details if item["severity"] == "must_fix"]
+    review_issues = [
+        item for item in issue_details
+        if item["severity"] == "review_or_accept"]
+
+    keyframes_ready = bool(
+        keyframes["total"]
+        and keyframes["usable"] >= keyframes["total"])
+    frames_ready = bool(
+        frames["total"] and frames["usable"] >= frames["total"])
+    videos_ready = bool(
+        videos["total"] and videos["usable"] >= videos["total"])
+
+    image_stage_active = (
+        live_run and (
+            keyframes["generating"] > 0
+            or keyframes["retrying"] > 0
+            or current_stage in {
+                "images", "shot_image", "redo_items", "regen_image",
+                "produce",
+            }
+        )
+    )
+    keyframe_count_text = (
+        f"已生成 {keyframes['generated']}/{keyframes['total']}，"
+        f"可用于下游 {keyframes['usable']}/{keyframes['total']}。")
+    if keyframes_ready:
+        keyframes["status"] = "ready"
+        keyframes["reason"] = (
+            f"{keyframe_count_text} "
+            + ("全部关键帧已由AI质检或选优并登记；内容观察只记风险、不阻断。"
+               if selection_mode else "全部关键帧均已通过当前合同。"))
+    elif image_stage_active:
+        keyframes["status"] = "active"
+        keyframes["reason"] = (
+            f"关键帧生产任务正在运行；{keyframe_count_text}")
+    elif keyframes["pending"] > 0 or pending_shots:
+        keyframes["status"] = "paused"
+        pending_total = len(pending_shots) or keyframes["pending"]
+        keyframes["reason"] = (
+            f"{keyframe_count_text} 当前没有运行任务；还有 "
+            f"{pending_total} 个镜头"
+            + ("由 Codex 自动归因、优化提示词与参考图；"
+               "每轮单图质检，局部问题编辑当前图，结构问题按锁定参考"
+               "重生1张，最多10轮。"
+               if selection_mode else "可继续生产。")
+            + (f" 当前归因：{technical_reason_text}。"
+               if technical_reason_text else ""))
+    elif keyframes["awaiting_human"] or keyframes["failed"]:
+        keyframes["status"] = "blocked"
+        keyframes["reason"] = (
+            f"{keyframe_count_text} 剩余关键帧均需人工处理，"
+            "暂时无法自动进入下一阶段。")
+    else:
+        keyframes["status"] = "blocked"
+        keyframes["reason"] = (
+            f"{keyframe_count_text} 未找到完整的关键帧正式资产"
+            "或可继续的生产项。")
+
+    keyframe_blockers = []
+    if pending_shots or keyframes["pending"]:
+        keyframe_blockers.append("keyframes_pending")
+    if issue_shots or keyframes["awaiting_human"] or keyframes["failed"]:
+        keyframe_blockers.append("keyframes_awaiting_human")
+
+    if not keyframes_ready:
+        frames["status"] = "blocked"
+        frames["blocked_by"] = keyframe_blockers or ["keyframes_incomplete"]
+        frames["reason"] = "关键帧未全部通过并登记，首尾帧生产门禁未开放。"
+    elif frames_ready:
+        frames["status"] = "ready"
+        frames["reason"] = "全部镜头的首帧和尾帧正式资产均已齐全。"
+    elif (live_run and (
+            frames["generating"] > 0 or frames["retrying"] > 0
+            or current_stage in {"frames", "first_frame", "last_frame"})):
+        frames["status"] = "active"
+        frames["reason"] = "首尾帧生产任务正在运行。"
+    elif frames["pending"] > 0:
+        frames["status"] = "paused"
+        frames["reason"] = "关键帧门禁已通过，可继续生产剩余首尾帧。"
+    else:
+        frames["status"] = "blocked"
+        frames["reason"] = "首尾帧仍有失败或待人工处理项。"
+
+    if not frames_ready:
+        videos["status"] = "blocked"
+        videos["blocked_by"] = ["frames_incomplete"]
+        videos["reason"] = "首尾帧未全部齐全，Seedance 视频生产门禁未开放。"
+    elif videos_ready:
+        videos["status"] = "ready"
+        videos["reason"] = "全部镜头视频正式资产已齐全。"
+    elif (live_run and current_stage in {
+            "videos", "video", "video_regen", "seedance"}):
+        videos["status"] = "active"
+        videos["reason"] = "Seedance 视频任务正在运行。"
+    else:
+        videos["status"] = "paused"
+        videos["reason"] = "首尾帧门禁已通过，可开始 Seedance 视频生产。"
+
+    blockers = []
+    pending_count = len(pending_shots) or keyframes["pending"]
+    issue_count = len(issue_shots) or (
+        keyframes["awaiting_human"] + keyframes["failed"])
+    if pending_count:
+        blockers.append({
+            "code": "keyframes_pending",
+            "stage": "keyframes",
+            "count": pending_count,
+            "shot_nos": pending_shots,
+            "message": (
+                f"还有 {pending_count} 个关键帧由 Codex 自动归因并优化"
+                "提示词与参考图；每轮单图质检，局部问题编辑当前图，"
+                "结构问题按锁定参考重生1张，最多10轮。"
+                if selection_mode
+                else f"还有 {pending_count} 个关键帧尚未生产。")
+                + (f" 当前归因：{technical_reason_text}。"
+                   if technical_reason_text else ""),
+            "technical_reasons": technical_reason_summary,
+        })
+    if issue_count:
+        severity = (
+            "mixed" if must_fix_issues and review_issues
+            else "must_fix" if must_fix_issues else "review_or_accept")
+        blockers.append({
+            "code": "keyframes_awaiting_human",
+            "stage": "keyframes",
+            "count": issue_count,
+            "shot_nos": issue_shots,
+            "hard_failure": bool(must_fix_issues),
+            "severity": severity,
+            "must_fix_count": len(must_fix_issues),
+            "review_or_accept_count": len(review_issues),
+            "message": f"还有 {issue_count} 个关键帧二次质检未通过，需人工处理。",
+        })
+    if not keyframes_ready:
+        current = keyframes
+        phase = "keyframes"
+    elif not frames_ready:
+        current = frames
+        phase = "frames"
+    elif not videos_ready:
+        current = videos
+        phase = "videos"
+    else:
+        current = None
+        phase = "review"
+
+    if current is None:
+        state = "ready"
+        current_step_label = "成片复核"
+        headline = "视频资产已齐全，可以进入成片复核"
+        reason = "关键帧、首尾帧和视频三道正式资产门禁均已通过。"
+        next_action = {
+            "action": "review_videos",
+            "label": "进入成片复核",
+            "count": videos["usable"],
+        }
+    else:
+        state = current["status"]
+        current_step_label = {
+            "keyframes": "关键帧生产",
+            "frames": "首尾帧生产",
+            "videos": "Seedance 视频生产",
+        }[phase]
+        headline = {
+            "active": f"{current_step_label}正在进行",
+            "paused": f"{current_step_label}已暂停",
+            "blocked": f"{current_step_label}被门禁拦截",
+            "ready": f"{current_step_label}已完成",
+        }[state]
+        reason = current["reason"]
+        if phase == "keyframes" and pending_count:
+            next_action = {
+                "action": "resume_keyframes",
+                "label": (
+                    f"自动单图质检并编辑返修（最多10轮 · {pending_count}镜）"
+                    if selection_mode else
+                    f"继续生产 {pending_count} 个非问题关键帧"),
+                "count": pending_count,
+            }
+        elif phase == "keyframes" and issue_count:
+            next_action = {
+                "action": "resolve_image_issues",
+                "label": f"处理 {issue_count} 个问题关键帧",
+                "count": issue_count,
+            }
+        elif phase == "frames":
+            next_action = {
+                "action": "resume_frames",
+                "label": f"继续生产 {frames['remaining']} 组首尾帧",
+                "count": frames["remaining"],
+            }
+        else:
+            next_action = {
+                "action": "start_videos",
+                "label": f"开始生产 {videos['remaining']} 个视频",
+                "count": videos["remaining"],
+            }
+
+    resume_pending_images = {
+        "action": "resume_pending_images",
+        "count": pending_count,
+        "shot_nos": pending_shots,
+        "item_ids": pending_item_ids,
+        "enabled": bool(pending_count and not live_run),
+        "label": (
+            f"自动单图质检并编辑返修（最多10轮 · {pending_count}镜）"
+            if selection_mode else
+            f"继续生产 {pending_count} 个非问题关键帧"),
+    }
+    resolve_image_issues = {
+        "action": "resolve_image_issues",
+        "count": issue_count,
+        "shot_nos": issue_shots,
+        "item_ids": issue_item_ids,
+        "hard_failure": bool(must_fix_issues),
+        "severity": (
+            "mixed" if must_fix_issues and review_issues
+            else "must_fix" if must_fix_issues
+            else "review_or_accept" if review_issues else "none"),
+        "must_fix_count": len(must_fix_issues),
+        "review_or_accept_count": len(review_issues),
+        "items": issue_details,
+        "enabled": bool(issue_count),
+        "label": (
+            f"修正 {len(must_fix_issues)} 个必须修复、"
+            f"复核 {len(review_issues)} 个可放行关键帧"
+            if issue_count else "没有待处理的问题关键帧"),
+    }
+    latest_failure = (
+        None if live_run else _latest_production_failure(
+            app, int(episode["id"])))
+    # 旧版本会在零张技术可用关键帧时仍然进入 frames，随后以数字
+    # ``KeyError`` 结束。历史运行事实仍保留在审计表，但当前生产引导
+    # 必须指向更早、也更真实的关键帧技术缺口，不能让“首尾帧失败: 1”
+    # 盖住可恢复的缺图清单。
+    technical_keyframe_gap = any(
+        item.get("category") == "shot_image"
+        and (
+            str(item.get("status") or "") == "technical_incomplete"
+            or bool((item.get("candidate_group") or {}).get(
+                "technical_incomplete"))
+            or bool((item.get("shot_candidate_group") or {}).get(
+                "technical_incomplete"))
+        )
+        for item in plan_items
+    )
+    if (latest_failure and technical_keyframe_gap
+            and latest_failure.get("stage") in {
+                "text_assets", "frames", "preflight", "videos", "voices",
+                "edit", "qc", "package", "archive"}):
+        latest_failure = None
+    recovery = {
+        "action": "resume_from_checkpoint",
+        "enabled": bool(latest_failure),
+        "label": "从断点自动修复并继续",
+        "detail": (
+            "保留已晋升正式资产；先修复失败阶段，再仅重跑其下游。"
+            if latest_failure else ""),
+    }
+    if latest_failure:
+        # 最新运行事实优先级高于 render_plan。候选组可能来自更早的批次，
+        # 绝不能用“待返修/待选片”盖住本次真正的门禁失败。
+        resume_pending_images["enabled"] = False
+        resolve_image_issues["enabled"] = False
+        blockers.insert(0, {
+            "code": "latest_run_failed",
+            "stage": latest_failure["stage"],
+            "count": 1,
+            "message": latest_failure["reason"],
+        })
+        state = "failed"
+        phase = latest_failure["stage"]
+        current_step_label = latest_failure["stage_label"]
+        headline = f"上次生产在「{current_step_label}」失败"
+        reason = latest_failure["reason"]
+        next_action = {
+            "action": recovery["action"],
+            "label": recovery["label"],
+            "count": 1,
+        }
+    return {
+        "state": state,
+        "phase": phase,
+        "current_step": phase,
+        "current_step_label": current_step_label,
+        "headline": headline,
+        "reason": reason,
+        "next_action": next_action,
+        "next_actions": {
+            "resume_pending_images": resume_pending_images,
+            "resolve_image_issues": resolve_image_issues,
+            "recovery": recovery,
+        },
+        "failure": latest_failure,
+        "blockers": blockers,
+        "issues": issue_details,
+        "actions": {
+            "pending_images": {
+                **resume_pending_images,
+            },
+            "resolve_image_issues": {
+                **resolve_image_issues,
+            },
+            "recovery": recovery,
+        },
+        "can_start_frames": keyframes_ready and not latest_failure,
+        "can_start_videos": (
+            keyframes_ready and frames_ready and not latest_failure),
+        "can_confirm_seedance": (
+            keyframes_ready and frames_ready and not latest_failure),
+        "stages": {
+            "keyframes": keyframes,
+            "frames": frames,
+            "videos": videos,
+        },
+    }
+
+
+def _episode_status_payload(app, episode_id, jobs):
+    """返回适合高频轮询的轻量变更摘要，不加载整集剧本和全部图片合同。"""
+    episode = app.projects.get_episode(episode_id)
+    if episode is None:
+        return None
+    project = app.db.query_one(
+        "SELECT * FROM projects WHERE id=?", (episode["project_id"],))
+    tasks = [dict(row) for row in app.db.query(
+        "SELECT id, stage, status, provider, cost, error, updated_at "
+        "FROM tasks WHERE episode_id=? ORDER BY id",
+        (episode_id,))]
+    document_versions = {
+        row["kind"]: int(row["version"])
+        for row in app.db.query(
+            "SELECT kind, MAX(version) AS version FROM documents "
+            "WHERE episode_id=? GROUP BY kind ORDER BY kind",
+            (episode_id,))
+    }
+    asset_marker = dict(app.db.query_one(
+        "SELECT COUNT(*) AS total, COALESCE(MAX(id), 0) AS max_id, "
+        "COALESCE(SUM(version), 0) AS versions, "
+        "COALESCE(SUM(reuse_count), 0) AS reuse_count, "
+        "COALESCE(SUM(LENGTH(uri) + LENGTH(meta)), 0) AS content_size "
+        "FROM assets WHERE project_id=?",
+        (project["id"],)))
+    out_dir = (app.workspace.artifacts_dir / f"p{project['id']:03d}"
+               / f"e{episode['number']:03d}")
+    plan_path = out_dir / "render_plan.json"
+    try:
+        plan_stat = plan_path.stat()
+        render_plan_marker = {
+            "exists": True,
+            "size": plan_stat.st_size,
+            "mtime_ns": plan_stat.st_mtime_ns,
+        }
+    except OSError:
+        render_plan_marker = {"exists": False, "size": 0, "mtime_ns": 0}
+    relevant_jobs = []
+    for job in jobs.list():
+        if (job.get("title") != project["title"]
+                or int(job.get("episode") or 0) != int(episode["number"])):
+            continue
+        relevant_jobs.append({
+            key: copy.deepcopy(job[key])
+            for key in (
+                "id", "status", "title", "episode", "started_at",
+                "finished_at", "error", "progress",
+                "series_advance_error")
+            if key in job
+        })
+    payload = {
+        "build": BUILD,
+        "episode": dict(episode),
+        "project": {
+            key: project[key] for key in (
+                "id", "title", "status", "kind", "style", "aspect",
+                "style_pack_id")
+        },
+        "tasks": tasks,
+        "jobs": relevant_jobs,
+        "document_versions": document_versions,
+        "asset_marker": asset_marker,
+        "render_plan_marker": render_plan_marker,
+    }
+    signature_source = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    payload["signature"] = hashlib.sha256(signature_source).hexdigest()
+    return payload
+
+
+def _scene3d_bindings(blocking, script):
+    """Bind visible staging zones to one canonical physical scene."""
+    blocking_copy = copy.deepcopy(blocking) if isinstance(blocking, dict) \
+        else {}
+    scenes = blocking_copy.get("scenes")
+    if not isinstance(scenes, list):
+        scenes = []
+        blocking_copy["scenes"] = scenes
+    family_groups = scene_family_groups(script or {})
+    script_scenes = (script or {}).get("scenes") \
+        if isinstance(script, dict) else []
+    script_scenes = script_scenes if isinstance(script_scenes, list) else []
+    script_by_no = {}
+    for scene in script_scenes:
+        if not isinstance(scene, dict):
+            continue
+        try:
+            scene_no = int(scene.get("scene_no"))
+        except (TypeError, ValueError):
+            continue
+        script_by_no.setdefault(scene_no, []).append(scene)
+
+    bindings = []
+    zones_by_physical = {}
+    for index, scene in enumerate(scenes):
+        if not isinstance(scene, dict):
+            continue
+        visible = str(scene.get("location") or scene.get("name") or "").strip()
+        explicit = str(
+            scene.get("physical_scene_id") or scene.get("base_location")
+            or "").strip()
+        physical = explicit or canonical_scene_location(script or {}, visible)
+        if not physical:
+            physical = visible or f"第{index + 1}场"
+        zones = []
+        for value in family_groups.get(physical, []):
+            value = str(value or "").strip()
+            if value and value not in zones:
+                zones.append(value)
+        scene_zones = scene.get("zones")
+        if isinstance(scene_zones, list):
+            for value in scene_zones:
+                value = str(value or "").strip()
+                if value and value not in zones:
+                    zones.append(value)
+        if visible and visible != physical and visible not in zones:
+            zones.append(visible)
+        try:
+            matching_script = script_by_no.get(int(scene.get("scene_no")), [])
+        except (TypeError, ValueError):
+            matching_script = []
+        for scripted in matching_script:
+            scripted_location = str(scripted.get("location") or "").strip()
+            scripted_physical = str(
+                scripted.get("physical_scene_id")
+                or scripted.get("base_location") or "").strip() \
+                or canonical_scene_location(script or {}, scripted_location)
+            if (scripted_physical == physical and scripted_location
+                    and scripted_location not in zones):
+                zones.append(scripted_location)
+        scene["physical_scene_id"] = physical
+        scene["base_location"] = physical
+        scene["zones"] = zones
+        zones_by_physical.setdefault(physical, [])
+        for zone in zones:
+            if zone not in zones_by_physical[physical]:
+                zones_by_physical[physical].append(zone)
+        bindings.append({
+            "location": visible or physical,
+            "physical_scene_id": physical,
+            "zones": zones,
+            "scene_no": scene.get("scene_no"),
+        })
+    return blocking_copy, bindings, zones_by_physical
+
+
+def _latest_named_asset(app, project_id, kind, names):
+    for name in names:
+        name = str(name or "").strip()
+        if not name:
+            continue
+        row = app.assets.latest(project_id, kind, name)
+        if row is not None and row["uri"]:
+            return row, name
+    return None, ""
+
+
+def _scene_model_source(app, project_id, physical_scene_id, zones):
+    canonical = app.assets.latest(
+        project_id, "scene_model", physical_scene_id)
+    if canonical is not None and canonical["uri"]:
+        return canonical, physical_scene_id, canonical
+    aliases = [physical_scene_id, *(zones or [])]
+    source, source_name = _latest_named_asset(
+        app, project_id, "scene_model", aliases)
+    return source, source_name, canonical
+
+
+def _finite_scene3d_number(value, field):
+    if isinstance(value, bool):
+        raise AifosError(f"{field} 必须是有限数")
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise AifosError(f"{field} 必须是有限数") from exc
+    if not math.isfinite(result):
+        raise AifosError(f"{field} 必须是有限数")
+    return result
+
+
+def _apply_scene3d_updates(model, updates):
+    if not isinstance(updates, list) or not updates:
+        raise AifosError("updates 必须是非空数组")
+    objects = model.get("objects") if isinstance(model, dict) else None
+    if not isinstance(objects, list):
+        raise AifosError("场景模型缺少可编辑物体表")
+    by_id = {
+        str(obj.get("object_id")): obj for obj in objects
+        if isinstance(obj, dict) and str(obj.get("object_id") or "").strip()
+    }
+    allowed = {
+        "object_id", "position_3d", "position", "dimensions",
+        "width_m", "height_m", "depth_m", "rotation_y_deg",
+        "support_id", "mount_type",
+    }
+    changed = []
+    seen = set()
+    for index, raw in enumerate(updates, 1):
+        if not isinstance(raw, dict):
+            raise AifosError(f"第 {index} 项更新不是 JSON 对象")
+        unknown = sorted(set(raw) - allowed)
+        if unknown:
+            raise AifosError("不允许修改字段: " + "、".join(unknown))
+        object_id = str(raw.get("object_id") or "").strip()
+        if not object_id or object_id not in by_id:
+            raise AifosError(f"第 {index} 项缺少有效 object_id")
+        if object_id in seen:
+            raise AifosError(f"object_id={object_id} 在同一请求中重复")
+        seen.add(object_id)
+        obj = by_id[object_id]
+        fields = []
+        position_patch = raw.get("position_3d", raw.get("position"))
+        if position_patch is not None:
+            if not isinstance(position_patch, dict) or not position_patch:
+                raise AifosError("position_3d 必须是非空对象")
+            unknown_axes = sorted(set(position_patch) - {"x", "y", "z"})
+            if unknown_axes:
+                raise AifosError("position_3d 含未知坐标: "
+                                 + "、".join(unknown_axes))
+            position = dict(obj.get("position_3d") or {})
+            for axis, value in position_patch.items():
+                position[axis] = _finite_scene3d_number(
+                    value, f"position_3d.{axis}")
+            obj["position_3d"] = position
+            fields.append("position_3d")
+            obj.setdefault("geometry_sources", {})["position"] = \
+                "manual_scene3d_edit"
+        dimensions = raw.get("dimensions")
+        if dimensions is not None:
+            if not isinstance(dimensions, dict):
+                raise AifosError("dimensions 必须是对象")
+            unknown_dimensions = sorted(
+                set(dimensions) - {"width_m", "height_m", "depth_m"})
+            if unknown_dimensions:
+                raise AifosError("dimensions 含未知字段: "
+                                 + "、".join(unknown_dimensions))
+        else:
+            dimensions = {}
+        for field in ("width_m", "height_m", "depth_m"):
+            value = raw[field] if field in raw else dimensions.get(field)
+            if value is None:
+                continue
+            number = _finite_scene3d_number(value, field)
+            if number <= 0:
+                raise AifosError(f"{field} 必须大于 0")
+            obj[field] = number
+            fields.append(field)
+            obj.setdefault("geometry_sources", {})[
+                field.removesuffix("_m")] = "manual_scene3d_edit"
+        if "rotation_y_deg" in raw:
+            obj["rotation_y_deg"] = _finite_scene3d_number(
+                raw["rotation_y_deg"], "rotation_y_deg")
+            fields.append("rotation_y_deg")
+            obj.setdefault("geometry_sources", {})["rotation"] = \
+                "manual_scene3d_edit"
+        if "mount_type" in raw:
+            mount_type = str(raw.get("mount_type") or "").strip()
+            if mount_type not in MOUNT_TYPES:
+                raise AifosError(
+                    "mount_type 必须是 " + "/".join(sorted(MOUNT_TYPES)))
+            obj["mount_type"] = mount_type
+            fields.append("mount_type")
+        if "support_id" in raw:
+            support_value = raw.get("support_id")
+            support_id = (str(support_value).strip()
+                          if support_value is not None else "")
+            if support_id and support_id not in by_id:
+                raise AifosError(f"support_id={support_id} 不存在")
+            if support_id == object_id:
+                raise AifosError("物体不能承托自身")
+            obj["support_id"] = support_id or None
+            fields.append("support_id")
+        if not fields:
+            raise AifosError(f"object_id={object_id} 没有可保存的更改")
+        changed.append({"object_id": object_id, "fields": fields})
+    refresh_scene_model_geometry(model)
+    return changed
+
+
+def _scene3d_save_edits(app, episode_id, request):
+    """Create one immutable scene-model revision with optimistic locking."""
+    if not isinstance(request, dict):
+        raise AifosError("请求体必须是 JSON 对象")
+    episode = app.projects.get_episode(episode_id)
+    if episode is None:
+        return None
+    blocking, _blocking_v = app.projects.latest_document(
+        episode_id, "blocking")
+    script, _script_v = app.projects.latest_document(episode_id, "script")
+    if not isinstance(blocking, dict):
+        raise AifosError("本集尚未生成空间调度")
+    _blocking_view, bindings, zones_by_physical = _scene3d_bindings(
+        blocking, script)
+    requested = str(
+        request.get("physical_scene_id") or request.get("scene_location")
+        or request.get("location") or ""
+    ).strip()
+    if not requested:
+        raise AifosError("缺少 physical_scene_id")
+    binding_map = {
+        item["location"]: item["physical_scene_id"] for item in bindings}
+    physical_scene_id = binding_map.get(
+        requested, canonical_scene_location(script or {}, requested))
+    valid_physical = {
+        item["physical_scene_id"] for item in bindings}
+    if physical_scene_id not in valid_physical:
+        raise AifosError(f"本集不包含物理场景: {requested}")
+    expected = request.get(
+        "expected_revision", request.get("revision"))
+    if (isinstance(expected, bool) or not isinstance(expected, int)
+            or expected < 0):
+        raise AifosError("expected_revision 必须是非负整数")
+    project_id = int(episode["project_id"])
+    zones = zones_by_physical.get(physical_scene_id, [])
+    aliases = list(dict.fromkeys([physical_scene_id, *zones]))
+    out_dir = (app.workspace.artifacts_dir
+               / f"p{project_id:03d}" / "scenes")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    safe = re.sub(r"[^\w.-]+", "_", physical_scene_id,
+                  flags=re.UNICODE).strip("_")[:48] or "scene"
+    with app.db.transaction(immediate=True) as conn:
+        canonical_row = conn.execute(
+            "SELECT * FROM assets WHERE project_id=? AND kind='scene_model' "
+            "AND name=? ORDER BY version DESC LIMIT 1",
+            (project_id, physical_scene_id)).fetchone()
+        actual = int(canonical_row["version"] or 0) if canonical_row else 0
+        if actual != expected:
+            raise DocumentConflictError(
+                f"scene_model:{physical_scene_id}", expected, actual)
+        source_row = canonical_row
+        source_name = physical_scene_id if source_row is not None else ""
+        if source_row is None:
+            for alias in aliases:
+                row = conn.execute(
+                    "SELECT * FROM assets WHERE project_id=? "
+                    "AND kind='scene_model' AND name=? "
+                    "ORDER BY version DESC LIMIT 1",
+                    (project_id, alias)).fetchone()
+                if row is not None and row["uri"]:
+                    source_row, source_name = row, alias
+                    break
+        if source_row is None or not source_row["uri"]:
+            raise AifosError(f"物理场景「{physical_scene_id}」没有可编辑的 scene_model")
+        try:
+            source_model = json.loads(
+                Path(source_row["uri"]).read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError) as exc:
+            raise AifosError("当前 scene_model 文件损坏或不可读") from exc
+        if not isinstance(source_model, dict):
+            raise AifosError("当前 scene_model 不是 JSON 对象")
+        model = normalize_scene_model_contract(
+            source_model, location=physical_scene_id)
+        source_issues = copy.deepcopy(model.get("issues") or [])
+        model["physical_scene_id"] = physical_scene_id
+        model["zones"] = list(zones)
+        changed = _apply_scene3d_updates(
+            model, request.get("updates", request.get("edits")))
+        revision = actual + 1
+        model["asset_version"] = revision
+        model["revision"] = revision
+        model["edited_at"] = time.time()
+        model["edit_provenance"] = {
+            "source": "scene3d_manual_edit",
+            "parent_asset_id": int(source_row["id"]),
+            "parent_asset_name": source_name,
+            "parent_asset_version": int(source_row["version"] or 0),
+            "expected_revision": expected,
+            "changes": changed,
+        }
+        validation = validate_scene_model(model)
+        validation["source_issues"] = source_issues
+        model["source_issues"] = source_issues
+        model["validation"] = validation
+        model["issues"] = validation["issues"]
+        destination = out_dir / (
+            f"scene_model_{safe}_v{revision}_edit_{uuid.uuid4().hex[:8]}.json")
+        destination.write_text(json.dumps(
+            model, ensure_ascii=False, indent=1), encoding="utf-8")
+        meta = {
+            "objects": len(model.get("objects") or []),
+            "issues": len(validation["issues"]),
+            "validation_passed": validation["passed"],
+            "physical_scene_id": physical_scene_id,
+            "zones": zones,
+            "source": "scene3d_manual_edit",
+            "parent_asset_id": int(source_row["id"]),
+            "parent_asset_version": int(source_row["version"] or 0),
+            "real": True,
+        }
+        conn.execute(
+            "INSERT INTO assets(project_id, kind, name, version, uri, meta, "
+            "created_at) VALUES(?,?,?,?,?,?,?)",
+            (project_id, "scene_model", physical_scene_id, revision,
+             str(destination), json.dumps(meta, ensure_ascii=False),
+             time.time()))
+        saved_row = conn.execute(
+            "SELECT * FROM assets WHERE project_id=? AND kind='scene_model' "
+            "AND name=? AND version=?",
+            (project_id, physical_scene_id, revision)).fetchone()
+    if app.assets.on_registered is not None:
+        try:
+            app.assets.on_registered(saved_row)
+        except Exception:
+            pass
+    return {
+        "episode_id": episode_id,
+        "physical_scene_id": physical_scene_id,
+        "zones": zones,
+        "revision": revision,
+        "asset_id": int(saved_row["id"]),
+        "model": model,
+        "render_contract": build_scene_render_contract(
+            model, location=physical_scene_id),
+        "validation": validation,
+    }
+
+
+_SCENE3D_APPEARANCE_LOCK = threading.Lock()
+
+
+def _scene3d_refresh_appearance(app, episode_id, request):
+    """Annotate visible materials/light and append an appearance-only revision."""
+    if not isinstance(request, dict):
+        raise AifosError("请求体必须是 JSON 对象")
+    if not _SCENE3D_APPEARANCE_LOCK.acquire(blocking=False):
+        raise AifosError("另一场景正在识别材质与灯光，请稍候")
+    try:
+        episode = app.projects.get_episode(episode_id)
+        if episode is None:
+            return None
+        blocking, _blocking_v = app.projects.latest_document(
+            episode_id, "blocking")
+        script, _script_v = app.projects.latest_document(episode_id, "script")
+        if not isinstance(blocking, dict):
+            raise AifosError("本集尚未生成空间调度")
+        _view, bindings, zones_by_physical = _scene3d_bindings(
+            blocking, script)
+        requested = str(
+            request.get("physical_scene_id") or request.get("scene_location")
+            or request.get("location") or "").strip()
+        if not requested:
+            raise AifosError("缺少 physical_scene_id")
+        binding_map = {
+            item["location"]: item["physical_scene_id"] for item in bindings}
+        physical = binding_map.get(
+            requested, canonical_scene_location(script or {}, requested))
+        valid_physical = {item["physical_scene_id"] for item in bindings}
+        if physical not in valid_physical:
+            raise AifosError(f"本集不包含物理场景: {requested}")
+        zones = zones_by_physical.get(physical, [])
+        project_id = int(episode["project_id"])
+        source_row, _source_name, _canonical = _scene_model_source(
+            app, project_id, physical, zones)
+        if source_row is None or not source_row["uri"]:
+            raise AifosError(f"物理场景「{physical}」没有可补材质的 scene_model")
+        try:
+            model = json.loads(Path(source_row["uri"]).read_text(
+                encoding="utf-8"))
+        except (OSError, ValueError, TypeError) as exc:
+            raise AifosError("当前 scene_model 文件损坏或不可读") from exc
+        objects = model.get("objects") if isinstance(model, dict) else None
+        if not isinstance(objects, list) or not objects:
+            raise AifosError("当前 scene_model 没有可识别材质的物体")
+        object_names = [str(obj.get("name") or "").strip()
+                        if isinstance(obj, dict) else "" for obj in objects]
+        if not all(object_names):
+            raise AifosError("当前 scene_model 存在无名称物体，无法安全匹配材质")
+        panorama_location = ""
+        panorama_row = None
+        for candidate in dict.fromkeys([physical, *zones, requested]):
+            row = app.director._scene_view_row(
+                project_id, candidate, app.director.SCENE_PANORAMA_KEY)
+            if row is not None:
+                panorama_location, panorama_row = candidate, row
+                break
+        if panorama_row is None:
+            raise AifosError(f"场景「{physical}」没有可读取的 720° 全景母版")
+        out_dir = (app.workspace.artifacts_dir
+                   / f"p{project_id:03d}" / "scenes")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        result = app.director.router.call("scene_annotate", {
+            "location": physical,
+            "panorama_location": panorama_location,
+            "appearance_only": True,
+            "object_names": object_names,
+            "image_uri": str(panorama_row["uri"]),
+            "require_reference_images": True,
+            "reference_manifest": [{
+                "index": 1,
+                "uri": str(panorama_row["uri"]),
+                "label": f"{panorama_location} 720°全景母版",
+                "role": "scene",
+                "binding": "只识别既有物体的可见材质与整场灯光，不改几何",
+            }],
+        }, out_dir)
+        if getattr(result, "provider", "") == "mock":
+            raise AifosError("当前没有可读取全景图的真实视觉通道")
+        try:
+            refreshed = apply_scene_appearance(
+                model, getattr(result, "data", None) or {})
+        except ValueError as exc:
+            raise AifosError(str(exc)) from exc
+        previous = app.assets.latest(
+            project_id, "scene_model", physical, include_deleted=True)
+        revision = int(previous["version"] + 1) if previous else 1
+        refreshed["location"] = physical
+        refreshed["physical_scene_id"] = physical
+        refreshed["zones"] = list(zones)
+        refreshed["asset_version"] = revision
+        refreshed["revision"] = revision
+        refreshed["appearance_analyzed_at"] = time.time()
+        refreshed["appearance_analysis"].update({
+            "provider": getattr(result, "provider", ""),
+            "panorama_asset_id": int(panorama_row["id"]),
+            "panorama_location": panorama_location,
+            "parent_asset_id": int(source_row["id"]),
+            "parent_asset_version": int(source_row["version"] or 0),
+        })
+        safe = re.sub(r"[^\w.-]+", "_", physical,
+                      flags=re.UNICODE).strip("_")[:48] or "scene"
+        destination = out_dir / (
+            f"scene_model_{safe}_v{revision}_appearance_"
+            f"{uuid.uuid4().hex[:8]}.json")
+        destination.write_text(json.dumps(
+            refreshed, ensure_ascii=False, indent=1), encoding="utf-8")
+        row = app.assets.register(
+            project_id, "scene_model", physical, str(destination), meta={
+                "objects": len(objects),
+                "issues": len(refreshed.get("issues") or []),
+                "physical_scene_id": physical,
+                "zones": zones,
+                "source": "panorama_appearance_annotation",
+                "provider": getattr(result, "provider", ""),
+                "parent_asset_id": int(source_row["id"]),
+                "parent_asset_version": int(source_row["version"] or 0),
+                "verified_materials": refreshed["appearance_analysis"][
+                    "verified_materials"],
+                "lighting_verified": refreshed["appearance_analysis"][
+                    "lighting_verified"],
+                "real": True,
+            }, new_version=previous is not None)
+        payload = _scene3d_payload(app, episode_id)
+        payload["appearance_refresh"] = {
+            "physical_scene_id": physical,
+            "revision": int(row["version"]),
+            "asset_id": int(row["id"]),
+            **refreshed["appearance_analysis"],
+        }
+        return payload
+    finally:
+        _SCENE3D_APPEARANCE_LOCK.release()
+
+
+def _scene3d_payload(app, episode_id):
+    """3D 空间查看器数据:blocking 三维调度 + 该场景的 720° 全景母版。
+
+    全景是房间几何真相,blocking 是人和机位在房间里的位置——两者同一
+    坐标系(全景中心 yaw0 = blocking +Z),叠在一起才是完整的空间事实。
+    """
+    episode = app.projects.get_episode(episode_id)
+    if episode is None:
+        return None
+    blocking, blocking_v = app.projects.latest_document(
+        episode_id, "blocking")
+    if blocking is None:
+        return {"episode_id": episode_id, "blocking": None,
+                "panoramas": {}, "scene_models": {},
+                "scene_model_contracts": {},
+                "scene_model_revisions": {}, "physical_scene_ids": {},
+                "scene_zones": {},
+                "render_contracts": {},
+                "message": "本集尚未生成空间调度"}
+    project_id = episode["project_id"]
+    script, _script_v = app.projects.latest_document(episode_id, "script")
+    blocking_view, bindings, scene_zones = _scene3d_bindings(
+        blocking, script)
+    artifacts = app.workspace.artifacts_dir.resolve()
+    panoramas = {}
+    scene_models = {}
+    scene_model_contracts = {}
+    scene_model_revisions = {}
+    physical_scene_ids = {}
+    model_cache = {}
+    panorama_cache = {}
+    locations = []
+    for binding in bindings:
+        location = binding["location"]
+        physical = binding["physical_scene_id"]
+        zones = binding["zones"]
+        if location not in locations:
+            locations.append(location)
+        physical_scene_ids[location] = physical
+        if physical not in model_cache:
+            source_row, source_name, canonical_row = _scene_model_source(
+                app, project_id, physical, zones)
+            raw_model = None
+            model = None
+            if source_row is not None and source_row["uri"]:
+                try:
+                    loaded = json.loads(Path(source_row["uri"]).read_text(
+                        encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        raw_model = loaded
+                        model = normalize_scene_model_contract(
+                            loaded, location=physical)
+                        model["physical_scene_id"] = physical
+                        model["zones"] = list(zones)
+                except (OSError, ValueError, TypeError):
+                    model = None
+            model_cache[physical] = {
+                "model": model,
+                "raw_model": raw_model,
+                "source_row": source_row,
+                "source_name": source_name,
+                "canonical_row": canonical_row,
+            }
+        cached = model_cache[physical]
+        if cached["raw_model"] is not None:
+            scene_models[location] = cached["raw_model"]
+        if cached["model"] is not None:
+            scene_model_contracts[location] = cached["model"]
+        canonical_row = cached["canonical_row"]
+        source_row = cached["source_row"]
+        scene_model_revisions[location] = {
+            "revision": (int(canonical_row["version"] or 0)
+                         if canonical_row is not None else 0),
+            "asset_id": (int(canonical_row["id"])
+                         if canonical_row is not None else None),
+            "physical_scene_id": physical,
+            "zones": list(zones),
+            "source_asset_id": (int(source_row["id"])
+                                if source_row is not None else None),
+            "source_asset_name": cached["source_name"],
+            "source_revision": (int(source_row["version"] or 0)
+                                if source_row is not None else 0),
+            "canonical_fork_required": bool(
+                source_row is not None and canonical_row is None),
+        }
+        if physical not in panorama_cache:
+            panorama_names = [
+                f"{name}::view:panorama"
+                for name in dict.fromkeys([physical, *zones])]
+            row, _row_name = _latest_named_asset(
+                app, project_id, "scene_art", panorama_names)
+            panorama = None
+            if row is not None and row["uri"]:
+                uri = Path(row["uri"]).resolve()
+                try:
+                    rel = uri.relative_to(artifacts)
+                except ValueError:
+                    pass
+                else:
+                    panorama = {
+                        "url": "/artifacts/" + str(rel),
+                        "version": row["version"],
+                        "physical_scene_id": physical,
+                        "zones": list(zones),
+                    }
+            panorama_cache[physical] = panorama
+        if panorama_cache[physical] is not None:
+            panoramas[location] = panorama_cache[physical]
+    render_contracts = {
+        location: build_scene_render_contract(
+            scene_model_contracts.get(location), panoramas.get(location),
+            location=physical_scene_ids.get(location, location))
+        for location in locations
+    }
+    storyboard, _sv = app.projects.latest_document(episode_id, "storyboard")
+    from ..camera_language import MOVEMENT_GEOMETRY, SCALE_GEOMETRY
+    movement_terms = sorted(MOVEMENT_GEOMETRY, key=len, reverse=True)
+    scale_terms = sorted(SCALE_GEOMETRY, key=len, reverse=True)
+    actions = {}
+    for shot in ((storyboard or {}).get("shots") or []):
+        try:
+            shot_no = int(shot.get("shot_no"))
+        except (TypeError, ValueError):
+            continue
+        camera = shot.get("camera")
+        camera_text = ("·".join(
+            str(value) for value in camera.values() if value)
+            if isinstance(camera, dict) else str(camera or ""))
+        dialogue = shot.get("dialogue") or {}
+        try:
+            duration = max(0.5, float(shot.get("duration")))
+        except (TypeError, ValueError):
+            duration = 5.0
+        actions[str(shot_no)] = {
+            "action": str(shot.get("action") or "")[:200],
+            "camera": camera_text[:120],
+            # 动态预演播放器的时间轴与信息条数据
+            "duration": duration,
+            "kind": str(shot.get("kind") or "")[:20],
+            "scene_no": shot.get("scene_no"),
+            "description": str(shot.get("description") or "")[:120],
+            "movement": next(
+                (term for term in movement_terms if term in camera_text), ""),
+            "scale": next(
+                (term for term in scale_terms if term in camera_text), ""),
+            "dialogue": (str(dialogue.get("dialogue") or "")[:80]
+                         if isinstance(dialogue, dict) else ""),
+            "speaker": (str(dialogue.get("character") or "")[:20]
+                        if isinstance(dialogue, dict) else ""),
+        }
+    from ..previz_checks import previz_report
+    return {
+        "episode_id": episode_id,
+        "episode_number": episode["number"],
+        "project_title": (app.db.query_one(
+            "SELECT title FROM projects WHERE id=?", (project_id,))
+            or {"title": ""})["title"],
+        "blocking": blocking_view,
+        "blocking_version": blocking_v,
+        "panoramas": panoramas,
+        "scene_models": scene_models,
+        "scene_model_contracts": scene_model_contracts,
+        "scene_model_revisions": scene_model_revisions,
+        "physical_scene_ids": physical_scene_ids,
+        "scene_zones": scene_zones,
+        "render_contracts": render_contracts,
+        "shot_actions": actions,
+        # 时间维度连贯性:跨镜传送/中途碰撞/交叉相撞/相机穿模(warn级)
+        "previz_checks": previz_report(
+            blocking_view, storyboard, scene_model_contracts),
+    }
+
+
+def _episode_payload(app, episode_id, jobs=None):
+    episode = app.projects.get_episode(episode_id)
+    if episode is None:
+        return None
+    project = app.db.query_one(
+        "SELECT * FROM projects WHERE id=?", (episode["project_id"],))
+    script, script_v = app.projects.latest_document(episode_id, "script")
+    story_analysis, story_analysis_v = app.projects.latest_document(
+        episode_id, "story_analysis")
+    if script is not None and story_analysis is not None:
+        from ..story_analysis import (
+            apply_story_analysis,
+            build_story_analysis,
+        )
+        # 详情接口始终做一次幂等内存规范化，不覆盖用户保存的文档版本。
+        # 除补齐旧字段外，这也会折叠历史版本中反复拼接的人物出图卡，
+        # 让当前项目立即看到简洁视觉提示词。
+        story_analysis = build_story_analysis(
+            script,
+            project["style"] or "",
+            raw=story_analysis,
+            source=story_analysis.get("source") or "legacy_upgrade",
+        )
+        script = apply_story_analysis(copy.deepcopy(script), story_analysis)
+    storyboard, sb_v = app.projects.latest_document(episode_id, "storyboard")
+    # 给每个镜头附上可人工核对的“剧本对应/时代/地点”上下文。这里是
+    # API 视图层的只读增强，不改写历史分镜文档，也不会影响已锁定提示词。
+    storyboard, shot_story_contexts = attach_shot_story_context(
+        script, storyboard)
+    continuity, continuity_v = app.projects.latest_document(
+        episode_id, "continuity")
+    scene_plan, _scene_plan_v = app.projects.latest_document(
+        episode_id, "scene_plan")
+    blocking, blocking_v = app.projects.latest_document(
+        episode_id, "blocking")
+    text_assets, text_assets_v = app.projects.latest_document(
+        episode_id, "text_assets")
+    preflight, preflight_v = app.projects.latest_document(
+        episode_id, "preflight")
+    content_review, content_review_v = app.projects.latest_document(
+        episode_id, "content_review")
+    production_standard, production_standard_v = app.projects.latest_document(
+        episode_id, "production_standard")
+    quality_policy, quality_policy_v = app.projects.latest_document(
+        episode_id, "quality_policy")
+    _character_asset_policy, character_asset_policy_v = \
+        app.projects.latest_document(episode_id, "character_asset_policy")
+    video_references, video_references_v = app.projects.latest_document(
+        episode_id, "video_references")
+    shot_revision_state, shot_revision_state_v = \
+        app.projects.latest_document(episode_id, "shot_revision_state")
+    video_qc_report, video_qc_report_v = \
+        app.projects.latest_document(episode_id, "video_qc_report")
+    series_source, series_source_v = app.projects.latest_document(
+        episode_id, "series_source")
+    cast_selection = app.director.production_asset_selection_status(
+        project["id"], script or {})
+    for character in cast_selection.get("characters", []):
+        if character.get("identity_uri"):
+            character["identity_url"] = _artifact_url(
+                app, character["identity_uri"])
+        for candidate in character.get("candidates", []):
+            candidate["url"] = _artifact_url(app, candidate.get("uri", ""))
+    for prop in cast_selection.get("props", []):
+        if prop.get("identity_uri"):
+            prop["identity_url"] = _artifact_url(
+                app, prop["identity_uri"])
+        for candidate in prop.get("candidates", []):
+            candidate["url"] = _artifact_url(
+                app, candidate.get("uri", ""))
+    tasks = [dict(t) for t in app.db.query(
+        "SELECT id, stage, name, status, provider, cost, error, created_at, "
+        "updated_at FROM tasks WHERE episode_id=? ORDER BY id",
+        (episode_id,))]
+    out_dir = (app.workspace.artifacts_dir / f"p{project['id']:03d}"
+               / f"e{episode['number']:03d}")
+    qc_report = None
+    qc_path = out_dir / "qc_report.json"
+    if qc_path.exists():
+        qc_report = json.loads(qc_path.read_text(encoding="utf-8"))
+    # 视频质检单独落盘，供生产表逐镜显示“已通过 / 自动返工 1/1 /
+    # 二次失败待人工”，即使总质检报告尚未生成也能看到视频状态。
+    video_qc_path = out_dir / "video_qc_report.json"
+    if video_qc_path.exists():
+        try:
+            video_qc_report = json.loads(
+                video_qc_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+    if (shot_revision_state or {}).get("active"):
+        # 镜头已出新版本而旧成片尚未补拍时，不能继续展示旧质检“通过”。
+        qc_report = None
+        video_qc_report = None
+        content_review = None
+    render_plan = None
+    plan_path = out_dir / "render_plan.json"
+    if plan_path.exists():
+        try:
+            render_plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        except ValueError:
+            render_plan = None
+    relations = None
+    relations_path = out_dir / "relations.json"
+    if relations_path.exists():
+        try:
+            relations = json.loads(
+                relations_path.read_text(encoding="utf-8"))
+        except ValueError:
+            relations = None
+    image_failures = []
+    if render_plan is not None:
+        render_plan = copy.deepcopy(render_plan)
+        render_plan["items"] = _current_render_plan_items(render_plan)
+        for item in render_plan.get("items", []):
+            if _selection_mode_enabled(app):
+                _selection_mode_present_item(item)
+            try:
+                shot_no = int(item.get("shot_no"))
+            except (TypeError, ValueError):
+                shot_no = None
+            if shot_no in shot_story_contexts:
+                item["story_context"] = copy.deepcopy(
+                    shot_story_contexts[shot_no])
+            for ref in (item.get("reference_inputs") or {}).get("items", []):
+                ref["url"] = _artifact_url(app, ref.get("uri", ""))
+            _sanitize_candidate_group_urls(app, item)
+            output_url = _artifact_url(app, item.get("output_uri", ""))
+            if output_url:
+                try:
+                    stamp = int(Path(item["output_uri"]).stat().st_mtime_ns)
+                except (OSError, TypeError, ValueError):
+                    stamp = int(render_plan.get("updated_at") or 0)
+                separator = "&" if "?" in output_url else "?"
+                item["output_url"] = (
+                    f"{output_url}{separator}failed={stamp}"
+                    if item.get("status") in ("awaiting_human", "failed")
+                    else output_url)
+            if (item.get("category") == "shot_image"
+                    and item.get("status") in ("awaiting_human", "failed")):
+                qc = item.get("qc") or {}
+                issues = list(qc.get("issues") or [])
+                if not issues and item.get("error"):
+                    issues = [item["error"]]
+                if not issues:
+                    # codex 内置 image_gen 等来源的失败常常 issues 双空,
+                    # 前端只能显示兜底文案"图片质检未通过"——把诊断里
+                    # 已有的原因逐级捞出来,失败必须带可读原因。
+                    fallback_reason = next((
+                        str(value).strip() for value in (
+                            (qc.get("image_error") or {}).get("summary"),
+                            qc.get("retry_blocked_reason"),
+                            (qc.get("codex_escalation") or {}).get("reason"),
+                        ) if str(value or "").strip()), "")
+                    if fallback_reason:
+                        issues = [fallback_reason]
+                image_failures.append({
+                    "item_id": _safe_diagnostic_text(
+                        item.get("id", ""), limit=160),
+                    "shot_no": item.get("shot_no"),
+                    "label": _safe_diagnostic_text(
+                        item.get("label", ""), limit=240),
+                    "status": item.get("status"),
+                    "attempts": int(qc.get("attempts") or 0),
+                    "consecutive_failures": int(
+                        qc.get("consecutive_failures")
+                        or qc.get("previous_consecutive_failures")
+                        or 0),
+                    "qc_provider": _safe_diagnostic_text(
+                        qc.get("qc_provider", ""), limit=80),
+                    "auto_repairs": int(qc.get("auto_repairs") or max(
+                        0, int(qc.get("attempts") or 1) - 1)),
+                    "issues": _safe_diagnostic_value(issues) or [],
+                    "revision_feedback": _safe_diagnostic_text(
+                        qc.get("revision_feedback", "")),
+                    "failed_output_url": item.get("output_url"),
+                    **_generation_diagnostic_payload(item, qc),
+                })
+    if isinstance(video_qc_report, dict):
+        video_qc_report = copy.deepcopy(video_qc_report)
+        for shot_qc in video_qc_report.get("shots", []):
+            if isinstance(shot_qc, dict):
+                shot_qc.update(_generation_diagnostic_payload(shot_qc))
+    video_references_effective = app.director.effective_video_references(
+        episode_id)
+    for shot in video_references_effective.get("shots", {}).values():
+        for item in shot.get("items", []):
+            item["url"] = _artifact_url(app, item.get("uri", ""))
+    image_acceleration = app.director.image_acceleration_options(
+        project["title"], episode["number"])
+    if blocking is not None:
+        blocking = copy.deepcopy(blocking)
+        for scene in blocking.get("scenes", []):
+            scene_url = _artifact_url(
+                app, scene.get("svg_uri", ""))
+            scene["svg_url"] = _versioned(
+                scene_url, {"version": blocking_v or 1})
+            # 空间调度的 3D 视图直接用本场 720° 全景当房间——调度不再是
+            # 抽象线框,而是「真实房间里的人和机位」。全景是几何唯一真相,
+            # 与 blocking 同坐标系(全景水平中心 = +Z)。
+            location = str(scene.get("location") or "").strip()
+            if location:
+                row = app.assets.latest(
+                    project["id"], "scene_art",
+                    f"{location}::view:panorama")
+                if row is not None and row["uri"]:
+                    scene["panorama_url"] = _versioned(
+                        _artifact_url(app, row["uri"]),
+                        {"version": row["version"] or 1})
+                # 三维场景表:物体的真实位置与尺寸(由全景反解)。有了它,
+                # 3D 调度视图画的是真家具而不只是贴图,人物与物件的空间
+                # 关系才看得清、镜头才不会穿帮。
+                model_row = app.assets.latest(
+                    project["id"], "scene_model", location)
+                if model_row is not None and model_row["uri"]:
+                    try:
+                        scene["scene_model"] = json.loads(
+                            Path(model_row["uri"]).read_text(
+                                encoding="utf-8"))
+                    except (OSError, ValueError):
+                        pass
+    production_progress = _production_progress(
+        app, episode, render_plan)
+    production_guidance = _production_guidance(
+        app, episode, storyboard, render_plan, production_progress)
+    artifacts = _collect_artifacts(
+        app, project["id"], episode["number"])
+    story_intelligence = _story_intelligence_payload(
+        app, episode, project, storyboard, sb_v, script_v, artifacts)
+    payload = {
+        "build": BUILD,
+        "episode": dict(episode),
+        "project": dict(project),
+        "tasks": tasks,
+        "script": script,
+        "script_version": script_v,
+        "story_analysis": story_analysis,
+        "story_analysis_version": story_analysis_v,
+        "storyboard": storyboard,
+        "storyboard_version": sb_v,
+        "continuity": continuity,
+        "scene_plan": scene_plan or {"skipped_scenes": []},
+        "continuity_version": continuity_v,
+        "blocking": blocking,
+        "blocking_version": blocking_v,
+        "text_assets": text_assets,
+        "text_assets_version": text_assets_v,
+        "preflight": preflight,
+        "preflight_version": preflight_v,
+        "content_review": content_review,
+        "content_review_version": content_review_v,
+        "production_profile": (storyboard or {}).get("profile", {}),
+        "production_standard": production_standard,
+        "production_standard_version": production_standard_v,
+        "quality_policy": normalize_quality_policy(quality_policy),
+        "quality_policy_version": quality_policy_v,
+        "character_asset_policy": app.director.character_asset_policy(
+            episode_id, script=script),
+        "character_asset_policy_version": character_asset_policy_v,
+        "video_references": video_references or {
+            "schema": "aifos.video-references/v1", "shots": {}},
+        "video_references_version": video_references_v,
+        "video_references_effective": video_references_effective,
+        "shot_revision_state": shot_revision_state,
+        "shot_revision_state_version": shot_revision_state_v,
+        "series_source": series_source,
+        "series_source_version": series_source_v,
+        "series_batch": app.series.batch_for_episode(episode_id),
+        "cast_selection": cast_selection,
+        "qc_report": qc_report,
+        "video_qc_report": video_qc_report,
+        "video_qc_report_version": video_qc_report_v,
+        "render_plan": render_plan,
+        "production_progress": production_progress,
+        "production_guidance": production_guidance,
+        "image_failures": image_failures,
+        "relations": relations,
+        "story_intelligence": story_intelligence,
+        "lessons": project_lessons(app.assets, project["id"], limit=20),
+        "image_acceleration": {
+            "summary": image_acceleration["summary"],
+            "default_provider": image_acceleration["default_provider"],
+            "default_model": image_acceleration["default_model"],
+            "default_quality": image_acceleration["default_quality"],
+        },
+        "artifacts": artifacts,
+    }
+    if jobs is not None:
+        status = _episode_status_payload(app, episode_id, jobs)
+        payload["poll_signature"] = status["signature"]
+    return payload
+
+
+def _overview_payload(app, jobs):
+    episodes = [dict(r) for r in app.db.query(
+        "SELECT e.id, e.number, e.title, e.status, e.qc_score, e.cost, "
+        "e.updated_at, p.title AS project "
+        "FROM episodes e JOIN projects p ON p.id=e.project_id "
+        "ORDER BY e.updated_at DESC")]
+    projects = [dict(r) for r in app.projects.list_projects()]
+    asset_stats = {}
+    for project in projects:
+        rows = [dict(row) for row in app.assets.stats(project["id"])]
+        if rows:
+            asset_stats[project["title"]] = rows
+    done = [e for e in episodes if e["status"] == "done"]
+    scored = [e["qc_score"] for e in episodes if e["qc_score"] is not None]
+    active_standard = app.standards.active()
+    return {
+        "version": __version__,
+        "build": BUILD,
+        "production_standard": {
+            key: active_standard.get(key) for key in (
+                "version_id", "profile_key", "version", "name",
+                "fingerprint", "created_at")
+        },
+        "projects": projects,
+        "episodes": episodes,
+        "stats": {
+            "episodes": len(episodes),
+            "done": len(done),
+            "total_cost": round(sum(e["cost"] for e in episodes), 2),
+            "avg_qc": round(sum(scored) / len(scored), 1) if scored else None,
+            "budget": app.config.get("budget", "per_episode", default=0),
+        },
+        "cost_by_stage": [dict(r) for r in app.system.cost_by_stage()],
+        "cost_by_provider": [dict(r) for r in app.system.cost_by_provider()],
+        "quota": [dict(r) for r in app.system.quota_status()],
+        "asset_stats": asset_stats,
+        "icloud_sync": app.icloud_sync.status(),
+        "firefire": app.firefire.overview(),
+        "jobs": jobs.list(),
+        "series_batches": app.series.list_batches(),
+    }
+
+
+def make_handler(workspace, jobs):
+    workspace = Path(workspace)
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):  # 静默访问日志(平台日志走系统中心)
+            pass
+
+        # ---- 响应助手 ----
+        def _json(self, data, status=200):
+            body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type",
+                             "application/json; charset=utf-8")
+            if (len(body) >= GZIP_MIN_SIZE
+                    and "gzip" in (self.headers.get("Accept-Encoding") or "")):
+                # 看板等大负载过隧道/外网时体积敏感;按内容哈希缓存压缩
+                # 结果,2.5s 轮询命中缓存时不必重复压缩
+                body = _gzip_bytes(body)
+                self.send_header("Content-Encoding", "gzip")
+                self.send_header("Vary", "Accept-Encoding")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _error(self, status, message):
+            self._json({"error": message}, status=status)
+
+        def _qr_svg(self, data):
+            """把任意文本(通常是外网地址)渲染成 QR 二维码 SVG。"""
+            from .. import qrcode
+            try:
+                matrix = qrcode.encode(data, "M")
+            except ValueError as exc:
+                return self._error(400, str(exc))
+            svg = qrcode.render_svg(matrix).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "image/svg+xml; charset=utf-8")
+            self.send_header("Content-Length", str(len(svg)))
+            self.send_header("Cache-Control", "public, max-age=60")
+            self.end_headers()
+            self.wfile.write(svg)
+
+        def _file(self, path, no_cache=False, cache_seconds=None):
+            path = Path(path)
+            if not path.is_file():
+                return self._error(404, "文件不存在")
+            size = path.stat().st_size
+            content_type = MIME.get(
+                path.suffix.lower(), "application/octet-stream")
+
+            def send_cache_headers():
+                if no_cache:
+                    # 界面文件禁缓存:git pull 更新后刷新即生效,
+                    # 避免浏览器缓存旧版界面导致"更新了却看不到新功能"
+                    self.send_header("Cache-Control", "no-cache")
+                elif cache_seconds:
+                    self.send_header("Cache-Control",
+                                     f"public, max-age={int(cache_seconds)}")
+
+            if "Range" in self.headers:
+                parsed_range = _parse_range(self.headers["Range"], size)
+                if parsed_range == "unsatisfiable":
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{size}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                if parsed_range is not None:
+                    start, end = parsed_range
+                    with open(path, "rb") as fh:
+                        fh.seek(start)
+                        body = fh.read(end - start + 1)
+                    self.send_response(206)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header(
+                        "Content-Range", f"bytes {start}-{end}/{size}")
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.send_header("Content-Length", str(len(body)))
+                    send_cache_headers()
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+
+            body = path.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            # 大文本(界面 js/css、数据导出)过隧道/外网时体积敏感;
+            # 按内容协商压缩,压缩结果按 (路径, mtime, 大小) 缓存
+            if (size >= GZIP_MIN_SIZE
+                    and path.suffix.lower() in GZIP_EXTS
+                    and "gzip" in (self.headers.get("Accept-Encoding") or "")):
+                body = _gzipped(path, body)
+                self.send_header("Content-Encoding", "gzip")
+                self.send_header("Vary", "Accept-Encoding")
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(len(body)))
+            send_cache_headers()
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _with_app(self, fn):
+            app = App(workspace)
+            try:
+                return fn(app)
+            finally:
+                app.close()
+
+        # ---- 路由 ----
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            route = unquote(parsed.path)
+            query = parse_qs(parsed.query)
+            try:
+                if route in ("/", "/index.html"):
+                    return self._file(STATIC_DIR / "index.html",
+                                      no_cache=True)
+                if route == "/manifest.webmanifest":
+                    return self._file(STATIC_DIR / "manifest.webmanifest",
+                                      no_cache=True)
+                if route == "/sw.js":
+                    return self._file(STATIC_DIR / "sw.js", no_cache=True)
+                if route.startswith("/static/"):
+                    return self._static(STATIC_DIR, route[len("/static/"):])
+                if route.startswith("/artifacts/"):
+                    return self._artifact(route[len("/artifacts/"):],
+                                          query)
+                if route == "/api/access":
+                    host, port = self.server.server_address[:2]
+                    return self._json(
+                        access_payload(host, port, workspace=workspace))
+                if route == "/qr.svg":
+                    data = query.get("data", [""])[0]
+                    if not data:
+                        return self._error(400, "缺少 data 参数")
+                    return self._qr_svg(data)
+                if route == "/scene3d":
+                    return self._file(STATIC_DIR / "scene3d.html",
+                                      no_cache=True)
+                if route == "/api/scene3d":
+                    try:
+                        episode_id = int(query.get("episode", ["0"])[0])
+                    except (TypeError, ValueError):
+                        return self._error(400, "episode 必须是数字")
+                    if not episode_id:
+                        return self._error(400, "缺少 episode 参数")
+                    payload = self._with_app(
+                        lambda app: _scene3d_payload(app, episode_id))
+                    if payload is None:
+                        return self._error(404, "剧集不存在")
+                    return self._json(payload)
+                if route == "/api/director-statement":
+                    try:
+                        episode_id = int(query.get("episode", ["0"])[0])
+                    except (TypeError, ValueError):
+                        return self._error(400, "episode 必须是数字")
+                    if not episode_id:
+                        return self._error(400, "缺少 episode 参数")
+
+                    def _load(app):
+                        if app.projects.get_episode(episode_id) is None:
+                            return None
+                        statement, version = app.projects.latest_document(
+                            episode_id, "director_statement")
+                        return {"episode_id": episode_id,
+                                "statement": statement or {},
+                                "version": version or 0}
+                    payload = self._with_app(_load)
+                    if payload is None:
+                        return self._error(404, "剧集不存在")
+                    return self._json(payload)
+                if route == "/api/overview":
+                    return self._json(self._with_app(
+                        lambda app: _overview_payload(app, jobs)))
+                if route == "/api/codex/channel-stats":
+                    from ..channel_stats import summarize
+                    try:
+                        hours = float(query.get("hours", ["24"])[0])
+                    except (TypeError, ValueError):
+                        hours = 24.0
+                    return self._json(summarize(
+                        Path(workspace) / "logs", hours=hours))
+                if route == "/api/qc/failure-stats":
+                    from ..qc_stats import summarize_qc
+                    try:
+                        hours = float(query.get("hours", ["168"])[0])
+                    except (TypeError, ValueError):
+                        hours = 168.0
+                    return self._json(summarize_qc(
+                        Path(workspace) / "logs", hours=hours))
+                if route == "/api/director/knowledge":
+                    # AI 导演知识库:直接读取运行时词典模块——所见即所用,
+                    # 不存副本,词典升级这里自动同步。
+                    from ..adapters.claude_script import DIRECTOR_PRINCIPLES
+                    from ..camera_language import (
+                        ANGLE_GEOMETRY, CAMERA_SCALE_CAPACITY,
+                        COMPOSITION_GEOMETRY, MOVEMENT_GEOMETRY,
+                        POSITION_GEOMETRY, SCALE_GEOMETRY,
+                        TOP_DOWN_POSITION_GEOMETRY)
+                    from ..lighting_language import (
+                        DEEP_FOCUS_CLAUSE, GENRE_LOOKS, LIGHTING_STYLES,
+                        NEGATIVE_CONTROLS, SHALLOW_DOF_CLAUSE,
+                        VOLUMETRIC_CLAUSE, WARM_COOL_CLAUSE)
+                    from ..realism_language import (
+                        NEGATIVE_CONTROLS as REALISM_NEGATIVE,
+                        NON_REALISTIC_TOKENS, REALISM_CLAUSE,
+                        REALISTIC_STYLE_TOKENS)
+                    from ..spatial_language import (_DISTANCE_FRAMING,
+                                                    _H_ZONES)
+                    return self._json({
+                        "schema": "aifos.director-knowledge/v1",
+                        "source_note": (
+                            "以下内容直接读取自运行时词典模块"
+                            "(camera_language/lighting_language/"
+                            "spatial_language/realism_language),"
+                            "AI导演与生成、质检共用同一份——所见即所用"),
+                        "principles": list(DIRECTOR_PRINCIPLES),
+                        "camera": {
+                            "景别": SCALE_GEOMETRY,
+                            "角度": ANGLE_GEOMETRY,
+                            "机位": POSITION_GEOMETRY,
+                            "机位·顶拍语境": TOP_DOWN_POSITION_GEOMETRY,
+                            "运镜": MOVEMENT_GEOMETRY,
+                            "构图": COMPOSITION_GEOMETRY,
+                        },
+                        "capacity": CAMERA_SCALE_CAPACITY,
+                        "lighting": {
+                            "styles": {
+                                key: value for key, value in
+                                LIGHTING_STYLES.items()},
+                            "extras": {
+                                "体积光": VOLUMETRIC_CLAUSE,
+                                "冷暖对比": WARM_COOL_CLAUSE,
+                                "浅景深": SHALLOW_DOF_CLAUSE,
+                                "大景深": DEEP_FOCUS_CLAUSE,
+                            },
+                            "negative": NEGATIVE_CONTROLS,
+                        },
+                        "genres": {
+                            key: {"label": look["label"],
+                                  "tokens": list(look["tokens"]),
+                                  "style": look["style"],
+                                  "grammar": look["grammar"],
+                                  "camera": dict(look.get("camera") or {})}
+                            for key, look in GENRE_LOOKS.items()},
+                        "spatial": {
+                            "screen_zones": [
+                                {"range": [low, high], "label": label}
+                                for low, high, label in _H_ZONES],
+                            "distance_framing": [
+                                # float('inf') 会被序列化成 Infinity,
+                                # 浏览器 JSON.parse 拒收 → 前端拿到空对象
+                                {"range": [low,
+                                           None if high == float("inf")
+                                           else high],
+                                 "label": label}
+                                for low, high, label in _DISTANCE_FRAMING],
+                            "clauses": [
+                                "空间站位:画面分区+被摄距离(到主体胸眼"
+                                "高度)+由近及远遮挡顺序+朝向视线",
+                                "行动路线:起点→终点的分区位移+走近/远离"
+                                "摄影机米数+姿态变化",
+                                "屏幕方向:180度轴线锁,同场跨镜左右关系"
+                                "不得翻转",
+                                "空间冲突:声明景别与机位距离跨两档即报,"
+                                "出图前拦截",
+                            ],
+                        },
+                        "realism": {
+                            "clause": REALISM_CLAUSE,
+                            "negative": REALISM_NEGATIVE,
+                            "enabled_styles": list(REALISTIC_STYLE_TOKENS),
+                            "disabled_styles": list(NON_REALISTIC_TOKENS),
+                        },
+                    })
+                if route == "/api/rules/appeals":
+                    from ..rule_appeals import (rules_needing_fix,
+                                                summarize_appeals)
+                    try:
+                        hours = float(query.get("hours", ["168"])[0])
+                    except (TypeError, ValueError):
+                        hours = 168.0
+                    summary = summarize_appeals(
+                        Path(workspace) / "logs", hours=hours)
+                    summary["needs_rule_fix"] = rules_needing_fix(summary)
+                    return self._json(summary)
+                match = re.match(r"^/api/project/(\d+)/rules$", route)
+                if match:
+                    return self._project_rules_get(
+                        int(match.group(1)))
+                match = re.match(
+                    r"^/api/episode/(\d+)/rule-stack$", route)
+                if match:
+                    return self._episode_rule_stack(
+                        int(match.group(1)), query)
+                match = re.match(r"^/api/episode/(\d+)/rules$", route)
+                if match:
+                    return self._episode_rules_get(
+                        int(match.group(1)), query)
+                if route in ("/api/firefire", "/api/firefire/overview"):
+                    return self._json(self._with_app(
+                        lambda app: app.firefire.overview()))
+                match = re.match(r"^/api/firefire/session/(\d+)$", route)
+                if match:
+                    payload = self._with_app(lambda app: app.firefire.get_session(
+                        int(match.group(1)), include_evidence=True))
+                    if payload is None:
+                        return self._error(404, "火火学习会话不存在")
+                    return self._json(payload)
+                match = re.match(r"^/api/firefire/style/([\w-]+)$", route)
+                if match:
+                    payload = self._with_app(lambda app: app.firefire.get_style(
+                        match.group(1)))
+                    if payload is None:
+                        return self._error(404, "火火独立风格不存在")
+                    return self._json(payload)
+                match = re.match(
+                    r"^/api/firefire/knowledge/([\w-]+)$", route)
+                if match:
+                    payload = self._with_app(
+                        lambda app: app.firefire.knowledge.get(
+                            match.group(1)))
+                    if payload is None:
+                        return self._error(404, "知识条目不存在")
+                    return self._json(payload)
+                match = re.match(r"^/api/episode/(\d+)/status$", route)
+                if match:
+                    payload = self._with_app(
+                        lambda app: _episode_status_payload(
+                            app, int(match.group(1)), jobs))
+                    if payload is None:
+                        return self._error(404, "剧集不存在")
+                    return self._json(payload)
+                match = re.match(r"^/api/episode/(\d+)/prompts$", route)
+                if match:
+                    payload = self._with_app(
+                        lambda app: build_episode_prompt_review(
+                            app, int(match.group(1))))
+                    if payload is None:
+                        return self._error(404, "剧集不存在")
+                    payload["build"] = BUILD
+                    return self._json(payload)
+                match = re.match(r"^/api/episode/(\d+)$", route)
+                if match:
+                    payload = self._with_app(
+                        lambda app: _episode_payload(
+                            app, int(match.group(1)), jobs=jobs))
+                    if payload is None:
+                        return self._error(404, "剧集不存在")
+                    payload["live_jobs"] = copy.deepcopy(jobs.running_for(
+                        payload["project"]["title"],
+                        payload["episode"]["number"]))
+                    return self._json(payload)
+                if route == "/api/assets":
+                    return self._assets(query)
+                if route == "/api/image_acceleration/options":
+                    return self._image_acceleration_options(query)
+                if route == "/api/asset-images":
+                    return self._asset_images(query)
+                if route == "/api/asset-studio/options":
+                    return self._asset_studio_options(query)
+                if route == "/api/project/shell":
+                    return self._project_shell(query)
+                if route == "/api/scene/expansion":
+                    return self._scene_expansion(query)
+                if route == "/api/logs":
+                    limit = int(query.get("limit", ["50"])[0])
+                    return self._json(self._with_app(
+                        lambda app: [dict(r)
+                                     for r in app.logger.tail(limit)]))
+                if route == "/api/history":
+                    limit = int(query.get("limit", ["200"])[0])
+                    status = query.get("status", [None])[0]
+                    action = query.get("action", [None])[0]
+                    search = query.get("q", [""])[0]
+                    return self._json(self._with_app(
+                        lambda app: app.history.list(
+                            limit=limit, status=status, action=action,
+                            query=search)))
+                match = re.match(r"^/api/history/(\d+)$", route)
+                if match:
+                    payload = self._with_app(
+                        lambda app: app.history.get(int(match.group(1))))
+                    if payload is None:
+                        return self._error(404, "历史记录不存在")
+                    return self._json(payload)
+                if route == "/api/jobs":
+                    return self._json(jobs.list())
+                if route == "/api/image-production/shards":
+                    return self._image_production_shards()
+                if route == "/api/standards":
+                    return self._standards()
+                if route == "/api/standards/export":
+                    version_id = query.get("version_id", [None])[0]
+                    return self._standards_export(
+                        int(version_id) if version_id else None)
+                match = re.match(r"^/api/jobs/(\w+)$", route)
+                if match:
+                    job = jobs.get(match.group(1))
+                    if job is None:
+                        return self._error(404, "任务不存在")
+                    return self._json(job)
+                match = re.match(r"^/api/series/(\d+)$", route)
+                if match:
+                    payload = self._with_app(
+                        lambda app: app.series.get_batch(int(match.group(1))))
+                    if payload is None:
+                        return self._error(404, "多集导入批次不存在")
+                    return self._json(payload)
+                match = re.match(r"^/api/export/(\d+)$", route)
+                if match:
+                    return self._export(int(match.group(1)))
+                if route == "/api/selection-mode":
+                    # 创作选片模式现状(独立内容质检开关接口,只读设置,
+                    # 不触碰生成/QC流程)
+                    return self._json(self._with_app(
+                        _selection_mode_payload))
+                if route == "/api/settings":
+                    from ..settings import settings_payload
+                    def settings_view(app):
+                        payload = settings_payload(app)
+                        payload.setdefault("defaults", {}).update(
+                            _selection_mode_payload(app))
+                        return payload
+                    return self._json(self._with_app(settings_view))
+                if route == "/api/doctor":
+                    from ..doctor import run_doctor
+                    ping = query.get("ping", ["0"])[0] == "1"
+                    return self._json(self._with_app(
+                        lambda app: run_doctor(app, do_ping=ping)))
+                return self._error(404, "未知路径")
+            except BrokenPipeError:
+                pass
+            except Exception as exc:
+                self._error(500, str(exc))
+
+        def do_POST(self):
+            parsed = urlparse(self.path)
+            try:
+                match = re.match(
+                    r"^/api/project/(\d+)/rules$", parsed.path)
+                if match:
+                    return self._project_rules_save(int(match.group(1)))
+                match = re.match(
+                    r"^/api/episode/(\d+)/rules$", parsed.path)
+                if match:
+                    return self._episode_rules_save(int(match.group(1)))
+                if parsed.path == "/api/produce":
+                    return self._produce()
+                if parsed.path == "/api/firefire/session":
+                    return self._firefire_session()
+                if parsed.path == "/api/firefire/evidence":
+                    return self._firefire_evidence()
+                if parsed.path == "/api/firefire/analyse":
+                    return self._firefire_analyse()
+                if parsed.path == "/api/firefire/style":
+                    return self._firefire_style()
+                if parsed.path == "/api/firefire/style/publish":
+                    return self._firefire_style_publish()
+                if parsed.path == "/api/firefire/style/archive":
+                    return self._firefire_style_archive()
+                if parsed.path == "/api/firefire/validation":
+                    return self._firefire_validation()
+                if parsed.path == "/api/firefire/knowledge":
+                    return self._firefire_knowledge()
+                if parsed.path == "/api/firefire/knowledge/publish":
+                    return self._firefire_knowledge_publish()
+                if parsed.path == "/api/firefire/knowledge/refresh":
+                    return self._firefire_knowledge_refresh()
+                if parsed.path == "/api/firefire/knowledge/resolve":
+                    return self._firefire_knowledge_resolve()
+                if parsed.path == "/api/series/preview":
+                    return self._series_preview()
+                if parsed.path == "/api/series/import":
+                    return self._series_import()
+                if parsed.path == "/api/series/next":
+                    return self._series_next()
+                if parsed.path == "/api/series/settings":
+                    return self._series_settings()
+                if parsed.path == "/api/confirm":
+                    return self._confirm()
+                if parsed.path == "/api/character/select":
+                    return self._character_select()
+                if parsed.path == "/api/prop/select":
+                    return self._prop_select()
+                if parsed.path == "/api/character/assets-policy":
+                    return self._character_assets_policy()
+                if parsed.path == "/api/character/regenerate":
+                    return self._character_regenerate()
+                if parsed.path == "/api/character/refine-prompt":
+                    return self._character_refine_prompt()
+                if parsed.path == "/api/character/refine-prompt/apply":
+                    return self._character_refine_apply()
+                if parsed.path == "/api/shot/direct":
+                    return self._shot_direct()
+                if parsed.path == "/api/shot/ai-direct":
+                    return self._shot_ai_direct()
+                if parsed.path == "/api/scene/skip":
+                    return self._scene_skip()
+                if parsed.path == "/api/scene/delete":
+                    return self._scene_delete()
+                if parsed.path == "/api/scene/expand":
+                    return self._scene_expand()
+                if parsed.path == "/api/revise":
+                    return self._revise()
+                if parsed.path == "/api/shot-candidates/select":
+                    return self._shot_candidate_select()
+                if parsed.path == "/api/shot-candidates/regenerate":
+                    return self._shot_candidates_regenerate()
+                if parsed.path == "/api/regen_image":
+                    return self._regen_image()
+                if parsed.path == "/api/upload":
+                    return self._upload()
+                if parsed.path == "/api/selection-mode":
+                    return self._selection_mode_update()
+                if parsed.path == "/api/settings":
+                    return self._settings_update()
+                if parsed.path == "/api/settings/test":
+                    return self._settings_test()
+                if parsed.path == "/api/settings/detect":
+                    return self._settings_detect()
+                if parsed.path == "/api/icloud-sync/backfill":
+                    return self._icloud_sync_backfill()
+                if parsed.path == "/api/update":
+                    return self._update_now()
+                if parsed.path == "/api/redo_mock":
+                    return self._redo_mock()
+                if parsed.path == "/api/director-statement":
+                    return self._director_statement_save()
+                if parsed.path == "/api/scene3d/appearance":
+                    return self._scene3d_appearance()
+                if parsed.path == "/api/scene3d":
+                    return self._scene3d_save()
+                if parsed.path == "/api/qc_item":
+                    return self._qc_item()
+                if parsed.path == "/api/qc_override":
+                    return self._qc_override()
+                if parsed.path == "/api/qc_all":
+                    return self._qc_all()
+                if parsed.path == "/api/redo_items":
+                    return self._redo_items()
+                if parsed.path == "/api/redo_video":
+                    return self._redo_video()
+                if parsed.path == "/api/redo_videos":
+                    return self._redo_videos()
+                if parsed.path == "/api/image_acceleration/preflight":
+                    return self._image_acceleration_preflight()
+                if parsed.path == "/api/image_acceleration/queue":
+                    return self._image_acceleration_queue()
+                if parsed.path == "/api/restyle":
+                    return self._restyle()
+                if parsed.path == "/api/reference/upload":
+                    return self._reference_upload()
+                if parsed.path == "/api/reference/delete":
+                    return self._reference_delete()
+                if parsed.path == "/api/asset/delete":
+                    return self._asset_delete()
+                if parsed.path == "/api/asset-studio/prompt":
+                    return self._asset_studio_prompt()
+                if parsed.path == "/api/asset-studio/generate":
+                    return self._asset_studio_generate()
+                if parsed.path == "/api/asset-studio/copy":
+                    return self._asset_studio_copy()
+                if parsed.path == "/api/history/delete":
+                    return self._history_delete()
+                if parsed.path == "/api/video/references":
+                    return self._video_references()
+                if parsed.path == "/api/lessons/approve":
+                    return self._lesson_approval()
+                if parsed.path == "/api/project/style":
+                    return self._project_style()
+                if parsed.path == "/api/story-analysis":
+                    return self._story_analysis()
+                if parsed.path == "/api/project/rename":
+                    return self._project_rename()
+                if parsed.path == "/api/project/create":
+                    return self._project_create()
+                if parsed.path == "/api/project/delete":
+                    return self._project_delete()
+                if parsed.path == "/api/stop":
+                    return self._stop()
+                if parsed.path == "/api/standards/save":
+                    return self._standards_save()
+                if parsed.path == "/api/standards/activate":
+                    return self._standards_activate()
+                if parsed.path == "/api/standards/reset":
+                    return self._standards_reset()
+                if parsed.path == "/api/standards/import":
+                    return self._standards_import()
+                return self._error(404, "未知路径")
+            except BrokenPipeError:
+                pass
+            except Exception as exc:
+                self._error(500, str(exc))
+
+        def do_PATCH(self):
+            parsed = urlparse(self.path)
+            try:
+                if parsed.path == "/api/scene3d":
+                    return self._scene3d_save()
+                return self._error(404, "未知路径")
+            except BrokenPipeError:
+                pass
+            except Exception as exc:
+                self._error(500, str(exc))
+
+        # ---- 各端点 ----
+        def _static(self, root, rel):
+            target = (root / rel).resolve()
+            if not str(target).startswith(str(root.resolve()) + "/"):
+                return self._error(404, "非法路径")
+            return self._file(target, no_cache=True)
+
+        THUMB_EXTS = (".png", ".jpg", ".jpeg", ".webp")
+
+        def _thumbnail(self, root, target, width):
+            """列表用缩略图:按需生成并缓存(macOS 自带 sips,备选
+            ffmpeg;都没有时回退原图)。点开大图仍加载原图。"""
+            if target.suffix.lower() not in self.THUMB_EXTS:
+                return target
+            width = max(64, min(width, 960))
+            try:
+                rel = target.relative_to(root)
+            except ValueError:
+                return target
+            thumb = root / ".thumbs" / f"w{width}" / rel
+            try:
+                if thumb.exists() and                         thumb.stat().st_mtime >= target.stat().st_mtime:
+                    return thumb
+                thumb.parent.mkdir(parents=True, exist_ok=True)
+                for command in (
+                        ["sips", "-Z", str(width), str(target),
+                         "--out", str(thumb)],
+                        ["ffmpeg", "-y", "-loglevel", "error",
+                         "-i", str(target),
+                         "-vf", f"scale={width}:-2", str(thumb)]):
+                    if shutil.which(command[0]) is None:
+                        continue
+                    proc = subprocess.run(command, capture_output=True,
+                                          timeout=30)
+                    if proc.returncode == 0 and thumb.exists():
+                        return thumb
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            return target
+
+        def _artifact(self, rel, query=None):
+            # 产物目录是 workspace 下的固定子目录;列表页每张图/每段视频
+            # 都走这里,若为一静态文件装配整套 App(数据库连接 + 全部
+            # 业务中心),高并发刷图时会造成持续的 SQLite 连接抖动。
+            root = (workspace / "artifacts").resolve()
+            target = (root / rel).resolve()
+            if not str(target).startswith(str(root) + "/"):
+                return self._error(404, "非法路径")
+            width = 0
+            try:
+                width = int((query or {}).get("w", ["0"])[0])
+            except (TypeError, ValueError):
+                width = 0
+            if width and target.is_file():
+                target = self._thumbnail(root, target, width)
+            # 产物带 ?v= 版本参数,可放心长缓存;重画后版本号变化自动失效
+            return self._file(target, cache_seconds=86400)
+
+        def _assets(self, query):
+            title = query.get("project", [""])[0]
+            kind = query.get("kind", [None])[0]
+
+            def fetch(app):
+                project = app.projects.get_project(title)
+                if project is None:
+                    return None
+                rows = app.assets.list(project["id"], kind=kind)
+                items = []
+                for row in rows:
+                    item = dict(row)
+                    item["meta"] = json.loads(item["meta"])
+                    item["url"] = _artifact_url(app, item["uri"])
+                    items.append(item)
+                return items
+
+            items = self._with_app(fetch)
+            if items is None:
+                return self._error(404, f"项目不存在: {title}")
+            return self._json(items)
+
+        def _asset_images(self, query):
+            """资产中心图片索引：按作品读取当前有效版本及完整溯源。"""
+            title = query.get("project", [""])[0].strip()
+            if not title:
+                return self._error(400, "缺少 project")
+
+            def fetch(app):
+                project = app.projects.get_project(title)
+                if project is None:
+                    return None
+                return _image_asset_catalog(app, project["id"])
+
+            items = self._with_app(fetch)
+            if items is None:
+                return self._error(404, f"项目不存在: {title}")
+            return self._json({"project": title, "items": items})
+
+        def _asset_studio_options(self, query):
+            """资产工坊表单选项:资产类型、用途、可勾选参考图、可关联对象。"""
+            title = query.get("project", [""])[0].strip()
+            if not title:
+                return self._error(400, "缺少 project")
+            try:
+                return self._json(self._with_app(
+                    lambda app: app.director.studio_asset_options(title)))
+            except Exception as exc:
+                return self._error(400, str(exc))
+
+        @staticmethod
+        def _asset_studio_reference_ids(body):
+            values = body.get("reference_asset_ids")
+            if values in (None, ""):
+                return []
+            if not isinstance(values, list):
+                raise AifosError("reference_asset_ids 必须是数组")
+            return values
+
+        def _asset_studio_prompt(self):
+            """AI 代写自建资产的出图提示词(只出文本,用户可再改)。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            title = (body.get("project") or "").strip()
+            if not title:
+                return self._error(400, "缺少 project")
+            try:
+                refs = self._asset_studio_reference_ids(body)
+                result = self._with_app(lambda app: app.director.studio_prompt(
+                    title, body.get("asset_type", ""),
+                    name=(body.get("name") or ""),
+                    brief=(body.get("brief") or ""),
+                    current_prompt=(body.get("prompt") or ""),
+                    feedback=(body.get("feedback") or ""),
+                    reference_asset_ids=refs,
+                    style=body.get("style")))
+            except Exception as exc:
+                return self._error(400, str(exc))
+            return self._json(result)
+
+        def _asset_studio_generate(self):
+            """生产自建资产图片并登记进资产中心(可直接用于后续制作)。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            title = (body.get("project") or "").strip()
+            if not title:
+                return self._error(400, "缺少 project")
+            try:
+                refs = self._asset_studio_reference_ids(body)
+                result = self._with_app(
+                    lambda app: app.director.generate_studio_asset(
+                        title, body.get("asset_type", ""),
+                        (body.get("name") or ""), (body.get("prompt") or ""),
+                        negative_prompt=(body.get("negative_prompt") or ""),
+                        feedback=(body.get("feedback") or ""),
+                        attach_to=(body.get("attach_to") or ""),
+                        reference_role=(body.get("reference_role") or ""),
+                        note=(body.get("note") or ""),
+                        reference_asset_ids=refs,
+                        base_asset_id=body.get("base_asset_id"),
+                        aspect=(body.get("aspect") or ""),
+                        style=body.get("style"),
+                        count=body.get("count", 1),
+                        optimize_prompt=bool(body.get("optimize_prompt")),
+                        prompt_source=(body.get("prompt_source") or "manual")))
+            except Exception as exc:
+                return self._error(400, str(exc))
+            return self._json(result, status=201)
+
+        def _asset_studio_copy(self):
+            """把自建资产复用到另一部作品(共用同一张图)。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            title = (body.get("project") or "").strip()
+            target = (body.get("target_project") or "").strip()
+            if not title or not target:
+                return self._error(400, "缺少 project/target_project")
+            if body.get("asset_id") is None:
+                return self._error(400, "缺少 asset_id")
+            try:
+                result = self._with_app(
+                    lambda app: app.director.copy_studio_asset(
+                        title, body["asset_id"], target))
+            except Exception as exc:
+                return self._error(400, str(exc))
+            return self._json(result, status=201)
+
+        def _standards(self):
+            def fetch(app):
+                active = app.standards.active()
+                return {
+                    "active": active,
+                    "history": app.standards.history(
+                        active.get("profile_key")),
+                    "capabilities": {
+                        "versioned": True,
+                        "episode_snapshot": True,
+                        "import_export": True,
+                        "locked_paths": [
+                            "rules.production.video_model",
+                            "rules.production.resolution",
+                            "rules.production.voice",
+                            "rules.production.lip_sync",
+                            "rules.production.burn_subtitles",
+                            "rules.production.fast_vip_real_face_conflict",
+                        ],
+                    },
+                }
+            return self._json(self._with_app(fetch))
+
+        def _standards_export(self, version_id=None):
+            return self._json(self._with_app(
+                lambda app: app.standards.export_bundle(version_id)))
+
+        def _standard_error(self, exc, status=400):
+            issues = getattr(exc, "issues", None) or []
+            return self._json({
+                "error": "制作标准校验失败",
+                "message": str(exc),
+                "issues": issues,
+            }, status=status)
+
+        def _standards_save(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            if not isinstance(body.get("content"), dict):
+                return self._error(400, "缺少 content 制作标准")
+            try:
+                snapshot = self._with_app(lambda app: app.standards.save(
+                    body["content"],
+                    change_note=(body.get("change_note") or "").strip(),
+                    activate=bool(body.get("activate", True)),
+                    expected_active_id=body.get("expected_active_id")))
+            except StandardValidationError as exc:
+                return self._standard_error(exc)
+            except StandardConflictError as exc:
+                return self._json({
+                    "error": "制作标准已被其他操作更新",
+                    "message": str(exc),
+                    "expected_active_id": exc.expected_active_id,
+                    "actual_active_id": exc.actual_active_id,
+                }, status=409)
+            return self._json({"standard": snapshot}, status=201)
+
+        def _standards_activate(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                version_id = int(body.get("version_id"))
+            except (TypeError, ValueError):
+                return self._error(400, "缺少合法 version_id")
+            try:
+                snapshot = self._with_app(
+                    lambda app: app.standards.activate(version_id))
+            except (StandardValidationError, ValueError, KeyError) as exc:
+                return self._standard_error(exc)
+            return self._json({"standard": snapshot})
+
+        def _standards_reset(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                snapshot = self._with_app(lambda app: app.standards.reset(
+                    change_note=(body.get("change_note")
+                                 or "恢复 SK 五维漫剧 V5 官方标准").strip()))
+            except StandardValidationError as exc:
+                return self._standard_error(exc)
+            return self._json({"standard": snapshot}, status=201)
+
+        def _standards_import(self):
+            if int(self.headers.get("Content-Length", "0")) > 2 * 1024 * 1024:
+                return self._error(400, "制作标准包不能超过 2MB")
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            bundle = body.get("bundle")
+            if not isinstance(bundle, dict):
+                return self._error(400, "缺少 bundle 标准包")
+            try:
+                snapshot = self._with_app(
+                    lambda app: app.standards.import_bundle(
+                        bundle,
+                        change_note=(body.get("change_note")
+                                     or "导入制作标准").strip(),
+                        activate=bool(body.get("activate", True))))
+            except StandardValidationError as exc:
+                return self._standard_error(exc)
+            return self._json({"standard": snapshot}, status=201)
+
+        def _export(self, episode_id):
+            """成品包 zip 下载。"""
+            from urllib.parse import quote as _quote
+
+            from ..export_kit import build_export_zip
+
+            def task(app):
+                episode = app.projects.get_episode(episode_id)
+                if episode is None:
+                    return None
+                project = app.db.query_one(
+                    "SELECT * FROM projects WHERE id=?",
+                    (episode["project_id"],))
+                return build_export_zip(
+                    app, project["title"], episode["number"])
+
+            try:
+                result = self._with_app(task)
+            except Exception as exc:
+                return self._error(400, str(exc))
+            if result is None:
+                return self._error(404, "剧集不存在")
+            data, filename = result
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header(
+                "Content-Disposition",
+                f"attachment; filename*=UTF-8''{_quote(filename)}")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _series_request(self, body):
+            filename = str(body.get("filename") or "").strip()
+            encoded = body.get("data_base64")
+            if not filename or not isinstance(encoded, str) or not encoded:
+                raise AifosError("请选择要导入的剧本文档")
+            if len(encoded) > 28 * 1024 * 1024:
+                raise AifosError("文档超过 20MB；请按卷拆分后导入")
+            try:
+                raw = base64.b64decode(encoded, validate=True)
+            except (ValueError, binascii.Error) as exc:
+                raise AifosError("文档数据不是有效的 Base64") from exc
+
+            def prepare(app):
+                start = body.get("start_episode")
+                try:
+                    start = int(start) if start not in (None, "") else None
+                except (TypeError, ValueError) as exc:
+                    raise AifosError("起始集数必须是正整数") from exc
+                title, number, note = resolve_produce_target(
+                    app, body.get("sentence", ""),
+                    title=(body.get("title") or None), number=start)
+                from ..series_import import (
+                    SeriesImportError, parse_series_document)
+                try:
+                    parsed = parse_series_document(
+                        filename, raw, title, start_number=number)
+                except SeriesImportError as exc:
+                    raise AifosError(str(exc)) from exc
+                project = app.projects.get_project(title)
+                conflicts = []
+                if project is not None:
+                    numbers = [item["episode_number"]
+                               for item in parsed["episodes"]]
+                    placeholders = ",".join("?" for _ in numbers)
+                    conflicts = [row["number"] for row in app.db.query(
+                        f"SELECT number FROM episodes WHERE project_id=? "
+                        f"AND number IN ({placeholders}) ORDER BY number",
+                        (project["id"], *numbers))]
+                return parsed, note, conflicts
+
+            return self._with_app(prepare)
+
+        def _series_preview(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                parsed, note, conflicts = self._series_request(body)
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            from ..series_import import preview_payload
+            payload = preview_payload(parsed)
+            payload["note"] = note
+            payload["conflicts"] = conflicts
+            payload["can_import"] = not conflicts
+            return self._json(payload)
+
+        def _series_import(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                parsed, note, conflicts = self._series_request(body)
+                if conflicts:
+                    joined = "、".join(f"第{number}集" for number in conflicts)
+                    return self._error(
+                        409, f"以下剧集已经存在，未覆盖任何内容：{joined}；"
+                        "请调整起始集数后重试")
+                style_pack_id = str(body.get("style_pack_id") or "").strip()
+                selected_style = body.get("style", "")
+                if style_pack_id:
+                    pack = self._with_app(lambda app: app.firefire.get_style(
+                        style_pack_id, approved_only=True))
+                    if pack is None:
+                        return self._error(409, "所选火火独立风格不存在或尚未人工确认")
+                    selected_style = pack["compiled_style"]
+                batch = self._with_app(
+                    lambda app: app.series.import_batch(
+                        parsed, style=selected_style,
+                        style_pack_id=style_pack_id,
+                        kind=(body.get("kind")
+                              if body.get("kind") in ("drama", "idol")
+                              else None),
+                        auto_advance=body.get("auto_advance", True)))
+                step = None
+                job_id = None
+                if body.get("start_first", True):
+                    step = self._with_app(
+                        lambda app: app.series.activate_next(batch["id"]))
+                    job_id = jobs.start_series_step(step)
+                    if isinstance(step, dict):
+                        step = {
+                            key: value for key, value in step.items()
+                            if key != "source_script"}
+                    batch = self._with_app(
+                        lambda app: app.series.get_batch(batch["id"]))
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            return self._json({
+                "batch": batch,
+                "first": step,
+                "job_id": job_id,
+                "note": note,
+            }, status=201)
+
+        def _series_next(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                batch_id = int(body.get("batch_id"))
+            except (TypeError, ValueError):
+                return self._error(400, "缺少有效 batch_id")
+            try:
+                step = self._with_app(
+                    lambda app: app.series.activate_next(batch_id))
+                job_id = jobs.start_series_step(step)
+                if isinstance(step, dict):
+                    step = {
+                        key: value for key, value in step.items()
+                        if key != "source_script"}
+            except AifosError as exc:
+                return self._error(409, str(exc))
+            return self._json({"step": step, "job_id": job_id}, status=202)
+
+        def _series_settings(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                batch_id = int(body.get("batch_id"))
+            except (TypeError, ValueError):
+                return self._error(400, "缺少有效 batch_id")
+            try:
+                batch = self._with_app(
+                    lambda app: app.series.set_auto_advance(
+                        batch_id, bool(body.get("auto_advance"))))
+            except AifosError as exc:
+                return self._error(404, str(exc))
+            return self._json(batch)
+
+        def _firefire_session(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                result = self._with_app(lambda app: app.firefire.create_session(
+                    name=body.get("name", ""),
+                    source_url=body.get("source_url", ""),
+                    source_type=body.get("source_type", "url"),
+                    rights_confirmed=bool(body.get("rights_confirmed")),
+                    notes=body.get("notes", "")))
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            return self._json(result, status=201)
+
+        def _firefire_evidence(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                session_id = int(body.get("session_id"))
+            except (TypeError, ValueError):
+                return self._error(400, "缺少有效 session_id")
+            try:
+                result = self._with_app(lambda app: app.firefire.add_evidence(
+                    session_id, kind=body.get("kind", "frame"),
+                    label=body.get("label", ""), uri=body.get("uri", ""),
+                    timecode=body.get("timecode", ""),
+                    observation=body.get("observation", ""),
+                    meta=body.get("meta") or {}))
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            return self._json(result, status=201)
+
+        def _firefire_analyse(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                session_id = int(body.get("session_id"))
+            except (TypeError, ValueError):
+                return self._error(400, "缺少有效 session_id")
+            try:
+                result = self._with_app(
+                    lambda app: app.firefire.start_analysis(session_id))
+            except AifosError as exc:
+                return self._error(409, str(exc))
+            return self._json(result)
+
+        def _firefire_style(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                session_id = body.get("session_id")
+                session_id = int(session_id) if session_id not in (None, "") else None
+                result = self._with_app(lambda app: app.firefire.create_style(
+                    name=body.get("name", ""), session_id=session_id,
+                    summary=body.get("summary", ""),
+                    compiled_style=body.get("compiled_style", ""),
+                    positive_prompt=body.get("positive_prompt", ""),
+                    negative_prompt=body.get("negative_prompt", ""),
+                    references=body.get("references") or [],
+                    validation=body.get("validation") or {},
+                    director_knowledge=body.get("director_knowledge") or {}))
+            except (AifosError, ValueError) as exc:
+                return self._error(400, str(exc))
+            return self._json(result, status=201)
+
+        def _firefire_style_publish(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            style_id = str(body.get("style_id") or "").strip()
+            if not style_id:
+                return self._error(400, "缺少 style_id")
+            try:
+                result = self._with_app(lambda app: app.firefire.publish_style(
+                    style_id, approved_by=body.get("approved_by", "human"),
+                    feedback=body.get("feedback", "")))
+            except AifosError as exc:
+                return self._error(409, str(exc))
+            return self._json(result)
+
+        def _firefire_style_archive(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            style_id = str(body.get("style_id") or "").strip()
+            if not style_id:
+                return self._error(400, "缺少 style_id")
+            try:
+                result = self._with_app(
+                    lambda app: app.firefire.archive_style(style_id))
+            except AifosError as exc:
+                return self._error(409, str(exc))
+            return self._json(result)
+
+        def _firefire_validation(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                session_id = body.get("session_id")
+                style_id = body.get("style_id")
+                result = self._with_app(
+                    lambda app: app.firefire.create_validation_task(
+                        title=body.get("title", ""),
+                        prompt=body.get("prompt", ""),
+                        session_id=(int(session_id)
+                                    if session_id not in (None, "") else None),
+                        style_id=(str(style_id).strip()
+                                  if style_id else None),
+                        references=body.get("references") or []))
+            except (AifosError, ValueError) as exc:
+                return self._error(400, str(exc))
+            return self._json(result, status=201)
+
+        def _firefire_knowledge(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                result = self._with_app(
+                    lambda app: app.firefire.create_knowledge(body))
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            return self._json(result, status=201)
+
+        def _firefire_knowledge_publish(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            knowledge_key = str(
+                body.get("knowledge_key") or "").strip()
+            if not knowledge_key:
+                return self._error(400, "缺少 knowledge_key")
+            try:
+                result = self._with_app(
+                    lambda app: app.firefire.publish_knowledge(
+                        knowledge_key,
+                        approved_by=body.get("approved_by", "human"),
+                        note=body.get("note", "")))
+            except AifosError as exc:
+                return self._error(409, str(exc))
+            return self._json(result)
+
+        def _firefire_knowledge_refresh(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            knowledge_key = str(
+                body.get("knowledge_key") or "").strip()
+            if not knowledge_key:
+                return self._error(400, "缺少 knowledge_key")
+            try:
+                result = self._with_app(
+                    lambda app: app.firefire.refresh_knowledge(
+                        knowledge_key))
+            except AifosError as exc:
+                return self._error(409, str(exc))
+            return self._json(result, status=201)
+
+        def _firefire_knowledge_resolve(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                result = self._with_app(
+                    lambda app: app.firefire.resolve_knowledge(
+                        stage=body.get("stage", ""),
+                        task_type=body.get("task_type", ""),
+                        query=body.get("query", ""),
+                        tags=body.get("tags") or [],
+                        limit=body.get("limit", 4)))
+            except (AifosError, TypeError, ValueError) as exc:
+                return self._error(400, str(exc))
+            return self._json(result)
+
+        def _produce(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                body = json.loads(
+                    self.rfile.read(length).decode("utf-8")) if length else {}
+            except ValueError:
+                return self._error(400, "请求体不是合法 JSON")
+            title = body.get("title")
+            number = body.get("episode")
+            sentence = body.get("sentence", "")
+            note = ""
+            if sentence or not (title and number):
+                try:
+                    title, number, note = self._with_app(
+                        lambda app: resolve_produce_target(
+                            app, sentence, title=title,
+                            number=int(number) if number else None))
+                except AifosError as exc:
+                    return self._error(400, str(exc))
+            script = None
+            if body.get("script_text"):
+                from ..script_import import (
+                    NoDialogueError, ScriptImportError, parse_any)
+                try:
+                    script = parse_any(
+                        body["script_text"], title, int(number))
+                except NoDialogueError:
+                    # 纯叙述/故事梗概没有可逐字抽取的对白——这不是用户
+                    # 的错,自动转 AI 编剧:原文全文作为剧情素材做影视化
+                    # 改编(台词由编剧补写),剧本仍停在等待确认关口人工审。
+                    source = str(body["script_text"]).strip()[:6000]
+                    premise = str(body.get("premise") or "").strip()
+                    body["premise"] = (
+                        (premise + "\n\n" if premise else "")
+                        + "【剧情素材,按影视化改编规则处理】\n" + source)
+                    note = ((note + ";") if note else "") + (
+                        "未识别到对白,已自动转 AI 编剧改编;"
+                        "剧本生成后会停在「等待确认」供你审阅")
+                except ScriptImportError as exc:
+                    return self._error(400, str(exc))
+            style_pack_id = str(body.get("style_pack_id") or "").strip()
+            selected_style = body.get("style", "")
+            if style_pack_id:
+                pack = self._with_app(lambda app: app.firefire.get_style(
+                    style_pack_id, approved_only=True))
+                if pack is None:
+                    return self._error(409, "所选火火独立风格不存在或尚未人工确认")
+                selected_style = pack["compiled_style"]
+            # Web 端默认走「预生产 → 确认 → 自动生产」流程
+            job_id = jobs.start(
+                title, int(number),
+                premise=body.get("premise", ""),
+                style=selected_style,
+                style_pack_id=style_pack_id,
+                force=bool(body.get("force")),
+                script=script,
+                review=bool(body.get("review", True)),
+                kind=body.get("kind")
+                if body.get("kind") in ("drama", "idol") else None,
+                action=("force_rebuild" if body.get("force") else
+                        "script_import" if script is not None else
+                        "produce"),
+                auto_select_assets=bool(
+                    body.get("auto_select_assets", True)),
+                fresh_assets=bool(
+                    body.get("fresh_assets", body.get("force", False))),
+                unique=True)
+            return self._json(
+                {"job_id": job_id, "title": title,
+                 "episode": int(number), "note": note}, status=202)
+
+        def _confirm(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                body = json.loads(
+                    self.rfile.read(length).decode("utf-8")) if length else {}
+            except ValueError:
+                return self._error(400, "请求体不是合法 JSON")
+            episode_id = body.get("episode_id")
+            if not episode_id:
+                return self._error(400, "缺少 episode_id")
+
+            def lookup(app):
+                episode = app.projects.get_episode(int(episode_id))
+                if episode is None:
+                    return None
+                project = app.db.query_one(
+                    "SELECT * FROM projects WHERE id=?",
+                    (episode["project_id"],))
+                return (project["title"], episode["number"],
+                        episode["status"], project["id"], episode["id"])
+
+            found = self._with_app(lookup)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number, status, project_id, found_episode_id = found
+            running = jobs.running_for(title, number)
+            if running:
+                return self._json({
+                    "job_id": running[0]["id"], "phase": status,
+                    "reused": True,
+                    "note": "本集已经在生产，无需重复确认",
+                }, status=202)
+            allowed = {"awaiting_script", "awaiting_cast",
+                       "awaiting_confirm"}
+            if status not in allowed:
+                return self._error(
+                    409, f"本集当前处于「{status}」，不能重复确认；"
+                    "请刷新查看当前生产进度")
+            if status == "awaiting_script":
+                try:
+                    self._with_app(
+                        lambda app: app.director.lock_story_analysis(
+                            found_episode_id))
+                except AifosError as exc:
+                    return self._error(409, str(exc))
+            revision_state = self._with_app(
+                lambda app: app.projects.latest_document(
+                    found_episode_id, "shot_revision_state")[0])
+            if (status == "awaiting_confirm"
+                    and (revision_state or {}).get("active")
+                    and not (revision_state or {}).get(
+                        "formal_ready", True)):
+                return self._error(
+                    409, "当前修订镜头是低质量试错图；请先在分镜表用中/高质量"
+                    "重画，低质量图不能交给 Seedance")
+            video_quality = body.get("video_quality")
+            if video_quality is not None:
+                try:
+                    video_quality = normalize_quality(
+                        video_quality, allow_auto=True,
+                        field="video_quality")
+                    self._with_app(
+                        lambda app: app.director.update_quality_policy(
+                            found_episode_id,
+                            video_default=video_quality))
+                except AifosError as exc:
+                    return self._error(400, str(exc))
+            # 旧版本会在人物/核心道具候选处要求用户逐张手机确认。现在由
+            # AI 对所有候选做视觉排序并自动锁定最高分；人工改选只作为事后
+            # 可选覆盖，因此旧 awaiting_cast 状态也可直接续跑完成自动定版。
+            # 剧本确认 → 继续预生产(画完人物/分镜再停一次);
+            # 开拍确认 → 自动完成视频/配音/剪辑/质检
+            job_id = jobs.start(
+                title, number,
+                review=(status in ("awaiting_script", "awaiting_cast")),
+                action=("confirm_script" if status == "awaiting_script"
+                        else "confirm_cast" if status == "awaiting_cast"
+                        else "confirm_preflight"),
+                auto_select_assets=True,
+                resume_after_preflight=(status == "awaiting_confirm"),
+                unique=True)
+            return self._json(
+                {"job_id": job_id, "phase": status}, status=202)
+
+        def _character_select(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            name = str(body.get("character") or "").strip()
+            index = body.get("candidate_index")
+            if not name or index is None:
+                return self._error(400, "缺少 character/candidate_index")
+            title, number = found
+            try:
+                result = self._with_app(
+                    lambda app: app.director.select_character_candidate(
+                        title, number, name, int(index)))
+            except (AifosError, TypeError, ValueError) as exc:
+                return self._error(400, str(exc))
+            return self._json(result)
+
+        def _prop_select(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            name = str(body.get("prop") or "").strip()
+            index = body.get("candidate_index")
+            if not name or index is None:
+                return self._error(400, "缺少 prop/candidate_index")
+            title, number = found
+            try:
+                result = self._with_app(
+                    lambda app: app.director.select_prop_candidate(
+                        title, number, name, int(index)))
+            except (AifosError, TypeError, ValueError) as exc:
+                return self._error(400, str(exc))
+            return self._json(result)
+
+        def _character_assets_policy(self):
+            """保存本集人物扩展资产的自动/简化/完整选择。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            mode = str(body.get("mode") or "").strip().lower()
+            if mode not in ("auto", "simple", "full"):
+                return self._error(
+                    400, "mode 需为 auto、simple 或 full")
+            expected_version = body.get("expected_version")
+            if (isinstance(expected_version, bool)
+                    or not isinstance(expected_version, int)
+                    or expected_version < 0):
+                return self._error(
+                    400, "expected_version 需为页面返回的非负整数，请刷新后重试")
+            title, number = found
+            if jobs.running_for(title, number):
+                return self._error(
+                    409, "本集正在生产，不能中途切换人物资产模式；请先停止生成")
+            try:
+                policy = self._with_app(
+                    lambda app: app.director.update_character_asset_policy(
+                        int(body["episode_id"]), mode,
+                        expected_version=expected_version))
+            except AifosError as exc:
+                return self._error(409, str(exc))
+            return self._json({
+                "policy": policy, "version": policy["version"]})
+
+        def _character_regenerate(self):
+            """放弃人物定版并重新生成候选,不绕过人物选择门禁。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            character_name = str(body.get("character") or "").strip()
+            prop_name = str(body.get("prop") or "").strip()
+            if character_name and prop_name:
+                return self._error(400, "character 与 prop 只能指定一个")
+            if jobs.running_for(title, number):
+                return self._error(
+                    409, "本集正在生产，请先暂停，待状态稳定后再重做人物候选")
+            job_id = jobs.start_task(
+                title, number,
+                lambda app, run_id: app.director.regenerate_character_candidates(
+                    title, number, run_id=run_id,
+                    character_name=character_name,
+                    prop_name=prop_name),
+                action="regenerate_cast",
+                request={
+                    "reason": "manual_regenerate_cast",
+                    "character": character_name,
+                    "prop": prop_name,
+                })
+            return self._json({"job_id": job_id}, status=202)
+
+        def _character_refine_prompt(self):
+            """用户意见 → AI 深度改写人物形象提示词(仅预览,不出图)。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            character = str(body.get("character") or "").strip()
+            feedback = str(body.get("feedback") or "").strip()
+            if not character:
+                return self._error(400, "缺少 character")
+            if not feedback:
+                return self._error(400, "请填写修改意见")
+            job_id = jobs.start_task(
+                title, number,
+                lambda app, run_id: app.director.refine_character_prompt(
+                    title, number, character, feedback),
+                action="refine_character_prompt",
+                request={"character": character, "feedback": feedback})
+            return self._json({"job_id": job_id}, status=202)
+
+        def _character_refine_apply(self):
+            """确认改写后的提示词:写入人物设定并重生成四张候选。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            character = str(body.get("character") or "").strip()
+            prompt = str(body.get("image_prompt") or "").strip()
+            if not character:
+                return self._error(400, "缺少 character")
+            if not prompt:
+                return self._error(400, "缺少确认后的 image_prompt")
+            if jobs.running_for(title, number):
+                return self._error(
+                    409, "本集正在生产，请先暂停，待状态稳定后再改人物形象")
+            job_id = jobs.start_task(
+                title, number,
+                lambda app, run_id: app.director.apply_character_prompt(
+                    title, number, character, prompt,
+                    feedback=str(body.get("feedback") or ""),
+                    run_id=run_id),
+                action="regenerate_cast",
+                request={"reason": "refine_character_prompt_apply",
+                         "character": character})
+            return self._json({"job_id": job_id}, status=202)
+
+        def _episode_ref(self, body):
+            episode_id = body.get("episode_id")
+            if not episode_id:
+                return None
+
+            def lookup(app):
+                episode = app.projects.get_episode(int(episode_id))
+                if episode is None:
+                    return None
+                project = app.db.query_one(
+                    "SELECT * FROM projects WHERE id=?",
+                    (episode["project_id"],))
+                return project["title"], episode["number"]
+
+            return self._with_app(lookup)
+
+        def _read_body(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                return json.loads(
+                    self.rfile.read(length).decode("utf-8")) if length else {}
+            except ValueError:
+                return None
+
+        def _scene3d_save(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                query = parse_qs(urlparse(self.path).query)
+                episode_id = int(
+                    body.get("episode_id")
+                    or query.get("episode", [0])[0])
+            except (TypeError, ValueError):
+                return self._error(400, "缺少合法 episode_id")
+            try:
+                result = self._with_app(
+                    lambda app: _scene3d_save_edits(app, episode_id, body))
+            except DocumentConflictError as exc:
+                return self._json({
+                    "error": "三维场景已被其他操作更新",
+                    "message": str(exc),
+                    "physical_scene_id": str(
+                        body.get("physical_scene_id")
+                        or body.get("location") or ""),
+                    "expected_revision": exc.expected_version,
+                    "actual_revision": exc.actual_version,
+                    "expected": exc.expected_version,
+                    "actual": exc.actual_version,
+                }, status=409)
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            if result is None:
+                return self._error(404, "剧集不存在")
+            return self._json(result, status=201)
+
+        def _scene3d_appearance(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                query = parse_qs(urlparse(self.path).query)
+                episode_id = int(
+                    body.get("episode_id")
+                    or query.get("episode", [0])[0])
+            except (TypeError, ValueError):
+                return self._error(400, "缺少合法 episode_id")
+            try:
+                result = self._with_app(lambda app:
+                    _scene3d_refresh_appearance(app, episode_id, body))
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            if result is None:
+                return self._error(404, "剧集不存在")
+            return self._json(result, status=201)
+
+        @staticmethod
+        def _expected_rule_version(body):
+            value = body.get("expected_version")
+            if (isinstance(value, bool) or not isinstance(value, int)
+                    or value < 0):
+                raise AifosError("expected_version 必须是非负整数")
+            return value
+
+        @staticmethod
+        def _request_id_matches(body, key, expected):
+            if key not in body:
+                return True
+            value = body.get(key)
+            return (not isinstance(value, bool)
+                    and isinstance(value, int) and value == int(expected))
+
+        def _project_rules_get(self, project_id):
+            def load(app):
+                project = app.projects.get_project_by_id(project_id)
+                if project is None:
+                    return None
+                content, version = app.projects.latest_project_document(
+                    project_id, "project_rules")
+                return _rule_pack_payload(
+                    content, version, project_id=project_id,
+                    kind="project_rules")
+
+            payload = self._with_app(load)
+            if payload is None:
+                return self._error(404, "项目不存在")
+            return self._json(payload)
+
+        def _project_rules_save(self, project_id):
+            body = self._read_body()
+            if body is None or not isinstance(body, dict):
+                return self._error(400, "请求体不是合法 JSON 对象")
+            if not self._request_id_matches(body, "project_id", project_id):
+                return self._error(409, "请求项目与 URL 项目不一致，已拒绝保存")
+            try:
+                expected = self._expected_rule_version(body)
+                content = _creative_rule_request(body, PROJECT_RULE_SCOPE)
+                binding_error = _creative_pack_binding_error(
+                    content, project_id)
+                if binding_error:
+                    return self._error(409, binding_error + "，已拒绝保存")
+
+                def save(app):
+                    if app.projects.get_project_by_id(project_id) is None:
+                        return None
+                    version = app.projects.save_project_document_cas(
+                        project_id, "project_rules", content, expected)
+                    return _rule_pack_payload(
+                        content, version, project_id=project_id,
+                        kind="project_rules")
+
+                payload = self._with_app(save)
+            except DocumentConflictError as exc:
+                return self._json({
+                    "error": str(exc),
+                    "expected_version": exc.expected_version,
+                    "actual_version": exc.actual_version,
+                }, status=409)
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            if payload is None:
+                return self._error(404, "项目不存在")
+            return self._json(payload)
+
+        def _episode_rule_binding(self, episode_id):
+            def load(app):
+                episode = app.projects.get_episode(episode_id)
+                if episode is None:
+                    return None
+                project = app.projects.get_project_by_id(
+                    episode["project_id"])
+                if project is None:
+                    return None
+                return dict(episode), dict(project)
+            return self._with_app(load)
+
+        def _episode_rules_get(self, episode_id, query):
+            binding = self._episode_rule_binding(episode_id)
+            if binding is None:
+                return self._error(404, "剧集不存在")
+            episode, project = binding
+            requested_project = query.get("project_id", [None])[0]
+            if requested_project is not None:
+                try:
+                    requested_project = int(requested_project)
+                except (TypeError, ValueError):
+                    return self._error(400, "project_id 必须是数字")
+                if requested_project != int(project["id"]):
+                    return self._error(
+                        409, "请求项目与该剧集所属项目不一致，已拒绝读取")
+
+            content, version = self._with_app(
+                lambda app: app.projects.latest_document(
+                    episode_id, "episode_rules"))
+            return self._json(_rule_pack_payload(
+                content, version, project_id=project["id"],
+                episode_id=episode_id, kind="episode_rules"))
+
+        def _episode_rule_stack(self, episode_id, query):
+            raw_shot_no = query.get("shot_no", [None])[0]
+            try:
+                shot_no = int(raw_shot_no)
+            except (TypeError, ValueError):
+                return self._error(400, "shot_no 必须是正整数")
+            if shot_no <= 0:
+                return self._error(400, "shot_no 必须是正整数")
+
+            requested_project = query.get("project_id", [None])[0]
+            if requested_project is not None:
+                try:
+                    requested_project = int(requested_project)
+                except (TypeError, ValueError):
+                    return self._error(400, "project_id 必须是数字")
+            stage = str(query.get("stage", [""])[0] or "production").strip()
+            modality = str(
+                query.get("modality", [""])[0] or "production").strip()
+
+            def resolve(app):
+                episode = app.projects.get_episode(episode_id)
+                if episode is None:
+                    return None
+                project = app.projects.get_project_by_id(
+                    episode["project_id"])
+                if project is None:
+                    return None
+                if (requested_project is not None
+                        and requested_project != int(project["id"])):
+                    return {"binding_conflict": True}
+
+                standard_snapshot, _ = app.projects.latest_document(
+                    episode_id, "production_standard")
+                if standard_snapshot is None and app.standards is not None:
+                    standard_snapshot = app.standards.active()
+                standard_snapshot = (
+                    standard_snapshot
+                    if isinstance(standard_snapshot, dict) else {})
+                script, _ = app.projects.latest_document(
+                    episode_id, "script")
+                storyboard, _ = app.projects.latest_document(
+                    episode_id, "storyboard")
+                script = script if isinstance(script, dict) else {}
+                storyboard = (
+                    storyboard if isinstance(storyboard, dict) else {})
+                shots = list(storyboard.get("shots") or [])
+                shot = None
+                for item in shots:
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        item_shot_no = int(item.get("shot_no", -1))
+                    except (TypeError, ValueError):
+                        continue
+                    if item_shot_no == shot_no:
+                        shot = copy.deepcopy(item)
+                        break
+                if shot is None:
+                    if shots:
+                        return {"shot_missing": True}
+                    # 规则编辑可早于分镜；此时仍能预览 shot_nos 适用范围。
+                    shot = {"shot_no": shot_no}
+                ctx = {
+                    "project": dict(project),
+                    "episode": dict(episode),
+                    "production_standard": standard_snapshot,
+                    "production_profile": production_profile(
+                        app.config, standard_snapshot),
+                    "script": script,
+                    "storyboard": storyboard or {"shots": []},
+                }
+                ctx["rule_layers"] = app.director._load_rule_layers(
+                    ctx["project"], ctx["episode"], standard_snapshot)
+                resolved = app.director._resolve_effective_rules(
+                    ctx, shot=shot, stage=stage, modality=modality)
+                payload = resolved.as_dict()
+                payload.update({
+                    "project_id": int(project["id"]),
+                    "episode_id": int(episode["id"]),
+                    "shot_no": shot_no,
+                    "effective_rules": copy.deepcopy(resolved.rules),
+                    # 解析器以 overridden 保存被高优先级替换的审计记录；
+                    # API 兼容使用者熟悉的 suppressed 命名，但不另做裁决。
+                    "suppressed": copy.deepcopy(resolved.overridden),
+                    "project_rule_version": ctx["rule_layers"][
+                        "project_version"],
+                    "episode_rule_version": ctx["rule_layers"][
+                        "episode_version"],
+                })
+                return payload
+
+            try:
+                payload = self._with_app(resolve)
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            if payload is None:
+                return self._error(404, "剧集不存在")
+            if payload.pop("binding_conflict", False):
+                return self._error(
+                    409, "请求项目与该剧集所属项目不一致，已拒绝读取")
+            if payload.pop("shot_missing", False):
+                return self._error(404, f"镜头不存在: {shot_no}")
+            return self._json(payload)
+
+        def _episode_rules_save(self, episode_id):
+            body = self._read_body()
+            if body is None or not isinstance(body, dict):
+                return self._error(400, "请求体不是合法 JSON 对象")
+            if not self._request_id_matches(body, "episode_id", episode_id):
+                return self._error(409, "请求剧集与 URL 剧集不一致，已拒绝保存")
+            binding = self._episode_rule_binding(episode_id)
+            if binding is None:
+                return self._error(404, "剧集不存在")
+            episode, project = binding
+            if not self._request_id_matches(
+                    body, "project_id", project["id"]):
+                return self._error(
+                    409, "请求项目与该剧集所属项目不一致，已拒绝保存")
+            try:
+                expected = self._expected_rule_version(body)
+                content = _creative_rule_request(body, EPISODE_RULE_SCOPE)
+                binding_error = _creative_pack_binding_error(
+                    content, project["id"], episode_id)
+                if binding_error:
+                    return self._error(409, binding_error + "，已拒绝保存")
+                version = self._with_app(
+                    lambda app: app.projects.save_document_cas(
+                        episode["id"], "episode_rules", content, expected))
+            except DocumentConflictError as exc:
+                return self._json({
+                    "error": str(exc),
+                    "expected_version": exc.expected_version,
+                    "actual_version": exc.actual_version,
+                }, status=409)
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            return self._json(_rule_pack_payload(
+                content, version, project_id=project["id"],
+                episode_id=episode_id, kind="episode_rules"))
+
+        def _director_statement_save(self):
+            """导演阐述:{episode_id, statement{intent,tone,pacing,
+            key_shots,emotional_peaks,avoid}}。本集意图锚,AI 导演逐镜
+            查偏的基准;previz 页可读写。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                episode_id = int(body.get("episode_id") or body.get("episode"))
+            except (TypeError, ValueError):
+                return self._error(400, "缺少 episode_id")
+            raw = body.get("statement")
+            if not isinstance(raw, dict):
+                return self._error(400, "缺少 statement 对象")
+            from ..director import Director
+            statement = {
+                key: str(raw.get(key) or "").strip()[:400]
+                for key, _label in Director.STATEMENT_FIELDS}
+            statement["schema"] = "aifos.director-statement/v1"
+
+            def _save(app):
+                if app.projects.get_episode(episode_id) is None:
+                    raise AifosError("剧集不存在")
+                version = app.projects.save_document(
+                    episode_id, "director_statement", statement)
+                return {"ok": True, "version": version,
+                        "statement": statement}
+            try:
+                return self._json(self._with_app(_save))
+            except AifosError as exc:
+                return self._error(400, str(exc))
+
+        def _shot_ai_direct(self):
+            """AI 导演审单镜:{episode_id, shot_no}。同步返回建议
+            (镜头五维/光影/意见/理由),由前端填入导演台供人审;
+            不直接改分镜(apply 由人按「按导演指令重画」触发)。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            try:
+                shot_no = int(body.get("shot_no"))
+            except (TypeError, ValueError):
+                return self._error(400, "缺少 shot_no")
+            try:
+                suggestion = self._with_app(
+                    lambda app: app.director.ai_direct_shot(
+                        title, number, shot_no,
+                        apply=bool(body.get("apply"))))
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            return self._json(suggestion)
+
+        def _shot_direct(self):
+            """导演台:{episode_id, shot_no, camera{五维}, lighting_style,
+            note, clear_note, redo}。指令写进分镜;redo=true 且产线空闲时
+            顺手把该镜加入重画队列。生产运行中只写指令不重画。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            try:
+                shot_no = int(body.get("shot_no"))
+            except (TypeError, ValueError):
+                return self._error(400, "缺少 shot_no")
+            try:
+                result = self._with_app(
+                    lambda app: app.director.direct_shot(
+                        title, number, shot_no,
+                        camera=body.get("camera"),
+                        lighting_style=str(body.get("lighting_style") or ""),
+                        note=str(body.get("note") or ""),
+                        clear_note=bool(body.get("clear_note")),
+                        motion_reference=str(
+                            body.get("motion_reference") or "")))
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            result["redo_queued"] = False
+            if body.get("redo"):
+                if jobs.production_running_for(title, number):
+                    result["redo_note"] = (
+                        "生产运行中:指令已保存,恢复后重画本镜生效;"
+                        "或先暂停再点重画")
+                else:
+                    # 重画是分钟级长任务,必须走后台任务通道,
+                    # 不能在请求线程里同步跑
+                    job_id = jobs.start_task(
+                        title, number,
+                        lambda app, run_id, report: app.director.redo_items(
+                            title, number,
+                            item_ids=[f"shot:{shot_no}"],
+                            progress=report),
+                        action="redo_items", tracked=True,
+                        request={"item_ids": [f"shot:{shot_no}"],
+                                 "source": "director_console"})
+                    result["redo_queued"] = True
+                    result["job_id"] = job_id
+            return self._json(result)
+
+        def _scene_skip(self):
+            """场次「暂不生成/恢复生成」:{title/episode_id, scene_no, skip}。
+            随时可切换,下次(恢复)生产时生效;单场跑通全流程测试用。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            try:
+                scene_no = int(body.get("scene_no"))
+            except (TypeError, ValueError):
+                return self._error(400, "缺少 scene_no")
+            try:
+                result = self._with_app(
+                    lambda app: app.director.set_scene_generation(
+                        title, number, scene_no,
+                        bool(body.get("skip", True))))
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            return self._json(result)
+
+        def _scene_delete(self):
+            """删除一场并级联:剧本/分镜去场、镜头产物软删、
+            连续性圣经下次生产自动按新剧本重建。生产运行中禁止。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            try:
+                scene_no = int(body.get("scene_no"))
+            except (TypeError, ValueError):
+                return self._error(400, "缺少 scene_no")
+            if jobs.production_running_for(title, number):
+                return self._error(
+                    409, "本集正在生产，请先点「停止生成」，"
+                         "待状态稳定后再删除场次")
+            try:
+                result = self._with_app(
+                    lambda app: app.director.delete_scene(
+                        title, number, scene_no))
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            return self._json(result)
+
+        def _revise(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            feedback = (body.get("feedback") or "").strip()
+            if not feedback:
+                return self._error(400, "请填写修改意见")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            # 重写会 force 重跑预生产,与正在跑的整集生产互斥;
+            # 先暂停再提交,避免两个任务同时改同一份 render_plan。
+            if jobs.production_running_for(title, number):
+                return self._error(
+                    409, "本集正在生产，请先点「停止生成」，"
+                         "待状态稳定后再提交剧本重写")
+            job_id = jobs.start_task(
+                title, number,
+                lambda app, run_id: app.director.revise_script(
+                    title, number, feedback, run_id=run_id),
+                action="revise_script", request={"feedback": feedback})
+            return self._json({"job_id": job_id}, status=202)
+
+        def _shot_candidate_request(self, body, *, require_contract=False):
+            """规范化候选组 CAS；兼容新 UI 与 expected_* 正式字段。"""
+            try:
+                shot_no = int(body.get("shot_no"))
+                revision = int(_candidate_request_value(
+                    body, "expected_candidate_revision",
+                    "candidate_revision", "expected_revision", "revision"))
+            except (TypeError, ValueError):
+                raise AifosError(
+                    "缺少合法 shot_no/expected_candidate_revision")
+            group_id = str(_candidate_request_value(
+                body, "expected_candidate_set_id", "candidate_set_id")
+                or "").strip()
+            token = str(_candidate_request_value(
+                body, "expected_candidate_set_token",
+                "candidate_set_token", "expected_token", "token")
+                or "").strip()
+            if shot_no < 1 or revision < 1 or not group_id or not token:
+                raise AifosError(
+                    "缺少完整候选组CAS：candidate_set_id/token/revision")
+            contract_revision = _candidate_request_value(
+                body, "expected_contract_revision", "contract_revision")
+            if require_contract and contract_revision in (None, ""):
+                raise AifosError(
+                    "单图编辑返修必须提供 contract_revision")
+            if contract_revision not in (None, ""):
+                try:
+                    contract_revision = int(contract_revision)
+                except (TypeError, ValueError) as exc:
+                    raise AifosError(
+                        "contract_revision 必须是正整数") from exc
+                if contract_revision < 1:
+                    raise AifosError(
+                        "contract_revision 必须是正整数")
+            return {
+                "shot_no": shot_no,
+                "candidate_set_id": group_id,
+                "candidate_set_token": token,
+                "candidate_revision": revision,
+                "contract_revision": contract_revision,
+            }
+
+        @staticmethod
+        def _assert_candidate_cas(app, title, number, expected):
+            """重生成入队前先快照校验；后台 Director 仍会再次原子校验。"""
+            state = app.director.shot_candidate_selection_state(
+                title, number, shot_no=expected["shot_no"])
+            item = next((
+                row for row in (state.get("items") or [])
+                if int(row.get("shot_no") or 0) == expected["shot_no"]
+            ), None)
+            if item is None:
+                raise AifosError(
+                    "selection_conflict: 当前镜头没有可重生成的候选组")
+            group = (item.get("candidate_group") or item.get("group")
+                     or item)
+            try:
+                actual_revision = int(
+                    group.get("candidate_revision") or 0)
+                actual_contract = int(
+                    group.get("contract_revision") or 0)
+            except (TypeError, ValueError):
+                actual_revision = 0
+                actual_contract = 0
+            stale = (
+                str(group.get("candidate_set_id") or "")
+                != expected["candidate_set_id"]
+                or str(group.get("candidate_set_token") or "")
+                != expected["candidate_set_token"]
+                or actual_revision != expected["candidate_revision"]
+                or (expected.get("contract_revision") is not None
+                    and actual_contract != expected["contract_revision"]))
+            if stale:
+                raise AifosError(
+                    "stale_candidate_set: 候选组已更新，请刷新后再操作")
+            return state
+
+        def _shot_candidate_select(self):
+            """明确选择一张当前候选；选择本身永不被旧生产门禁拦截。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            try:
+                expected = self._shot_candidate_request(body)
+                candidate_id = str(
+                    body.get("candidate_id") or "").strip()
+                candidate_index = body.get("candidate_index")
+                if candidate_index not in (None, ""):
+                    candidate_index = int(candidate_index)
+                else:
+                    candidate_index = 0
+                if not candidate_id and candidate_index < 1:
+                    raise AifosError(
+                        "缺少 candidate_id/candidate_index")
+            except (AifosError, TypeError, ValueError) as exc:
+                return self._error(400, str(exc))
+            title, number = found
+
+            def select(app):
+                result = dict(app.director.select_shot_candidate(
+                    title, number, expected["shot_no"],
+                    expected["candidate_set_id"],
+                    expected["candidate_set_token"],
+                    expected["candidate_revision"],
+                    candidate_id, candidate_index,
+                    source="manual"))
+                # 选择接口也遵守路径边界；前端刷新 episode 获取完整候选组。
+                selected_uri = str(result.pop("selected_uri", "") or "")
+                result["selected_url"] = (
+                    _artifact_url(app, selected_uri)
+                    or result.get("selected_url"))
+                result["source"] = "manual"
+                return result
+
+            try:
+                result = self._with_app(select)
+            except AifosError as exc:
+                return self._error(
+                    409 if _candidate_conflict(exc) else 400, str(exc))
+
+            # 只有“本次刚好选完最后一镜”才排断点续产。Director 的幂等
+            # 返回 + JobRegistry 的同 action 原子去重共同保证不会重复开工。
+            if (result.get("need_resume")
+                    and result.get("last_pending")
+                    and not result.get("already_selected")):
+                job_id = jobs.start_task(
+                    title, number,
+                    lambda app, run_id: app.director.produce(
+                        title, number, run_id=run_id),
+                    action="image_selection_resume",
+                    request={
+                        "source": "shot_candidate_selection",
+                        "shot_no": expected["shot_no"],
+                        "candidate_set_id": expected[
+                            "candidate_set_id"],
+                        "candidate_revision": expected[
+                            "candidate_revision"],
+                    },
+                    queue=True, unique_action=True)
+                result["resume_job_id"] = job_id
+                job = jobs.get(job_id) or {}
+                result["resume_job_status"] = (
+                    job.get("status") or "queued")
+            else:
+                result["resume_job_id"] = None
+            return self._json(result)
+
+        def _shot_candidates_regenerate(self):
+            """以当前关键帧为基底排队编辑返修1张；不打断同集其他工作。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            if body.get("confirm_regenerate") is not True:
+                return self._error(
+                    400, "单图编辑返修需要 confirm_regenerate=true 二次确认")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            prompt = str(
+                body.get("prompt") or body.get("feedback") or "").strip()
+            if not prompt:
+                return self._error(400, "单图编辑返修必须提供完整 prompt")
+            try:
+                expected = self._shot_candidate_request(
+                    body, require_contract=True)
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            title, number = found
+            try:
+                self._with_app(lambda app: self._assert_candidate_cas(
+                    app, title, number, expected))
+            except AifosError as exc:
+                return self._error(
+                    409 if _candidate_conflict(exc) else 400, str(exc))
+
+            def regenerate(app, run_id):
+                result = dict(app.director.regenerate_shot_candidates(
+                    title, number, expected["shot_no"],
+                    expected["candidate_set_id"],
+                    expected["candidate_set_token"],
+                    expected["candidate_revision"], prompt,
+                    confirm=True))
+                if result.get("need_resume"):
+                    result["resume"] = app.director.produce(
+                        title, number, run_id=run_id)
+                return result
+
+            job_id = jobs.start_task(
+                title, number, regenerate,
+                action="regenerate_shot_candidates",
+                request={
+                    **expected,
+                    "prompt": prompt,
+                    "confirm_regenerate": True,
+                },
+                queue=True)
+            job = jobs.get(job_id) or {}
+            return self._json({
+                "job_id": job_id,
+                "status": job.get("status") or "queued",
+                "queue_position": job.get("queue_position") or 0,
+                "shot_no": expected["shot_no"],
+            }, status=202)
+
+        def _regen_image(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            target = body.get("target") or {}
+            if target.get("kind") not in ("character_art", "scene_art",
+                                          "shot", "character_sheet",
+                                          "frames", "first_frame",
+                                          "last_frame"):
+                return self._error(400, "target.kind 需为 character_art/"
+                                        "scene_art/shot/character_sheet/"
+                                        "frames/first_frame/last_frame")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            if (target.get("kind") == "shot"
+                    and self._with_app(_selection_mode_enabled)):
+                return self._error(
+                    409,
+                    "创作选片模式下禁止使用旧的单镜头重画接口；"
+                    "请在本镜候选区修改完整提示词，并调用 "
+                    "/api/shot-candidates/regenerate 携带当前候选组的 "
+                    "candidate_set_id、candidate_set_token、"
+                    "candidate_revision 和 contract_revision，"
+                    "以当前图为基底编辑返修1张。"
+                    "只有 /api/shot-candidates/select 可把返修图晋升为正式图")
+            # 整集生产时并行 worker 正在改整份 render_plan,改单张不安全,
+            # 仍要求先暂停。但"另一张图正在重画"不该拦住这一张——排队即可,
+            # 否则用户改完一张必须盯着等它跑完才能提交下一张。
+            if jobs.production_running_for(title, number):
+                return self._error(
+                    409, "本集正在生产，请先暂停，待状态稳定后再修改镜头")
+            feedback = (body.get("feedback") or "").strip()
+            prompt = (body.get("prompt") or "").strip()
+            quality = body.get("quality")
+            if quality is not None:
+                try:
+                    quality = normalize_quality(
+                        quality, allow_auto=True, field="image_quality")
+                except AifosError as exc:
+                    return self._error(400, str(exc))
+            # Codex 判「改合同/拆镜/人工」时默认熔断；前端确认合同已修好后
+            # 带 escalation_override 再来，才放行这一张。
+            override = bool(body.get("escalation_override"))
+            job_id = jobs.start_task(
+                title, number,
+                lambda app, run_id: app.director.regen_image(
+                    title, number, target, feedback=feedback,
+                    prompt_override=prompt, quality_override=quality,
+                    escalation_override=override),
+                action="regen_image",
+                request={"target": target, "feedback": feedback,
+                         "prompt": prompt, "quality": quality,
+                         "escalation_override": override},
+                # 不能用 unique:那会把第二张的请求并进第一张的 job,
+                # 前端轮询到第一张成功就以为改好了,第二张其实从未重画。
+                queue=True)
+            job = jobs.get(job_id) or {}
+            return self._json({
+                "job_id": job_id,
+                "status": job.get("status") or "running",
+                "queue_position": job.get("queue_position") or 0,
+            }, status=202)
+
+        def _selection_mode_update(self):
+            """一键创作选片模式:{enabled} 或按键传
+            image_content_qc/video_content_qc。只写 defaults 配置并回显,
+            生成/QC 流程语义由 director 侧消费方实现。"""
+            from ..settings import set_defaults
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            updates = {}
+            if "enabled" in body:
+                updates["selection_mode"] = body.get("enabled")
+            for key in ("selection_mode", "image_content_qc",
+                        "video_content_qc", "shot_candidate_count"):
+                if key in body:
+                    updates[key] = body.get(key)
+            if not updates:
+                return self._error(
+                    400, "缺少 enabled 或任一开关键")
+
+            def task(app):
+                from ..config import Config
+                set_defaults(app.workspace.config_path, updates)
+                # app.config 在写入前加载;重读文件回显持久化后的真实现状
+                fresh = Config.load(app.workspace.config_path)
+                result = _selection_mode_payload_from_config(fresh)
+                result["ok"] = True
+                return result
+            try:
+                return self._json(self._with_app(task))
+            except AifosError as exc:
+                return self._error(400, str(exc))
+
+        def _settings_update(self):
+            """设置中心保存 Provider、能力路由或整套图片策略。"""
+            from ..settings import set_icloud_sync, set_image_strategy, \
+                set_codex_profiles, set_routing, settings_payload, \
+                update_provider
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+
+            def task(app):
+                if body.get("codex_profiles") is not None:
+                    set_codex_profiles(app.workspace.config_path,
+                                       body.get("codex_profiles"))
+                elif body.get("provider"):
+                    update_provider(app.workspace.config_path,
+                                    body["provider"],
+                                    body.get("fields") or {})
+                elif body.get("image_strategy"):
+                    set_image_strategy(app.workspace.config_path,
+                                       body["image_strategy"])
+                elif body.get("defaults"):
+                    from ..settings import set_defaults
+                    set_defaults(app.workspace.config_path,
+                                 body["defaults"])
+                elif body.get("icloud_sync") is not None:
+                    values = body.get("icloud_sync") or {}
+                    if "enabled" not in values:
+                        raise AifosError("icloud_sync 缺少 enabled")
+                    set_icloud_sync(app.workspace.config_path,
+                                    values["enabled"])
+                elif body.get("capability"):
+                    chain = body.get("chain") or []
+                    if isinstance(chain, str):
+                        chain = [c.strip() for c in chain.split(",")
+                                 if c.strip()]
+                    set_routing(app.workspace.config_path,
+                                body["capability"], chain)
+                else:
+                    raise AifosError(
+                        "缺少 provider、capability 或 icloud_sync")
+
+            try:
+                self._with_app(task)
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            # 重新加载,回传保存后的完整视图
+            return self._json(self._with_app(settings_payload))
+
+        def _image_production_shards(self):
+            """返回图片任务按 Codex profile 的只读分片快照。
+
+            生产线程把 profile id 写入 render_plan 条目；这里仅汇总已有
+            清单，不启动任何 Provider，也不读取 CODEX_HOME 下的认证文件。
+            没有新任务时返回两个可用但空闲的通道，前端仍能明确看到配置
+            已生效，而不是把 404 误判成设置未保存。
+            """
+            def collect(app):
+                profiles = app.config.codex_profiles()
+                rows = {profile["id"]: {
+                    "id": profile["id"],
+                    "name": profile["name"],
+                    "assigned": 0,
+                    "running": 0,
+                    "completed": 0,
+                    "failed": 0,
+                    "active_jobs": [],
+                } for profile in profiles}
+                jobs_seen = set()
+                for job in jobs.list():
+                    if job.get("status") not in ("running", "done", "failed"):
+                        continue
+                    try:
+                        row = app.db.query_one(
+                            "SELECT p.id AS project_id, e.id AS episode_id "
+                            "FROM projects p JOIN episodes e "
+                            "ON e.project_id=p.id "
+                            "WHERE p.title=? AND e.number=?",
+                            (job.get("title"), int(job.get("episode"))),
+                        )
+                    except (TypeError, ValueError):
+                        row = None
+                    if row is None:
+                        continue
+                    plan_path = (app.workspace.artifacts_dir
+                                 / f"p{int(row['project_id']):03d}"
+                                 / f"e{int(job['episode']):03d}"
+                                 / "render_plan.json")
+                    try:
+                        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        continue
+                    for item in plan.get("items", []):
+                        profile_id = str(item.get("codex_profile") or "")
+                        target = rows.get(profile_id)
+                        if target is None or item.get("category") not in (
+                                "character_art", "character_sheet",
+                                "scene_art", "shot_image", "first_frame",
+                                "last_frame", "cover"):
+                            continue
+                        item_key = f"{job.get('id')}:{item.get('id')}"
+                        if item_key in jobs_seen:
+                            continue
+                        jobs_seen.add(item_key)
+                        target["assigned"] += 1
+                        status = item.get("status") or "pending"
+                        if status == "generating":
+                            target["running"] += 1
+                        elif status in ("done", "reused"):
+                            target["completed"] += 1
+                        elif status in ("failed", "awaiting_human"):
+                            target["failed"] += 1
+                        if status == "generating":
+                            target["active_jobs"].append({
+                                "id": item.get("id", ""),
+                                "status": status,
+                                "error": item.get("error", ""),
+                            })
+                for target in rows.values():
+                    finished = target["completed"] + target["failed"]
+                    target["progress"] = (
+                        finished / target["assigned"]
+                        if target["assigned"] else 0)
+                return {
+                    "shards": list(rows.values()),
+                    "codex_parallel": app.config.codex_parallel_status(),
+                }
+            return self._json(self._with_app(collect))
+
+        def _icloud_sync_backfill(self):
+            report = self._with_app(lambda app: app.icloud_sync.backfill())
+            if report.get("status") == "disabled":
+                return self._error(409, "请先启用 iCloud 图片同步")
+            return self._json(report)
+
+        def _settings_test(self):
+            from ..settings import test_provider
+            body = self._read_body()
+            if body is None or not body.get("provider"):
+                return self._error(400, "缺少 provider")
+            try:
+                report = self._with_app(
+                    lambda app: test_provider(app, body["provider"]))
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            return self._json(report)
+
+        def _settings_detect(self):
+            """自动检测本机 CLI 并接线,返回检测结果 + 最新设置视图。"""
+            from ..doctor import apply_detected, detect_clis
+            from ..settings import settings_payload
+
+            def task(app):
+                found = detect_clis()
+                applied = apply_detected(app.workspace.config_path, found)
+                return found, applied
+
+            found, applied = self._with_app(task)
+            view = self._with_app(settings_payload)
+            view["detected"] = found
+            view["applied"] = [{"provider": p, "path": path}
+                               for p, path in applied]
+            return self._json(view)
+
+        def _stop(self):
+            """停止生成:置 cancelling,流水线在下一次产线调用前安全停下,
+            落回最近的可调整检查点(剧本确认/开拍确认)。"""
+            body = self._read_body()
+            if body is None or not body.get("episode_id"):
+                return self._error(400, "缺少 episode_id")
+            stable = {"done", "failed", "qc_failed", "created",
+                      "awaiting_script", "awaiting_confirm"}
+
+            def inspect(app):
+                episode = app.projects.get_episode(int(body["episode_id"]))
+                if episode is None:
+                    raise AifosError("剧集不存在")
+                project = app.db.query_one(
+                    "SELECT * FROM projects WHERE id=?",
+                    (episode["project_id"],))
+                # 有正在运行的制作任务时,无论状态都允许停止
+                job_running = any(
+                    j["status"] == "running"
+                    and j.get("title") == project["title"]
+                    and j.get("episode") == episode["number"]
+                    for j in jobs.list())
+                if episode["status"] in stable and not job_running:
+                    raise AifosError("当前没有正在进行的生成")
+                project = app.db.query_one(
+                    "SELECT * FROM projects WHERE id=?",
+                    (episode["project_id"],))
+                return dict(episode), project["title"]
+
+            try:
+                episode, title = self._with_app(inspect)
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            active = jobs.running_for(title, episode["number"])
+            if not active:
+                landing = self._with_app(
+                    lambda app: app.history.recover_episode(
+                        episode["id"], "停止时未发现活动进程，已清理失联任务"))
+                return self._json({"status": landing,
+                                   "previous": episode["status"],
+                                   "recovered": True})
+
+            def cancel(app):
+                app.projects.set_episode_status(episode["id"], "cancelling")
+                for job in active:
+                    jobs.request_cancel(job["id"])
+                    app.history.mark_cancelling(job.get("run_id"))
+
+            self._with_app(cancel)
+            return self._json({"status": "cancelling",
+                               "previous": episode["status"],
+                               "run_ids": [j.get("run_id") for j in active]})
+
+        def _story_analysis(self):
+            """保存、锁定或重新运行剧本 AI 制作圣经。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            episode_id = int(body["episode_id"])
+            action = str(body.get("action") or "save").strip()
+            if action == "reanalyze":
+                if jobs.running_for(title, number):
+                    return self._error(409, "本集已有任务正在运行")
+                direction = str(
+                    body.get("creative_direction") or "").strip()
+                job_id = jobs.start_task(
+                    title, number,
+                    lambda app, run_id: app.director.reanalyze_story(
+                        title, number, direction, run_id=run_id),
+                    action="reanalyze_story",
+                    request={"creative_direction": direction},
+                    unique=True)
+                return self._json({"job_id": job_id}, status=202)
+            try:
+                if action == "lock":
+                    result = self._with_app(
+                        lambda app: app.director.lock_story_analysis(
+                            episode_id))
+                elif action == "save":
+                    analysis = body.get("analysis")
+                    if not isinstance(analysis, dict):
+                        return self._error(400, "缺少 analysis 制作圣经")
+                    result = self._with_app(
+                        lambda app: app.director.save_story_analysis(
+                            episode_id, analysis,
+                            expected_version=body.get("expected_version"),
+                            locked=bool(body.get("locked", False))))
+                else:
+                    return self._error(
+                        400, "action 仅支持 save / lock / reanalyze")
+            except AifosError as exc:
+                return self._error(409, str(exc))
+            return self._json(result)
+
+        def _project_style(self):
+            """画风确认:{project, style}。剧本确认页在开画前设定,
+            之后所有人物/场景/分镜出图提示都会带上该画风。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            title = (body.get("project") or "").strip()
+            style = (body.get("style") or "").strip()
+            if not title:
+                return self._error(400, "缺少 project")
+            if not style:
+                return self._error(400, "画风不能为空")
+
+            def task(app):
+                if app.projects.get_project(title) is None:
+                    raise AifosError(f"项目不存在: {title}")
+                project = app.projects.update_project(title, style=style)
+                app.logger.info("director", f"画风已确认: {style}")
+                return dict(project)
+
+            try:
+                project = self._with_app(task)
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            return self._json(project)
+
+        def _scene_expansion(self, query):
+            """场景视角母版完成度:带 location 查单个,不带查全部。"""
+            title = query.get("project", [""])[0].strip()
+            if not title:
+                return self._error(400, "缺少 project")
+            location = query.get("location", [""])[0].strip()
+            try:
+                if location:
+                    return self._json(self._with_app(
+                        lambda app: app.director.scene_expansion_state(
+                            title, location)))
+                return self._json(self._with_app(
+                    lambda app: app.director.scene_expansion_overview(title)))
+            except Exception as exc:
+                return self._error(400, str(exc))
+
+        def _scene_expand(self):
+            """生成 720° 全景母版 + 四向视角;已有的默认跳过不重复烧额度。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            title = (body.get("project") or "").strip()
+            location = (body.get("location") or "").strip()
+            if not title or not location:
+                return self._error(400, "缺少 project/location")
+            directions = body.get("directions")
+            if directions is not None and not isinstance(directions, list):
+                return self._error(400, "directions 必须是数组")
+            try:
+                result = self._with_app(
+                    lambda app: app.director.expand_scene_views(
+                        title, location,
+                        regenerate=bool(body.get("regenerate")),
+                        style=body.get("style"),
+                        quality=(body.get("quality") or "high"),
+                        include_panorama=body.get(
+                            "include_panorama", True) is not False,
+                        directions=directions))
+            except Exception as exc:
+                return self._error(400, str(exc))
+            return self._json(result, status=201)
+
+        def _project_create(self):
+            """自定义作品名/资产库名:不必先跑一集就能建壳并往里存资产。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            title = (body.get("title") or "").strip()
+            if not title:
+                return self._error(400, "请填写作品名")
+            if len(title) > 60:
+                return self._error(400, "作品名不能超过 60 个字")
+
+            def task(app):
+                project, created = app.projects.get_or_create_project(
+                    title, style=(body.get("style") or "").strip(),
+                    aspect=(body.get("aspect") or "").strip())
+                if created:
+                    app.logger.info(
+                        "web", f"已新建作品/资产库《{title}》(暂无剧集,"
+                        "可直接在资产中心生产自建资产)")
+                return {**dict(project), "created": created}
+
+            try:
+                return self._json(self._with_app(task), status=201)
+            except Exception as exc:
+                return self._error(400, str(exc))
+
+        def _project_shell(self, query):
+            """删除剧名前的体检:还剩几集、几张图,能不能删。"""
+            title = query.get("project", [""])[0].strip()
+            if not title:
+                return self._error(400, "缺少 project")
+            summary = self._with_app(
+                lambda app: app.history.project_shell_summary(title))
+            if summary is None:
+                return self._error(404, f"作品不存在: {title}")
+            return self._json(summary)
+
+        def _project_delete(self):
+            """删除只剩空壳的剧名;有剧集记录的一律拒绝,磁盘原图不动。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            title = (body.get("title") or "").strip()
+            if not title:
+                return self._error(400, "缺少 title")
+            try:
+                result = self._with_app(
+                    lambda app: app.history.delete_project(
+                        title, delete_assets=bool(body.get("delete_assets"))))
+            except Exception as exc:
+                return self._error(400, str(exc))
+            return self._json(result)
+
+        def _project_rename(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+
+            def task(app):
+                title = body.get("title")
+                if not title and body.get("project_id"):
+                    row = app.db.query_one(
+                        "SELECT * FROM projects WHERE id=?",
+                        (int(body["project_id"]),))
+                    if row is None:
+                        raise AifosError("项目不存在")
+                    title = row["title"]
+                return dict(app.projects.rename_project(
+                    title, body.get("new_title", "")))
+
+            try:
+                project = self._with_app(task)
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            return self._json(project)
+
+        def _update_now(self):
+            """手动触发自更新:更新成功后 1 秒重启服务(自动恢复)。"""
+            busy = any(j["status"] == "running" for j in jobs.list())
+            if busy:
+                return self._error(409, "有生产任务在跑,空闲后会自动更新")
+            status, detail = check_and_update(repo_root())
+            if status == "updated":
+                def later():
+                    time.sleep(1)
+                    restart_process()
+                threading.Thread(target=later, daemon=True).start()
+            return self._json({"status": status, "detail": detail})
+
+        def _qc_item(self):
+            """单张质检:{episode_id|project+episode, item_id}(同步返回结果)。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            item_id = (body.get("item_id") or "").strip()
+            if not item_id:
+                return self._error(400, "缺少 item_id")
+            title, number = found
+            try:
+                report = self._with_app(
+                    lambda app: app.director.qc_item(title, number, item_id))
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            return self._json(report)
+
+        def _qc_override(self):
+            """人工通过轻微问题图:{episode_id,item_ids,note,only_failed}."""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            item_ids = body.get("item_ids")
+            if item_ids is not None and not isinstance(item_ids, list):
+                return self._error(400, "item_ids 必须是数组")
+            try:
+                result = self._with_app(
+                    lambda app: app.director.manual_qc_pass(
+                        title, number, item_ids=item_ids,
+                        only_failed=bool(body.get("only_failed")),
+                        note=str(body.get("note") or "").strip()))
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            return self._json(result)
+
+        def _qc_all(self):
+            """批量质检:后台逐张核对(可暂停)。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            include_existing = bool(body.get("include_existing"))
+            auto_repair = bool(body.get("auto_repair", True))
+            parallel = bool(body.get("parallel"))
+            categories = body.get("categories")
+            if categories is not None and not isinstance(categories, list):
+                return self._error(400, "categories 必须是数组")
+            job_id = jobs.start_task(
+                title, number,
+                lambda app, run_id, report: app.director.qc_all(
+                    title, number,
+                    include_existing=include_existing,
+                    auto_repair=auto_repair,
+                    parallel=parallel,
+                    progress=report,
+                    categories=categories),
+                action=("recheck_current_storyboard"
+                        if include_existing else "qc_all"),
+                tracked=True,
+                request={
+                    "include_existing": include_existing,
+                    "auto_repair": auto_repair,
+                    "parallel": parallel,
+                    "categories": categories,
+                })
+            return self._json({"job_id": job_id}, status=202)
+
+        def _image_acceleration_options(self, query):
+            value = query.get("episode_id", [""])[0]
+            try:
+                episode_id = int(value)
+            except (TypeError, ValueError):
+                return self._error(400, "缺少有效 episode_id")
+            found = self._episode_ref({"episode_id": episode_id})
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+
+            def load(app):
+                payload = app.director.image_acceleration_options(
+                    title, number)
+                for item in payload.get("items", []):
+                    for ref in (item.get("references") or {}).get(
+                            "items", []):
+                        ref["url"] = _artifact_url(
+                            app, ref.get("uri", ""))
+                return payload
+
+            return self._json(self._with_app(load))
+
+        def _image_acceleration_body(self):
+            body = self._read_body()
+            if body is None:
+                return None, None, (400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return None, None, (404, "剧集不存在")
+            if not isinstance(body.get("item_ids"), list):
+                return None, None, (400, "item_ids 必须是数组")
+            return body, found, None
+
+        def _image_acceleration_preflight(self):
+            body, found, error = self._image_acceleration_body()
+            if error is not None:
+                return self._error(*error)
+            title, number = found
+            try:
+                report = self._with_app(
+                    lambda app: app.director.preflight_image_acceleration(
+                        title, number, body.get("item_ids"),
+                        str(body.get("provider") or ""),
+                        str(body.get("model") or ""),
+                        quality=body.get("quality") or "medium",
+                        contract_tokens=body.get("contract_tokens") or {}))
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            return self._json(report)
+
+        def _image_acceleration_queue(self):
+            body, found, error = self._image_acceleration_body()
+            if error is not None:
+                return self._error(*error)
+            title, number = found
+            try:
+                report = self._with_app(
+                    lambda app: app.director.queue_image_acceleration(
+                        title, number, body.get("item_ids"),
+                        str(body.get("provider") or ""),
+                        str(body.get("model") or ""),
+                        quality=body.get("quality") or "medium",
+                        fingerprint=str(body.get("fingerprint") or ""),
+                        contract_tokens=body.get("contract_tokens") or {}))
+            except AifosError as exc:
+                return self._error(409, str(exc))
+            running = jobs.running_for(title, number)
+            if running:
+                job_id = running[0]["id"]
+                report["dispatch"] = "current_job"
+            else:
+                # 没有主任务时从断点恢复；真正的 API 调用仍由这一条原
+                # Director 流水线完成，不另开抢跑的图片 worker。
+                job_id = jobs.start(
+                    title, number, review=False,
+                    action="image_acceleration_resume")
+                report["dispatch"] = "resumed_job"
+            report["job_id"] = job_id
+            return self._json(report, status=202)
+
+        def _redo_items(self):
+            """批量重画:{item_ids:[...]} 或 {only_failed:true}。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            if jobs.running_for(title, number):
+                return self._error(
+                    409, "本集正在生产，请先安全暂停后再批量优化修改")
+            item_ids = body.get("item_ids") or []
+            only_failed = bool(body.get("only_failed"))
+            quality = body.get("quality")
+            if quality is not None:
+                try:
+                    quality = normalize_quality(
+                        quality, allow_auto=True, field="image_quality")
+                except AifosError as exc:
+                    return self._error(400, str(exc))
+            override = bool(body.get("escalation_override"))
+            job_id = jobs.start_task(
+                title, number,
+                lambda app, run_id, report: app.director.redo_items(
+                    title, number, item_ids=item_ids,
+                    only_failed=only_failed, quality_override=quality,
+                    progress=report, escalation_override=override),
+                action="redo_items", tracked=True,
+                request={"item_ids": item_ids,
+                         "only_failed": only_failed, "quality": quality,
+                         "escalation_override": override})
+            return self._json({"job_id": job_id}, status=202)
+
+        def _redo_video(self):
+            """人工修订后重生成单镜视频:{episode_id,shot_no,feedback}。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            feedback = (body.get("feedback") or "").strip()
+            if not feedback:
+                return self._error(400, "请填写视频质检问题与修改要求")
+            try:
+                shot_no = int(body.get("shot_no"))
+            except (TypeError, ValueError):
+                return self._error(400, "缺少有效 shot_no")
+            title, number = found
+            if jobs.running_for(title, number):
+                return self._error(409, "本集正在生产，请先等待当前任务结束")
+            job_id = jobs.start_task(
+                title, number,
+                lambda app, run_id: app.director.redo_video(
+                    title, number, shot_no, feedback),
+                action="redo_video", request={"shot_no": shot_no,
+                                               "feedback": feedback},
+                unique=True)
+            return self._json({"job_id": job_id}, status=202)
+
+        def _redo_videos(self):
+            """视频提示词合同升级后批量重制，所有镜头完成后只合成一次。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            if jobs.running_for(title, number):
+                return self._error(409, "本集正在生产，请先等待当前任务结束")
+            shot_nos = body.get("shot_nos") or []
+            try:
+                shot_nos = [int(value) for value in shot_nos]
+            except (TypeError, ValueError):
+                return self._error(400, "shot_nos 必须是镜头编号数组")
+            job_id = jobs.start_task(
+                title, number,
+                lambda app, run_id: app.director.redo_videos(
+                    title, number, shot_nos=shot_nos),
+                action="redo_videos",
+                request={"shot_nos": shot_nos}, unique=True)
+            return self._json({"job_id": job_id}, status=202)
+
+        def _redo_mock(self):
+            """一键补真:{episode_id|project+episode} → 只重画占位图。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            job_id = jobs.start_task(
+                title, number,
+                lambda app, run_id: app.director.redo_placeholders(
+                    title, number),
+                action="redo_placeholders")
+            return self._json({"job_id": job_id}, status=202)
+
+        def _restyle(self):
+            """一键换画风:{episode_id|project+episode, style?}。
+            后台按新画风重做全部形象(立绘/套件/场景),可暂停续做。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            style = (body.get("style") or "").strip()
+            job_id = jobs.start_task(
+                title, number,
+                lambda app, run_id: app.director.restyle_project(
+                    title, number, style=style),
+                action="restyle", request={"style": style})
+            return self._json({"job_id": job_id}, status=202)
+
+        def _reference_upload(self):
+            """参考图上传:{project|episode_id, name, attach_to, note,
+            reference_role,
+            filename, data_base64};出图时自动注入提示。"""
+            import base64
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            title = (body.get("project") or "").strip()
+            if not title:
+                found = self._episode_ref(body)
+                if found is None:
+                    return self._error(400, "缺少 project(或有效 episode_id)")
+                title = found[0]
+            try:
+                data = base64.b64decode(body.get("data_base64", ""))
+            except Exception:
+                return self._error(400, "data_base64 解码失败")
+            if not data:
+                return self._error(400, "文件为空")
+            if len(data) > 50 * 1024 * 1024:
+                return self._error(400, "参考图超过 50MB")
+            ext = Path(body.get("filename", "")).suffix.lower() or ".png"
+            try:
+                result = self._with_app(
+                    lambda app: app.director.add_reference(
+                        title, body.get("name", ""), data, ext,
+                        attach_to=(body.get("attach_to") or "").strip(),
+                        note=(body.get("note") or "").strip(),
+                        reference_role=(
+                            body.get("reference_role") or "").strip()))
+            except Exception as exc:
+                return self._error(400, str(exc))
+            return self._json(result)
+
+        def _reference_delete(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                result = self._with_app(
+                    lambda app: app.director.delete_reference(
+                        (body.get("project") or "").strip(),
+                        (body.get("name") or "").strip()))
+            except Exception as exc:
+                return self._error(400, str(exc))
+            return self._json(result)
+
+        def _asset_delete(self):
+            """资产中心删图：软删除当前版本，历史文件保持可恢复。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            title = (body.get("project") or "").strip()
+            if not title or body.get("asset_id") is None:
+                return self._error(400, "缺少 project/asset_id")
+            try:
+                result = self._with_app(
+                    lambda app: app.director.delete_image_asset(
+                        title, int(body["asset_id"])))
+            except Exception as exc:
+                return self._error(400, str(exc))
+            return self._json(result)
+
+        def _history_delete(self):
+            """删除历史对应的整集作品；关联图片由用户明确选择是否软删。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            has_run = body.get("run_id") is not None
+            has_episode = body.get("episode_id") is not None
+            if has_run == has_episode:
+                return self._error(400, "请且仅请提供 run_id 或 episode_id")
+            delete_assets = body.get("delete_assets") is True
+
+            if has_run:
+                try:
+                    run_id = int(body["run_id"])
+                except (TypeError, ValueError):
+                    return self._error(400, "缺少合法 run_id")
+                run = self._with_app(lambda app: app.history.get(run_id))
+                if run is None:
+                    return self._error(404, "历史记录不存在")
+                title = run.get("current_project") or run["project_title"]
+                number = run["episode_number"]
+
+                def delete_target(app):
+                    return app.history.delete_work(
+                        run_id, delete_assets=delete_assets)
+            else:
+                try:
+                    episode_id = int(body["episode_id"])
+                except (TypeError, ValueError):
+                    return self._error(400, "缺少合法 episode_id")
+
+                def lookup(app):
+                    episode = app.projects.get_episode(episode_id)
+                    if episode is None:
+                        return None
+                    project = app.db.query_one(
+                        "SELECT title FROM projects WHERE id=?",
+                        (episode["project_id"],))
+                    return project["title"], episode["number"]
+
+                target = self._with_app(lookup)
+                if target is None:
+                    return self._error(404, "剧集不存在")
+                title, number = target
+
+                def delete_target(app):
+                    return app.history.delete_episode_work(
+                        episode_id, delete_assets=delete_assets)
+
+            if jobs.running_for(title, number):
+                return self._error(409, "本集仍在生成，请先安全停止后再删除")
+            result = self._with_app(delete_target)
+            if result is None:
+                return self._error(404, "作品不存在或已删除")
+            return self._json(result)
+
+        def _video_references(self):
+            """按镜头保存从资产中心选择的 Seedance 多图参考。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            if body.get("episode_id") is None or body.get("shot_no") is None:
+                return self._error(400, "缺少 episode_id/shot_no")
+            try:
+                result = self._with_app(
+                    lambda app: app.director.set_video_references(
+                        int(body["episode_id"]), int(body["shot_no"]),
+                        body.get("asset_ids") or [],
+                        reset=bool(body.get("reset"))))
+            except Exception as exc:
+                return self._error(400, str(exc))
+            return self._json(result)
+
+        def _lesson_approval(self):
+            """人工审批一条质检观察:批准后才允许注入后续提示词。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            if body.get("project_id") is None or not body.get("lesson_id"):
+                return self._error(400, "缺少 project_id/lesson_id")
+            try:
+                result = self._with_app(
+                    lambda app: set_lesson_approval(
+                        app.assets, int(body["project_id"]),
+                        str(body["lesson_id"]),
+                        bool(body.get("approved", True))))
+            except KeyError:
+                return self._error(404, "经验库中没有这条记录")
+            except Exception as exc:
+                return self._error(400, str(exc))
+            return self._json(result)
+
+        def _upload(self):
+            """人工修改素材上传:{episode_id, target, filename, data_base64}。
+            target.kind: character_art / scene_art / shot / first_frame /
+            last_frame / shot_video。"""
+            import base64
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            target = body.get("target") or {}
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            if jobs.running_for(title, number):
+                return self._error(
+                    409, "本集正在生产，请先暂停，待状态稳定后再替换镜头")
+            try:
+                data = base64.b64decode(body.get("data_base64", ""))
+            except Exception:
+                return self._error(400, "data_base64 解码失败")
+            if not data:
+                return self._error(400, "文件为空")
+            if len(data) > 200 * 1024 * 1024:
+                return self._error(400, "文件超过 200MB")
+            ext = Path(body.get("filename", "")).suffix.lower() or ".png"
+
+            def task(app):
+                if target.get("kind") == "shot_video":
+                    return app.director.import_video(
+                        title, number, int(target["shot_no"]), data, ext)
+                return app.director.import_image(
+                    title, number, target, data, ext)
+
+            try:
+                result = self._with_app(task)
+            except Exception as exc:
+                return self._error(400, str(exc))
+            return self._json(result)
+
+    return Handler
+
+
+def serve(workspace, host="127.0.0.1", port=8619):
+    """构建并返回 HTTP 服务器(调用方负责 serve_forever)。"""
+    jobs = JobRegistry(workspace)
+    handler = make_handler(workspace, jobs)
+    httpd = ThreadingHTTPServer((host, port), handler)
+    # 零操作自动更新:空闲时拉取新版并自愈重启(可用
+    # defaults.auto_update=false 关闭;非 git 安装自动跳过)
+    app = App(workspace)
+    try:
+        auto = app.config.get("defaults", "auto_update", default=True)
+    finally:
+        app.close()
+    if auto:
+        def on_log(message):
+            worker = App(workspace)
+            try:
+                worker.logger.info("updater", message)
+            finally:
+                worker.close()
+        start_auto_updater(
+            jobs_idle=lambda: all(
+                j["status"] != "running" for j in jobs.list()),
+            on_log=on_log)
+    return httpd

@@ -1,0 +1,285 @@
+"""打磨系统测试:剧本意见重写、单张图片附意见重画。"""
+
+import json
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from aifos.app import App
+from aifos.cli import main
+from aifos.errors import AifosError
+
+REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+
+
+@pytest.fixture()
+def app(tmp_path):
+    instance = App(tmp_path / "ws")
+    yield instance
+    instance.close()
+
+
+def _script_of(app, title, number):
+    project = app.projects.get_project(title)
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=?",
+        (project["id"], number))
+    return app.projects.latest_document(episode["id"], "script")
+
+
+def _to_preflight(app, title="万妖图录", number=1, finish=False):
+    summary = app.director.produce(title, number)
+    assert summary["status"] == "awaiting_cast"
+    script, _ = _script_of(app, title, number)
+    for character in script["characters"]:
+        app.director.select_character_candidate(
+            title, number, character["name"], 1)
+    return app.director.produce(
+        title, number, pause_for_confirm=not finish)
+
+
+def test_revise_script_regenerates(app):
+    app.director.produce("万妖图录", 1, pause_for_confirm=True)
+    before, v1 = _script_of(app, "万妖图录", 1)
+    summary = app.director.revise_script(
+        "万妖图录", 1, "节奏太慢,加一场打斗")
+    assert summary["status"] == "awaiting_script"   # 重写后先看剧本再画图
+    after, v2 = _script_of(app, "万妖图录", 1)
+    assert v2 == v1 + 1
+    assert after != before  # 意见进入 payload → 确定性变化
+    # 意见沉淀到数据中心
+    cases = app.data.cases(label="failure", kind="case")
+    assert any("节奏太慢" in row["prompt"] for row in cases)
+
+
+def test_regen_character_art(app):
+    app.director.produce("万妖图录", 1, pause_for_confirm=True)
+    app.director.produce("万妖图录", 1, pause_for_confirm=True)  # 剧本确认
+    script, _ = _script_of(app, "万妖图录", 1)
+    name = script["characters"][0]["name"]
+    with pytest.raises(AifosError, match="最终立绘不能从文字直接重画"):
+        app.director.regen_image(
+            "万妖图录", 1, {"kind": "character_art", "name": name},
+            feedback="表情更凶")
+
+
+def test_regen_shot_invalidates_video(app):
+    _to_preflight(app, "万妖图录", 2, finish=True)
+    project = app.projects.get_project("万妖图录")
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=?",
+        (project["id"], 2))
+    old_image = app.assets.latest(
+        project["id"], "image", "e002_shot001")
+    assert app.assets.latest(project["id"], "video", "e002_shot001")
+    assert app.assets.latest(project["id"], "edit", "e002_final")
+    assert app.assets.latest(project["id"], "review_board", "e002")
+    app.director.set_video_references(
+        episode["id"], 1, [old_image["id"]])
+
+    revised = app.director.regen_image(
+        "万妖图录", 2, {"kind": "shot", "shot_no": 1}, feedback="改成夜晚")
+    sync = revised["sync"]
+    # 旧视频/成片/检查板作废，同场已有首尾帧链已经同步重生成。
+    assert app.assets.latest(project["id"], "video", "e002_shot001") is None
+    new_image = app.assets.latest(
+        project["id"], "image", "e002_shot001")
+    assert new_image["version"] >= 2
+    assert sync["frame_shots"][0] == 1
+    assert sync["invalidated_video_shots"] == sync["frame_shots"]
+    assert app.assets.latest(project["id"], "edit", "e002_final") is None
+    assert app.assets.latest(project["id"], "review_board", "e002") is None
+    assert app.projects.get_episode(episode["id"])["qc_score"] is None
+    assert app.projects.get_episode(episode["id"])["status"] == \
+        "awaiting_confirm"
+    revision, _ = app.projects.latest_document(
+        episode["id"], "shot_revision_state")
+    assert revision["active"] is True
+
+    # 手选 Seedance 参考不能因 asset_id 变旧而静默丢失。
+    refs, _ = app.projects.latest_document(
+        episode["id"], "video_references")
+    assert refs["shots"]["1"][0]["asset_id"] == new_image["id"]
+    assert refs["shots"]["1"][0]["asset_id"] != old_image["id"]
+
+    # 增量补齐：只重拍同场受帧链影响的镜头，其余镜头视频复用。
+    summary = app.director.produce("万妖图录", 2)
+    assert summary["status"] == "done"
+    videos = next(s for s in summary["stages"] if s["stage"] == "videos")
+    assert videos["detail"]["reused"] == (
+        videos["detail"]["count"]
+        - len(sync["invalidated_video_shots"]))
+    revision, _ = app.projects.latest_document(
+        episode["id"], "shot_revision_state")
+    assert revision["active"] is False
+
+
+def test_regen_shot_keeps_success_when_dependent_frame_chain_defers(
+        app, monkeypatch):
+    """下一镜帧链构建失败不能倒灌成当前关键帧重画失败。"""
+    _to_preflight(app, "万妖图录", 21, finish=True)
+    project = app.projects.get_project("万妖图录")
+    before = app.assets.latest(
+        project["id"], "image", "e021_shot001")
+
+    def defer_frames(*_args, **_kwargs):
+        raise AifosError("镜头2的空间参考预算暂不可构建")
+
+    monkeypatch.setattr(
+        app.director, "_regenerate_revised_frame_chain", defer_frames)
+    revised = app.director.regen_image(
+        "万妖图录", 21, {"kind": "shot", "shot_no": 1},
+        feedback="只调整当前镜头构图")
+
+    after = app.assets.latest(
+        project["id"], "image", "e021_shot001")
+    assert after["version"] == before["version"] + 1
+    assert revised["uri"] == after["uri"]
+    assert revised["sync"]["frames_deferred"] is True
+    assert revised["sync"]["frame_shots"] == []
+    assert "镜头2" in revised["sync"]["frame_defer_reason"]
+
+
+def test_revise_last_and_first_frame_syncs_shared_boundary_and_references(app):
+    _to_preflight(app, "万妖图录", 3, finish=True)
+    project = app.projects.get_project("万妖图录")
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=?",
+        (project["id"], 3))
+    storyboard, _ = app.projects.latest_document(
+        episode["id"], "storyboard")
+    previous, following = next(
+        (left, right) for left, right in zip(
+            storyboard["shots"], storyboard["shots"][1:])
+        if left["scene_no"] == right["scene_no"])
+    previous_no = int(previous["shot_no"])
+    following_no = int(following["shot_no"])
+    previous_name = f"e003_shot{previous_no:03d}"
+    following_name = f"e003_shot{following_no:03d}"
+    old_tail = app.assets.latest(
+        project["id"], "last_frame", previous_name)
+    old_head = app.assets.latest(
+        project["id"], "first_frame", following_name)
+    assert old_tail and old_head
+    assert app.assets.latest(project["id"], "video", previous_name)
+    assert app.assets.latest(project["id"], "video", following_name)
+    app.director.set_video_references(
+        episode["id"], following_no, [old_tail["id"], old_head["id"]])
+
+    revised = app.director.regen_image(
+        "万妖图录", 3,
+        {"kind": "last_frame", "shot_no": previous_no},
+        feedback="人物表情改为惊讶，其他内容保持不变")
+    sync = revised["sync"]
+    new_tail = app.assets.latest(
+        project["id"], "last_frame", previous_name)
+    new_head = app.assets.latest(
+        project["id"], "first_frame", following_name)
+    assert new_tail["version"] == old_tail["version"] + 1
+    assert new_head["version"] == old_head["version"] + 1
+    assert new_tail["uri"] == new_head["uri"]
+    assert sync["frame_shots"] == [previous_no, following_no]
+    assert sync["boundary_sync"][0]["synced_kind"] == "first_frame"
+    assert set(sync["invalidated_video_shots"]) == {
+        previous_no, following_no}
+    assert app.assets.latest(project["id"], "video", previous_name) is None
+    assert app.assets.latest(project["id"], "video", following_name) is None
+    assert app.assets.latest(project["id"], "edit", "e003_final") is None
+    assert app.assets.latest(project["id"], "review_board", "e003") is None
+
+    refs, _ = app.projects.latest_document(
+        episode["id"], "video_references")
+    selected = refs["shots"][str(following_no)]
+    assert {item["asset_id"] for item in selected} == {
+        new_tail["id"], new_head["id"]}
+    revision, _ = app.projects.latest_document(
+        episode["id"], "shot_revision_state")
+    assert revision["source_kind"] == "last_frame"
+    assert revision["affected_shots"] == [previous_no, following_no]
+
+    # 上传修好的下一镜首帧，也要反向同步回上一镜尾帧。
+    uploaded = app.director.import_image(
+        "万妖图录", 3,
+        {"kind": "first_frame", "shot_no": following_no},
+        Path(new_head["uri"]).read_bytes(), Path(new_head["uri"]).suffix)
+    uploaded_head = app.assets.latest(
+        project["id"], "first_frame", following_name)
+    uploaded_tail = app.assets.latest(
+        project["id"], "last_frame", previous_name)
+    assert uploaded_head["uri"] == uploaded_tail["uri"] == uploaded["uri"]
+    assert uploaded["sync"]["boundary_sync"][0]["synced_kind"] == \
+        "last_frame"
+    refs, _ = app.projects.latest_document(
+        episode["id"], "video_references")
+    selected_ids = {item["asset_id"] for item in
+                    refs["shots"][str(following_no)]}
+    assert selected_ids == {uploaded_head["id"], uploaded_tail["id"]}
+
+
+def test_regen_scene_art_and_errors(app):
+    _to_preflight(app)
+    project = app.projects.get_project("万妖图录")
+    scene = app.assets.list(project["id"], "scene_art")[0]["name"]
+    result = app.director.regen_image(
+        "万妖图录", 1, {"kind": "scene_art", "name": scene})
+    assert Path(result["uri"]).exists()
+    with pytest.raises(AifosError):
+        app.director.regen_image("万妖图录", 1, {"kind": "shot",
+                                                 "shot_no": 999})
+    with pytest.raises(AifosError):
+        app.director.regen_image("不存在", 1, {"kind": "shot", "shot_no": 1})
+
+
+def test_claude_bridge_receives_feedback(tmp_path):
+    """修改意见与上一版剧本必须进入 claude 提示词。"""
+    dump = tmp_path / "prompt.txt"
+    fake = tmp_path / "claude"
+    fake.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        f"open({str(dump)!r}, 'w').write(sys.argv[-1])\n"
+        "print(json.dumps({'episode_title': 'T', 'logline': 'L',"
+        "'characters': [{'name': '甲', 'role': '主角'}],"
+        "'scenes': [{'scene_no': 1, 'location': 'x', 'characters': ['甲'],"
+        "'action': '', 'lines': [{'character': '甲', 'dialogue': 'hi'}]}]},"
+        " ensure_ascii=False))\n",
+        encoding="utf-8")
+    fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+    request = {
+        "capability": "script",
+        "payload": {"project_title": "T", "episode_number": 1,
+                    "feedback": "加一场雨戏",
+                    "previous_script": {"logline": "旧版梗概"}},
+        "out_dir": str(tmp_path / "out"),
+    }
+    proc = subprocess.run(
+        [sys.executable, "-m", "aifos.adapters.claude_script",
+         "--claude", str(fake)],
+        input=json.dumps(request, ensure_ascii=False),
+        capture_output=True, text=True, timeout=60, cwd=REPO_ROOT)
+    reply = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert reply["ok"], reply
+    prompt = dump.read_text(encoding="utf-8")
+    assert "加一场雨戏" in prompt
+    assert "旧版梗概" in prompt
+
+
+def test_cli_revise_and_regen(tmp_path, capsys):
+    ws = str(tmp_path / "ws")
+    assert main(["--workspace", ws, "produce", "--title", "万妖图录",
+                 "--episode", "1", "--review"]) == 0
+    capsys.readouterr()
+    assert main(["--workspace", ws, "revise", "--project", "万妖图录",
+                 "--episode", "1", "--feedback", "更热血"]) == 0
+    assert "重写" in capsys.readouterr().out
+    # 剧本确认 → AI 自动为人物/道具候选选优定版，无需手机逐张选择。
+    assert main(["--workspace", ws, "confirm", "--project", "万妖图录",
+                 "--episode", "1"]) == 0
+    assert "AI 自动选优定版" in capsys.readouterr().out
+    assert main(["--workspace", ws, "regen", "--project", "万妖图录",
+                 "--episode", "1", "--shot", "1",
+                 "--feedback", "夜晚"]) == 0
+    assert "已重画" in capsys.readouterr().out

@@ -1,0 +1,533 @@
+"""数据层:SQLite 统一存储全部结构化数据(项目/资产/任务/额度/日志/沉淀)。"""
+
+import os
+import sqlite3
+import threading
+import time
+from contextlib import contextmanager
+
+_DATABASE_IO_LOCK = threading.RLock()
+_DATABASE_INITIALIZED_FILES = {}
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS projects(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL UNIQUE,
+  description TEXT NOT NULL DEFAULT '',
+  style TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'active',
+  kind TEXT NOT NULL DEFAULT 'drama',     -- drama 漫剧 / idol AI虚拟偶像
+  account TEXT NOT NULL DEFAULT '',       -- 绑定的抖音等平台账号
+  aspect TEXT NOT NULL DEFAULT '',        -- 画幅:空=用全局默认(9:16)
+  style_pack_id TEXT NOT NULL DEFAULT '', -- 火火漫剧研究室人工确认的独立风格包
+  created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS episodes(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL REFERENCES projects(id),
+  number INTEGER NOT NULL,
+  title TEXT NOT NULL DEFAULT '',
+  premise TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'created',
+  qc_score REAL,
+  cost REAL NOT NULL DEFAULT 0,
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL,
+  UNIQUE(project_id, number)
+);
+
+-- 长篇/多集剧本文档的串行生产批次。整批先导入，但任一时刻只激活一集；
+-- 后续集保留在 queued_script，避免并行烧图和跨集连续性失控。
+CREATE TABLE IF NOT EXISTS series_batches(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL REFERENCES projects(id),
+  filename TEXT NOT NULL DEFAULT '',
+  source_format TEXT NOT NULL DEFAULT 'text',
+  source_sha256 TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'active',
+  total INTEGER NOT NULL DEFAULT 0,
+  auto_advance INTEGER NOT NULL DEFAULT 1,
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS series_batch_items(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch_id INTEGER NOT NULL REFERENCES series_batches(id) ON DELETE CASCADE,
+  episode_id INTEGER NOT NULL REFERENCES episodes(id),
+  position INTEGER NOT NULL,
+  source_number INTEGER,
+  source_title TEXT NOT NULL DEFAULT '',
+  mode TEXT NOT NULL DEFAULT 'script',       -- script 已有剧本 / outline 剧情梗概待编剧
+  source_text TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'queued',
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL,
+  UNIQUE(batch_id, position),
+  UNIQUE(batch_id, episode_id)
+);
+
+CREATE INDEX IF NOT EXISTS series_batch_project_idx
+ON series_batches(project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS series_batch_item_episode_idx
+ON series_batch_items(episode_id);
+
+-- 每次生产/续产/重做/打磨的持久运行记录。Web Job 可以随服务重启消失，
+-- production_runs 作为用户可追溯的历史事实源永久保留。
+CREATE TABLE IF NOT EXISTS production_runs(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  episode_id INTEGER REFERENCES episodes(id),
+  project_title TEXT NOT NULL,
+  episode_number INTEGER NOT NULL,
+  action TEXT NOT NULL DEFAULT 'produce',
+  source TEXT NOT NULL DEFAULT 'web',
+  status TEXT NOT NULL DEFAULT 'running',
+  result_status TEXT NOT NULL DEFAULT '',
+  force INTEGER NOT NULL DEFAULT 0,
+  cost REAL NOT NULL DEFAULT 0,
+  providers TEXT NOT NULL DEFAULT '',
+  stage_count INTEGER NOT NULL DEFAULT 0,
+  last_stage TEXT NOT NULL DEFAULT '',
+  error TEXT NOT NULL DEFAULT '',
+  request TEXT NOT NULL DEFAULT '{}',
+  summary TEXT NOT NULL DEFAULT '{}',
+  started_at REAL NOT NULL,
+  finished_at REAL,
+  updated_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS production_runs_started_idx
+ON production_runs(started_at DESC);
+CREATE INDEX IF NOT EXISTS production_runs_episode_idx
+ON production_runs(episode_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS production_runs_status_idx
+ON production_runs(status, started_at DESC);
+
+-- Web/后台作业的持久事实源。production_runs 记录一次业务运行的汇总，
+-- production_jobs 则记录可轮询、排队和取消的实际后台作业；二者分表避免
+-- 把细粒度作业混入现有流水线阶段 tasks，污染成本和 stage_count。
+CREATE TABLE IF NOT EXISTS production_jobs(
+  id TEXT PRIMARY KEY,
+  run_id INTEGER REFERENCES production_runs(id) ON DELETE SET NULL,
+  episode_id INTEGER REFERENCES episodes(id) ON DELETE SET NULL,
+  idempotency_key TEXT NOT NULL DEFAULT '',
+  action TEXT NOT NULL DEFAULT 'adjustment',
+  status TEXT NOT NULL DEFAULT 'queued',
+  queue_key TEXT NOT NULL DEFAULT '',
+  queue_position INTEGER,
+  progress TEXT NOT NULL DEFAULT '{}',
+  request TEXT NOT NULL DEFAULT '{}',
+  result TEXT NOT NULL DEFAULT '{}',
+  error TEXT NOT NULL DEFAULT '',
+  cancel_requested INTEGER NOT NULL DEFAULT 0,
+  cancel_reason TEXT NOT NULL DEFAULT '',
+  owner_id TEXT NOT NULL DEFAULT '',
+  owner_pid INTEGER,
+  owner_host TEXT NOT NULL DEFAULT '',
+  heartbeat_at REAL,
+  lease_expires_at REAL,
+  started_at REAL,
+  finished_at REAL,
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS production_jobs_run_unique_idx
+ON production_jobs(run_id) WHERE run_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS production_jobs_idempotency_unique_idx
+ON production_jobs(idempotency_key) WHERE idempotency_key <> '';
+CREATE INDEX IF NOT EXISTS production_jobs_status_updated_idx
+ON production_jobs(status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS production_jobs_episode_updated_idx
+ON production_jobs(episode_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS production_jobs_queue_idx
+ON production_jobs(queue_key, status, queue_position, created_at);
+
+-- 通用作业关系：episode/shot 标识业务归属，artifact/output 标识生成产物。
+-- relation_id 使用 TEXT，因为镜头当前是 render-plan item id，而资产可使用
+-- 数字 id；uri/meta 保存尚未晋升为正式 assets 行的候选输出事实。
+CREATE TABLE IF NOT EXISTS production_job_links(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id TEXT NOT NULL REFERENCES production_jobs(id) ON DELETE CASCADE,
+  relation_type TEXT NOT NULL,
+  relation_id TEXT NOT NULL DEFAULT '',
+  role TEXT NOT NULL DEFAULT '',
+  uri TEXT NOT NULL DEFAULT '',
+  meta TEXT NOT NULL DEFAULT '{}',
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL,
+  UNIQUE(job_id, relation_type, relation_id, role)
+);
+
+CREATE INDEX IF NOT EXISTS production_job_links_job_idx
+ON production_job_links(job_id, relation_type);
+CREATE INDEX IF NOT EXISTS production_job_links_relation_idx
+ON production_job_links(relation_type, relation_id, updated_at DESC);
+
+-- 剧本 / 分镜等结构化文档,按版本沉淀
+CREATE TABLE IF NOT EXISTS documents(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  episode_id INTEGER NOT NULL REFERENCES episodes(id),
+  kind TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  content TEXT NOT NULL,
+  created_at REAL NOT NULL,
+  UNIQUE(episode_id, kind, version)
+);
+
+-- 项目级版本文档。与集级 documents 分表，避免用虚构 episode 承载
+-- 跨集事实，也让项目规则和本集临时规则在存储层就不可能串剧。
+CREATE TABLE IF NOT EXISTS project_documents(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  content TEXT NOT NULL,
+  created_at REAL NOT NULL,
+  UNIQUE(project_id, kind, version)
+);
+
+CREATE INDEX IF NOT EXISTS project_documents_latest_idx
+ON project_documents(project_id, kind, version DESC);
+
+-- IP 资产:角色/场景/动作/镜头/Prompt/首尾帧/图片/视频/配音/封面/成片等
+CREATE TABLE IF NOT EXISTS assets(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL REFERENCES projects(id),
+  kind TEXT NOT NULL,
+  name TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1,
+  uri TEXT NOT NULL DEFAULT '',
+  meta TEXT NOT NULL DEFAULT '{}',
+  reuse_count INTEGER NOT NULL DEFAULT 0,
+  created_at REAL NOT NULL,
+  UNIQUE(project_id, kind, name, version)
+);
+
+-- AI 导演中心的调度任务(每个流水线阶段一条)
+CREATE TABLE IF NOT EXISTS tasks(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  episode_id INTEGER NOT NULL REFERENCES episodes(id),
+  run_id INTEGER REFERENCES production_runs(id),
+  stage TEXT NOT NULL,
+  name TEXT NOT NULL,
+  status TEXT NOT NULL,
+  provider TEXT NOT NULL DEFAULT '',
+  cost REAL NOT NULL DEFAULT 0,
+  retries INTEGER NOT NULL DEFAULT 0,
+  payload TEXT NOT NULL DEFAULT '{}',
+  result TEXT NOT NULL DEFAULT '{}',
+  error TEXT NOT NULL DEFAULT '',
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL
+);
+
+-- 图片任务进入 worker 前的不可变派发契约。Web 端只能给仍为 pending 且
+-- never_started=1 的条目请求 API 加速；原 Director 在提交 worker 时原子
+-- claim，因此不会出现第二个任务抢跑、重复生成和重复计费。
+CREATE TABLE IF NOT EXISTS image_dispatch_contracts(
+  episode_id INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+  item_id TEXT NOT NULL,
+  category TEXT NOT NULL DEFAULT '',
+  capability TEXT NOT NULL DEFAULT 'image',
+  contract_token TEXT NOT NULL,
+  contract TEXT NOT NULL DEFAULT '{}',
+  production_state TEXT NOT NULL DEFAULT 'pending',
+  never_started INTEGER NOT NULL DEFAULT 1,
+  acceleration_status TEXT NOT NULL DEFAULT '',
+  requested_provider TEXT NOT NULL DEFAULT '',
+  requested_model TEXT NOT NULL DEFAULT '',
+  requested_quality TEXT NOT NULL DEFAULT 'medium',
+  actual_provider TEXT NOT NULL DEFAULT '',
+  actual_model TEXT NOT NULL DEFAULT '',
+  error TEXT NOT NULL DEFAULT '',
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL,
+  PRIMARY KEY(episode_id, item_id)
+);
+
+CREATE INDEX IF NOT EXISTS image_dispatch_episode_state_idx
+ON image_dispatch_contracts(episode_id, production_state, never_started);
+
+-- 订阅额度(即梦 CLI 优先使用订阅额度,耗尽回退 API)
+CREATE TABLE IF NOT EXISTS quota(
+  provider TEXT PRIMARY KEY,
+  used INTEGER NOT NULL DEFAULT 0,
+  quota_limit INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS logs(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts REAL NOT NULL,
+  level TEXT NOT NULL,
+  source TEXT NOT NULL,
+  message TEXT NOT NULL
+);
+
+-- 数据中心:Prompt、图片、视频、成功案例、失败案例沉淀
+CREATE TABLE IF NOT EXISTS archive(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  episode_id INTEGER,
+  kind TEXT NOT NULL,
+  label TEXT NOT NULL,
+  prompt TEXT NOT NULL DEFAULT '',
+  uri TEXT NOT NULL DEFAULT '',
+  meta TEXT NOT NULL DEFAULT '{}',
+  created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS users(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,
+  role TEXT NOT NULL DEFAULT 'operator'
+);
+
+-- 制作标准中心:版本记录只追加不修改，state 只保存各 profile 的激活指针。
+CREATE TABLE IF NOT EXISTS production_standard_versions(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  profile_key TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  content TEXT NOT NULL,
+  change_note TEXT NOT NULL DEFAULT '',
+  fingerprint TEXT NOT NULL,
+  created_at REAL NOT NULL,
+  UNIQUE(profile_key, version)
+);
+
+CREATE TABLE IF NOT EXISTS production_standard_state(
+  profile_key TEXT PRIMARY KEY,
+  active_version_id INTEGER NOT NULL
+    REFERENCES production_standard_versions(id) ON DELETE RESTRICT,
+  updated_at REAL NOT NULL
+);
+
+-- 火火漫剧研究室:学习素材、可追溯证据和人工确认的独立风格包。
+-- 该空间与 production_standard_versions 分离，学习结果只能被项目显式选择，
+-- 不会悄悄改写系统制作标准。
+CREATE TABLE IF NOT EXISTS firefire_sessions(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL DEFAULT '',
+  source_url TEXT NOT NULL DEFAULT '',
+  source_type TEXT NOT NULL DEFAULT 'url',
+  status TEXT NOT NULL DEFAULT 'awaiting_rights',
+  rights_confirmed INTEGER NOT NULL DEFAULT 0,
+  notes TEXT NOT NULL DEFAULT '',
+  analysis TEXT NOT NULL DEFAULT '{}',
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS firefire_session_updated_idx
+ON firefire_sessions(updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS firefire_evidence(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id INTEGER NOT NULL REFERENCES firefire_sessions(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL DEFAULT 'frame',
+  label TEXT NOT NULL DEFAULT '',
+  uri TEXT NOT NULL DEFAULT '',
+  timecode TEXT NOT NULL DEFAULT '',
+  observation TEXT NOT NULL DEFAULT '',
+  meta TEXT NOT NULL DEFAULT '{}',
+  created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS firefire_evidence_session_idx
+ON firefire_evidence(session_id, created_at);
+
+CREATE TABLE IF NOT EXISTS firefire_styles(
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1,
+  status TEXT NOT NULL DEFAULT 'draft',
+  session_id INTEGER REFERENCES firefire_sessions(id),
+  summary TEXT NOT NULL DEFAULT '',
+  compiled_style TEXT NOT NULL DEFAULT '',
+  positive_prompt TEXT NOT NULL DEFAULT '',
+  negative_prompt TEXT NOT NULL DEFAULT '',
+  references_json TEXT NOT NULL DEFAULT '[]',
+  director_knowledge TEXT NOT NULL DEFAULT '{}',
+  validation TEXT NOT NULL DEFAULT '{}',
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL,
+  UNIQUE(name, version)
+);
+
+CREATE INDEX IF NOT EXISTS firefire_style_status_idx
+ON firefire_styles(status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS firefire_validation_tasks(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id INTEGER REFERENCES firefire_sessions(id),
+  style_id TEXT REFERENCES firefire_styles(id),
+  title TEXT NOT NULL DEFAULT '',
+  prompt TEXT NOT NULL DEFAULT '',
+  references_json TEXT NOT NULL DEFAULT '[]',
+  status TEXT NOT NULL DEFAULT 'queued',
+  result_json TEXT NOT NULL DEFAULT '{}',
+  human_feedback TEXT NOT NULL DEFAULT '',
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS firefire_validation_status_idx
+ON firefire_validation_tasks(status, created_at DESC);
+
+-- 知识大脑:候选先过价值门禁，版本内容只追加不修改；state 只保存
+-- 当前激活版本和等待人工复核的候选版本。
+CREATE TABLE IF NOT EXISTS firefire_knowledge_versions(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  knowledge_key TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  title TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'knowledge',
+  domain TEXT NOT NULL DEFAULT 'cross_stage',
+  summary TEXT NOT NULL DEFAULT '',
+  content TEXT NOT NULL DEFAULT '{}',
+  applicability TEXT NOT NULL DEFAULT '{}',
+  provenance TEXT NOT NULL DEFAULT '{}',
+  assessment TEXT NOT NULL DEFAULT '{}',
+  standard_snapshot TEXT NOT NULL DEFAULT '{}',
+  fingerprint TEXT NOT NULL,
+  created_at REAL NOT NULL,
+  UNIQUE(knowledge_key, version),
+  UNIQUE(knowledge_key, fingerprint)
+);
+
+CREATE INDEX IF NOT EXISTS firefire_knowledge_version_idx
+ON firefire_knowledge_versions(knowledge_key, version DESC);
+
+CREATE TABLE IF NOT EXISTS firefire_knowledge_state(
+  knowledge_key TEXT PRIMARY KEY,
+  active_version_id INTEGER
+    REFERENCES firefire_knowledge_versions(id) ON DELETE RESTRICT,
+  candidate_version_id INTEGER
+    REFERENCES firefire_knowledge_versions(id) ON DELETE RESTRICT,
+  status TEXT NOT NULL DEFAULT 'review',
+  reviewed_by TEXT NOT NULL DEFAULT '',
+  review_note TEXT NOT NULL DEFAULT '',
+  updated_at REAL NOT NULL
+);
+
+-- 数据库级保护，避免绕过 StandardCenter 意外篡改历史版本。
+CREATE TRIGGER IF NOT EXISTS production_standard_versions_immutable_update
+BEFORE UPDATE ON production_standard_versions
+BEGIN
+  SELECT RAISE(ABORT, 'production standard versions are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS production_standard_versions_immutable_delete
+BEFORE DELETE ON production_standard_versions
+BEGIN
+  SELECT RAISE(ABORT, 'production standard versions are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS firefire_knowledge_versions_immutable_update
+BEFORE UPDATE ON firefire_knowledge_versions
+BEGIN
+  SELECT RAISE(ABORT, 'knowledge versions are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS firefire_knowledge_versions_immutable_delete
+BEFORE DELETE ON firefire_knowledge_versions
+BEGIN
+  SELECT RAISE(ABORT, 'knowledge versions are immutable');
+END;
+"""
+
+
+def now():
+    return time.time()
+
+
+# 既有库的列级迁移:(表, 列, 声明)
+MIGRATIONS = [
+    ("projects", "kind", "TEXT NOT NULL DEFAULT 'drama'"),
+    ("projects", "account", "TEXT NOT NULL DEFAULT ''"),
+    ("projects", "aspect", "TEXT NOT NULL DEFAULT ''"),
+    ("projects", "style_pack_id", "TEXT NOT NULL DEFAULT ''"),
+    ("tasks", "run_id", "INTEGER REFERENCES production_runs(id)"),
+    ("firefire_styles", "director_knowledge", "TEXT NOT NULL DEFAULT '{}'"),
+    ("production_jobs", "owner_id", "TEXT NOT NULL DEFAULT ''"),
+    ("production_jobs", "owner_pid", "INTEGER"),
+    ("production_jobs", "owner_host", "TEXT NOT NULL DEFAULT ''"),
+    ("production_jobs", "heartbeat_at", "REAL"),
+    ("production_jobs", "lease_expires_at", "REAL"),
+]
+
+
+class Database:
+    def __init__(self, path):
+        self.path = str(path)
+        # 并行出图产线的 worker 线程会经由 router/logger 读写库:
+        # 连接允许跨线程；所有 App 实例共享同一把进程级锁，只串行化极短
+        # 的 SQLite 读写，图片/API 调用本身仍保持并行。
+        # Autocommit prevents an overlooked direct statement from retaining a
+        # write transaction while another image worker waits. Explicit
+        # all-or-nothing operations still use transaction() below.
+        self.conn = sqlite3.connect(
+            self.path, timeout=60, check_same_thread=False,
+            isolation_level=None)
+        self.conn.row_factory = sqlite3.Row
+        self._lock = _DATABASE_IO_LOCK
+        # WAL 允许页面读取与图片 worker 写入并行；60 秒等待覆盖多通道
+        # 同时注册产物/质检结果的写入高峰，不因几秒锁竞争丢掉整批结果。
+        with self._lock:
+            self.conn.execute("PRAGMA busy_timeout = 60000")
+            journal = self.conn.execute(
+                "PRAGMA journal_mode").fetchone()[0]
+            if str(journal).lower() != "wal":
+                self.conn.execute("PRAGMA journal_mode = WAL").fetchone()
+            self.conn.execute("PRAGMA synchronous = NORMAL")
+            self.conn.execute("PRAGMA foreign_keys = ON")
+            # AIFOS creates one lightweight App per parallel worker. Running
+            # the full DDL script for every connection turns startup into a
+            # schema-lock storm before any image API call begins. Initialize
+            # once per actual database file in this process.
+            stat = os.stat(self.path)
+            file_key = (stat.st_dev, stat.st_ino)
+            if _DATABASE_INITIALIZED_FILES.get(self.path) != file_key:
+                self.conn.executescript(SCHEMA)
+                self._migrate()
+                _DATABASE_INITIALIZED_FILES[self.path] = file_key
+
+    def _migrate(self):
+        for table, column, decl in MIGRATIONS:
+            cols = {row[1] for row in self.conn.execute(
+                f"PRAGMA table_info({table})")}
+            if column not in cols:
+                self.conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+    def execute(self, sql, params=()):
+        with self._lock:
+            cur = self.conn.execute(sql, params)
+            return cur
+
+    @contextmanager
+    def transaction(self, *, immediate=False):
+        """跨 App/线程安全的显式事务；供批量认领做全有或全无更新。"""
+        with self._lock:
+            self.conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+            try:
+                yield self.conn
+            except Exception:
+                self.conn.rollback()
+                raise
+            else:
+                self.conn.commit()
+
+    def query(self, sql, params=()):
+        with self._lock:
+            return self.conn.execute(sql, params).fetchall()
+
+    def query_one(self, sql, params=()):
+        with self._lock:
+            return self.conn.execute(sql, params).fetchone()
+
+    def close(self):
+        with self._lock:
+            self.conn.close()

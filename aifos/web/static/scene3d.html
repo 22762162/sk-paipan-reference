@@ -1,0 +1,2321 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>3D 空间 · AIFOS</title>
+<style>
+:root{
+  --ink:#100e0c; --panel:#1a1613; --line:#332c24;
+  --gold:#d9a441; --gold-dim:#8a6a2f; --paper:#e8ded0; --paper-dim:#9a8d7b;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%;overflow:hidden;background:var(--ink);color:var(--paper);
+  font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
+#top{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;
+  padding:10px 14px;border-bottom:1px solid var(--line);background:var(--panel)}
+h1{font-family:"Songti SC","STSong",serif;font-size:17px;letter-spacing:.06em;
+  color:var(--gold);font-weight:700}
+.meta{font-size:11px;color:var(--paper-dim);letter-spacing:.04em}
+#stage{position:absolute;inset:0;top:0}
+#wrap{position:relative;height:calc(100% - 0px);display:flex;flex-direction:column}
+#view{flex:1;position:relative;min-height:0}
+canvas{position:absolute;inset:0;width:100%;height:100%;display:block;
+  cursor:grab;touch-action:none}
+canvas.drag{cursor:grabbing}
+#labels{position:absolute;inset:0;pointer-events:none;overflow:hidden}
+.tag{position:absolute;transform:translate(-50%,-100%);
+  font-size:11px;line-height:1.3;white-space:nowrap;
+  padding:2px 7px;border-radius:3px;border:1px solid var(--line);
+  background:rgba(16,14,12,.82);letter-spacing:.03em}
+.tag b{font-weight:600}
+.tag.cam{color:var(--gold);border-color:var(--gold-dim)}
+.tag.obj{color:#d6c5aa;border-color:#6f604e;background:rgba(26,21,17,.88)}
+#hud{position:absolute;top:10px;right:12px;font-size:11px;color:var(--paper-dim);
+  background:rgba(16,14,12,.78);padding:5px 9px;border:1px solid var(--line);
+  border-radius:3px;font-variant-numeric:tabular-nums;pointer-events:none}
+#notice{position:absolute;top:10px;left:12px;max-width:min(520px,calc(100% - 150px));
+  display:none;padding:7px 10px;border:1px solid #7a5f2b;border-radius:4px;
+  background:rgba(34,27,17,.9);color:#e8c77e;font-size:11px;line-height:1.55;
+  box-shadow:0 8px 26px rgba(0,0,0,.28);pointer-events:auto;z-index:3}
+#notice.bad{border-color:#8b3f36;color:#f0aaa0;background:rgba(45,19,17,.92)}
+#noticePanel{border:0}#noticeSummary{cursor:pointer;font-weight:600;list-style-position:inside}
+#noticeDetails{max-height:180px;overflow:auto;margin-top:5px}
+.notice-group{margin-top:6px;border-top:1px solid rgba(217,164,65,.18);padding-top:4px}
+.notice-group-title{font-size:10px;color:var(--gold);letter-spacing:.08em;
+  padding:2px 3px}
+.notice-item{display:block;width:100%;text-align:left;margin-top:4px;padding:5px 7px;
+  color:inherit;background:rgba(0,0,0,.16);border-color:rgba(217,164,65,.28)}
+.notice-item.locatable::after{content:" · 定位";color:var(--gold)}
+#err{position:absolute;inset:0;display:none;place-items:center;text-align:center;
+  z-index:4;padding:24px;color:#f0aaa0;font-size:13px;line-height:1.8;
+  background:rgba(16,14,12,.92)}
+footer{border-top:1px solid var(--line);background:var(--panel);
+  padding:9px 12px 11px;display:flex;flex-direction:column;gap:7px}
+.row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.row-label{font-size:10px;color:var(--gold-dim);letter-spacing:.2em;
+  min-width:52px}
+button{font:inherit;font-size:12px;color:var(--paper);background:transparent;
+  border:1px solid var(--line);border-radius:3px;padding:4px 10px;cursor:pointer;
+  transition:border-color .18s,background .18s,color .18s}
+button:hover{border-color:var(--gold-dim)}
+button:disabled{opacity:.35;cursor:default}
+button:focus-visible{outline:2px solid var(--gold);outline-offset:1px}
+button.on{color:var(--ink);background:var(--gold);border-color:var(--gold);
+  font-weight:600}
+button.ghost.on{color:var(--gold);background:transparent;
+  border-color:var(--gold-dim);font-weight:600}
+#pvInfo{font-size:12px;color:var(--paper);letter-spacing:.03em;
+  min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+#pvInfo b{color:var(--gold)}
+#pvScrub{flex:1;min-width:120px;accent-color:var(--gold);height:18px}
+#pvClock{font-size:11px;color:var(--paper-dim);
+  font-variant-numeric:tabular-nums;min-width:86px;text-align:right}
+#pvIssues{display:none;max-height:130px;overflow:auto;border:1px solid #6b4a33;
+  border-radius:4px;background:rgba(38,26,18,.92);padding:6px 8px;font-size:11px;
+  line-height:1.55}
+#pvIssues.show{display:block}
+.pv-issue{cursor:pointer;padding:2px 4px;border-radius:3px;color:#e8c77e}
+.pv-issue:hover{background:rgba(217,164,65,.14)}
+.pv-issue b{color:#f0b357}
+#pvBadge{position:absolute;left:12px;bottom:12px;display:none;
+  font-size:12px;letter-spacing:.08em;color:var(--gold);
+  background:rgba(16,14,12,.82);border:1px solid var(--gold-dim);
+  border-radius:3px;padding:4px 9px;pointer-events:none}
+#pip{position:absolute;right:12px;bottom:12px;border:1px solid var(--gold-dim);
+  border-radius:4px;overflow:hidden;display:none;pointer-events:none;
+  box-shadow:0 10px 30px rgba(0,0,0,.45)}
+#pipTag{position:absolute;left:6px;top:5px;font-size:10px;color:var(--gold);
+  letter-spacing:.14em;text-shadow:0 1px 2px #000}
+#stmtPanel{position:absolute;top:10px;right:12px;z-index:5;display:none;
+  width:min(340px,calc(100% - 24px));max-height:calc(100% - 24px);
+  overflow:auto;background:rgba(20,17,14,.96);border:1px solid var(--gold-dim);
+  border-radius:5px;padding:12px 13px;box-shadow:0 14px 40px rgba(0,0,0,.5)}
+#stmtPanel.show{display:block}
+#stmtPanel h2{font-size:13px;color:var(--gold);letter-spacing:.1em;
+  margin-bottom:4px}
+#stmtPanel p.hint{font-size:10px;color:var(--paper-dim);line-height:1.6;
+  margin-bottom:8px}
+.stmt-field{margin-bottom:8px}
+.stmt-field label{display:block;font-size:10px;color:var(--gold-dim);
+  letter-spacing:.14em;margin-bottom:3px}
+.stmt-field textarea{width:100%;font:inherit;font-size:12px;line-height:1.5;
+  color:var(--paper);background:rgba(16,14,12,.8);border:1px solid var(--line);
+  border-radius:3px;padding:5px 7px;resize:vertical;min-height:34px}
+.stmt-field textarea:focus{outline:none;border-color:var(--gold-dim)}
+#stmtStatus{font-size:11px;color:var(--paper-dim);margin-left:8px}
+#quality{position:absolute;left:12px;bottom:12px;z-index:2;display:flex;gap:5px;
+  flex-wrap:wrap;max-width:calc(100% - 24px);pointer-events:none}
+.quality-badge{font-size:10px;line-height:1;padding:5px 7px;border:1px solid var(--line);
+  border-radius:999px;background:rgba(16,14,12,.84);color:var(--paper-dim)}
+.quality-badge.ok{color:#87d7a3;border-color:#315d42}
+.quality-badge.warn{color:#e8c77e;border-color:#7a5f2b}
+#previewBadge{position:absolute;left:50%;top:10px;transform:translateX(-50%);
+  display:none;z-index:3;padding:6px 10px;border:1px solid #b36b2e;border-radius:4px;
+  background:rgba(55,28,10,.92);color:#ffd08a;font-size:11px;font-weight:700;
+  pointer-events:none}
+#viewTools{position:absolute;right:12px;top:50px;z-index:2;display:flex;
+  flex-direction:column;gap:6px}
+#viewTools button{width:44px;height:44px;padding:0;font-size:18px;
+  background:rgba(16,14,12,.82)}
+#inspector{position:absolute;right:12px;bottom:12px;z-index:5;display:none;
+  width:min(360px,calc(100% - 24px));max-height:calc(100% - 24px);overflow:auto;
+  padding:11px;border:1px solid var(--gold-dim);border-radius:6px;
+  background:rgba(20,17,14,.97);box-shadow:0 14px 40px rgba(0,0,0,.55)}
+#inspector.show{display:block}
+.inspector-head{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.inspector-head strong{color:var(--gold);flex:1;min-width:0;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.edit-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}
+.edit-field label{display:block;font-size:9px;color:var(--gold-dim);margin-bottom:2px}
+.edit-field input,.edit-field select{width:100%;min-width:0;font:inherit;font-size:12px;
+  color:var(--paper);background:#120f0d;border:1px solid var(--line);border-radius:3px;
+  padding:6px}
+.edit-field input:disabled,.edit-field select:disabled{opacity:.65}
+#inspectorHint{font-size:10px;color:var(--paper-dim);line-height:1.5;margin:7px 0}
+#saveStatus{font-size:10px;color:var(--paper-dim)}
+#appearanceStatus{font-size:10px;color:var(--paper-dim);max-width:210px}
+#footerToggle{display:none}
+@media(max-width:600px){
+  #top{height:50px;flex-wrap:nowrap;padding:7px 10px;align-items:center}
+  h1{font-size:15px;flex:none}.meta{white-space:nowrap;overflow:hidden;
+    text-overflow:ellipsis;min-width:0;flex:1}
+  #stmtBtn{min-width:44px;font-size:0;padding:0}#stmtBtn::after{content:"导";font-size:13px}
+  #view{min-height:55vh}
+  footer{max-height:calc(45vh - 50px);overflow:auto;padding:7px 8px 10px;gap:6px}
+  footer .row{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none}
+  footer .row::-webkit-scrollbar{display:none}
+  button,select{min-height:44px;min-width:44px;padding:7px 11px;flex:none}
+  .row-label{position:sticky;left:0;z-index:1;background:var(--panel);min-width:44px}
+  #shots{flex-wrap:nowrap!important;overflow-x:auto;min-width:0}
+  #pvScrub{min-width:170px;height:44px}#pvClock{min-width:92px}
+  #notice{top:8px;left:8px;right:62px;max-width:none;padding:7px 9px;
+    overflow:hidden;white-space:nowrap}
+  #notice:not(.expanded){max-height:38px}
+  #notice.expanded{max-height:min(42vh,280px);white-space:normal}
+  #noticeDetails{max-height:min(32vh,210px)}
+  #hud{top:auto;right:8px;bottom:8px;max-width:66%;overflow:hidden;
+    white-space:nowrap;text-overflow:ellipsis}
+  #quality{left:8px;bottom:8px;max-width:64%;gap:3px}
+  .quality-badge{font-size:9px;padding:4px 6px}
+  #viewTools{right:8px;top:54px}
+  #footerToggle{display:block;position:absolute;right:8px;bottom:8px;z-index:6;
+    width:44px;height:44px;padding:0;background:rgba(16,14,12,.88)}
+  body.footer-collapsed footer{display:none}
+  body.footer-collapsed #view{min-height:calc(100vh - 50px)}
+  #inspector{left:8px;right:8px;bottom:8px;width:auto;max-height:58%}
+  .edit-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
+  #previewBadge{top:auto;bottom:8px;max-width:58%;white-space:nowrap;overflow:hidden;
+    text-overflow:ellipsis}
+}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="top">
+    <h1>3D 空间</h1>
+    <span class="meta" id="meta">加载中…</span>
+    <button id="stmtBtn" class="ghost" style="margin-left:auto">导演阐述</button>
+  </div>
+  <div id="view">
+    <canvas id="c"></canvas>
+    <div id="labels"></div>
+    <div id="hud"></div>
+    <div id="notice" role="status" aria-live="polite"></div>
+    <div id="previewBadge">修复预览 · 不进入导出</div>
+    <div id="quality" aria-label="场景质量"></div>
+    <div id="viewTools" aria-label="视图控制">
+      <button id="zoomIn" title="放大" aria-label="放大">＋</button>
+      <button id="zoomOut" title="缩小" aria-label="缩小">－</button>
+      <button id="resetView" title="重置视图" aria-label="重置视图">⌂</button>
+    </div>
+    <button id="footerToggle" aria-label="显示或隐藏控制台">控</button>
+    <div id="pvBadge"></div>
+    <div id="pip"><span id="pipTag">镜头视窗</span></div>
+    <div id="stmtPanel">
+      <h2>本集导演阐述</h2>
+      <p class="hint">意图锚:AI 导演逐镜建议、预演审片都以这份阐述为查偏基准。
+        写清你想要的效果,分镜就不会偏。</p>
+      <div class="stmt-field"><label>一句话意图</label>
+        <textarea id="stmt_intent" rows="1" placeholder="这一集要让观众感到什么"></textarea></div>
+      <div class="stmt-field"><label>基调</label>
+        <textarea id="stmt_tone" rows="1" placeholder="如:压抑中的隐忍,冷色实用光"></textarea></div>
+      <div class="stmt-field"><label>节奏</label>
+        <textarea id="stmt_pacing" rows="1" placeholder="如:前紧后缓,高潮在第2场"></textarea></div>
+      <div class="stmt-field"><label>重点镜</label>
+        <textarea id="stmt_key_shots" rows="2" placeholder="哪些镜头必须出彩,想要什么处理"></textarea></div>
+      <div class="stmt-field"><label>情绪高点</label>
+        <textarea id="stmt_emotional_peaks" rows="1" placeholder="在哪一场哪一拍,用什么运镜托住"></textarea></div>
+      <div class="stmt-field"><label>避免</label>
+        <textarea id="stmt_avoid" rows="1" placeholder="不想看到的处理,如:滥用特写/平光"></textarea></div>
+      <div class="row">
+        <button id="stmtSave">保存阐述</button>
+        <span id="stmtStatus"></span>
+      </div>
+    </div>
+    <section id="inspector" aria-label="物体检查器">
+      <div class="inspector-head"><strong id="inspectorTitle">未选择物体</strong>
+        <button id="inspectorClose" aria-label="关闭检查器">×</button></div>
+      <div class="edit-grid">
+        <div class="edit-field"><label>X 米</label><input id="editX" type="number" step="0.1"></div>
+        <div class="edit-field"><label>Y 米</label><input id="editY" type="number" step="0.1"></div>
+        <div class="edit-field"><label>Z 米</label><input id="editZ" type="number" step="0.1"></div>
+        <div class="edit-field"><label>宽 米</label><input id="editW" type="number" min="0.01" step="0.1"></div>
+        <div class="edit-field"><label>高 米</label><input id="editH" type="number" min="0.01" step="0.1"></div>
+        <div class="edit-field"><label>深 米</label><input id="editD" type="number" min="0.01" step="0.1"></div>
+        <div class="edit-field"><label>朝向 °</label><input id="editYaw" type="number" step="5"></div>
+        <div class="edit-field"><label>安装方式</label><select id="editMount"><option value="">未声明</option><option value="floor">落地</option><option value="wall">墙装</option><option value="ceiling">吊装</option><option value="surface">台面</option></select></div>
+        <div class="edit-field"><label>支撑物</label><input id="editSupport" type="text" placeholder="地面/墙/物体ID"></div>
+      </div>
+      <p id="inspectorHint">真值模式只读；进入“修复预览”后才可编辑。未保存改动不会进入导出。</p>
+      <div class="row">
+        <button id="undoEdit" disabled>撤销</button><button id="redoEdit" disabled>重做</button>
+        <button id="saveEdits" disabled>保存修复</button><span id="saveStatus"></span>
+      </div>
+    </section>
+    <div id="err"></div>
+  </div>
+  <footer>
+    <div class="row"><span class="row-label">预演</span>
+      <button id="pvPlay">▶ 播放</button>
+      <button id="pvPrev" title="上一镜">⏮</button>
+      <button id="pvNext" title="下一镜">⏭</button>
+      <select id="pvSpeed" style="font:inherit;font-size:12px;background:transparent;
+        color:var(--paper);border:1px solid var(--line);border-radius:3px;padding:3px 4px">
+        <option value="0.5">0.5×</option>
+        <option value="1" selected>1×</option>
+        <option value="2">2×</option>
+      </select>
+      <input id="pvScrub" type="range" min="0" max="1000" value="0">
+      <span id="pvClock">0.0s / 0.0s</span>
+      <button id="pvChecks" class="ghost">连贯性 0</button>
+    </div>
+    <div class="row"><span id="pvInfo">动态预演:按 ▶ 从当前镜开始播放</span></div>
+    <div id="pvIssues"></div>
+    <div class="row"><span class="row-label">镜头</span>
+      <div class="row" id="shots" style="gap:5px"></div></div>
+    <div class="row"><span class="row-label">视角</span>
+      <button id="orbit" class="on">俯瞰环视</button>
+      <button id="enter">进入本镜机位</button>
+      <span class="row-label" style="margin-left:6px">模式</span>
+      <button id="modeReal" class="on">写实</button>
+      <button id="modeStructure">结构</button>
+      <span class="row-label" style="margin-left:6px">数据</span>
+      <button id="truthMode" class="on" aria-pressed="true">真值</button>
+      <button id="repairMode" class="ghost" aria-pressed="false">修复预览</button>
+      <span class="row-label" style="margin-left:6px">显示</span>
+      <button id="tPano" class="ghost on">全景</button>
+      <button id="tControl" class="ghost" aria-pressed="false">控制标注</button>
+      <button id="tPath" class="ghost" disabled>路线</button>
+      <button id="tFrus" class="ghost" disabled>视锥</button>
+      <button id="tAxis" class="ghost" disabled>轴线</button>
+      <button id="analyzeAppearance">AI识别材质/灯光</button>
+      <button id="exportPng">导出效果图</button>
+      <span id="appearanceStatus"></span>
+    </div>
+  </footer>
+</div>
+<script>
+"use strict";
+// ---- 小型矩阵库(不引外部依赖:CSP 禁 CDN) ----
+const M4={
+ id:()=>[1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1],
+ mul:(a,b)=>{const o=new Array(16);
+  for(let i=0;i<4;i++)for(let j=0;j<4;j++){let s=0;
+   for(let k=0;k<4;k++)s+=a[k*4+j]*b[i*4+k];o[i*4+j]=s}return o},
+ persp:(fovy,asp,n,f)=>{const t=1/Math.tan(fovy/2);
+  return [t/asp,0,0,0, 0,t,0,0, 0,0,(f+n)/(n-f),-1, 0,0,2*f*n/(n-f),0]},
+ inv:a=>{const o=new Array(16),
+  b00=a[0]*a[5]-a[1]*a[4],b01=a[0]*a[6]-a[2]*a[4],
+  b02=a[0]*a[7]-a[3]*a[4],b03=a[1]*a[6]-a[2]*a[5],
+  b04=a[1]*a[7]-a[3]*a[5],b05=a[2]*a[7]-a[3]*a[6],
+  b06=a[8]*a[13]-a[9]*a[12],b07=a[8]*a[14]-a[10]*a[12],
+  b08=a[8]*a[15]-a[11]*a[12],b09=a[9]*a[14]-a[10]*a[13],
+  b10=a[9]*a[15]-a[11]*a[13],b11=a[10]*a[15]-a[11]*a[14],
+  det=b00*b11-b01*b10+b02*b09+b03*b08-b04*b07+b05*b06;
+  if(!det)return null;const d=1/det;
+  o[0]=(a[5]*b11-a[6]*b10+a[7]*b09)*d;
+  o[1]=(-a[1]*b11+a[2]*b10-a[3]*b09)*d;
+  o[2]=(a[13]*b05-a[14]*b04+a[15]*b03)*d;
+  o[3]=(-a[9]*b05+a[10]*b04-a[11]*b03)*d;
+  o[4]=(-a[4]*b11+a[6]*b08-a[7]*b07)*d;
+  o[5]=(a[0]*b11-a[2]*b08+a[3]*b07)*d;
+  o[6]=(-a[12]*b05+a[14]*b02-a[15]*b01)*d;
+  o[7]=(a[8]*b05-a[10]*b02+a[11]*b01)*d;
+  o[8]=(a[4]*b10-a[5]*b08+a[7]*b06)*d;
+  o[9]=(-a[0]*b10+a[1]*b08-a[3]*b06)*d;
+  o[10]=(a[12]*b04-a[13]*b02+a[15]*b00)*d;
+  o[11]=(-a[8]*b04+a[9]*b02-a[11]*b00)*d;
+  o[12]=(-a[4]*b09+a[5]*b07-a[6]*b06)*d;
+  o[13]=(a[0]*b09-a[1]*b07+a[2]*b06)*d;
+  o[14]=(-a[12]*b03+a[13]*b01-a[14]*b00)*d;
+  o[15]=(a[8]*b03-a[9]*b01+a[10]*b00)*d;return o},
+ look:(e,c,u)=>{const z=V.norm(V.sub(e,c)),x=V.norm(V.cross(u,z)),y=V.cross(z,x);
+  return [x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0,
+          -V.dot(x,e),-V.dot(y,e),-V.dot(z,e),1]}};
+const V={
+ sub:(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]],
+ add:(a,b)=>[a[0]+b[0],a[1]+b[1],a[2]+b[2]],
+ scale:(a,s)=>[a[0]*s,a[1]*s,a[2]*s],
+ dot:(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2],
+ cross:(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]],
+ len:a=>Math.hypot(a[0],a[1],a[2]),
+ norm:a=>{const l=V.len(a)||1;return [a[0]/l,a[1]/l,a[2]/l]}};
+const P=(o,d=0)=>[Number(o&&o.x)||0,Number(o&&o.y)||d,Number(o&&o.z)||0];
+
+const cv=document.getElementById("c"),hud=document.getElementById("hud"),
+      labels=document.getElementById("labels"),errBox=document.getElementById("err"),
+      notice=document.getElementById("notice");
+const gl=cv.getContext("webgl",{
+ antialias:true,alpha:false,preserveDrawingBuffer:true});
+function fail(msg){errBox.style.display="grid";errBox.textContent=msg}
+function warn(messages,bad=false){
+ const rows=(Array.isArray(messages)?messages:[messages]).filter(Boolean);
+ notice.textContent="";notice.style.display=rows.length?"block":"none";
+ notice.classList.toggle("bad",bad);notice.classList.remove("expanded");
+ if(!rows.length)return;
+ const panel=document.createElement("details");panel.id="noticePanel";
+ const summary=document.createElement("summary");summary.id="noticeSummary";
+ const hasLocatable=rows.some(row=>row&&typeof row==="object"&&row.objectKey);
+ const groupLabel=row=>{const code=String(row&&row.code||"").toLowerCase(),
+  field=String(row&&row.field||"").toLowerCase();
+  if(code.includes("material")||field.includes("material"))return "材质";
+  if(code.includes("lighting")||field.includes("lighting"))return "灯光";
+  if(code.includes("support")||code.includes("overlap")||code.includes("bounds")||
+     field.includes("support")||field.includes("bounds"))return "空间关系";
+  if(code.includes("geometry")||code.includes("rotation")||code.includes("scale")||
+     field.includes("geometry")||field.includes("scale"))return "几何";
+  return "其他"};
+ const groups=new Map();rows.forEach(row=>{const label=groupLabel(row);
+  if(!groups.has(label))groups.set(label,[]);groups.get(label).push(row)});
+ const groupSummary=[...groups].map(([label,items])=>`${label}${items.length}`).join(" · ");
+ summary.textContent=rows.length===1&&!hasLocatable?String(rows[0].message||rows[0]):
+  `${rows.length} 项场景问题 · ${groupSummary}（点击展开）`;
+ panel.ontoggle=()=>notice.classList.toggle("expanded",panel.open);
+ panel.appendChild(summary);notice.appendChild(panel);
+ if(rows.length>1||hasLocatable){const details=document.createElement("div");details.id="noticeDetails";
+  groups.forEach((groupRows,label)=>{const group=document.createElement("section");
+   group.className="notice-group";const title=document.createElement("div");
+   title.className="notice-group-title";title.textContent=`${label} · ${groupRows.length}项`;
+   group.appendChild(title);groupRows.forEach(row=>{const item=document.createElement("button");
+    item.className="notice-item";item.textContent=String(row.message||row);
+    if(row&&typeof row==="object"&&row.objectKey){
+     item.classList.add("locatable");item.onclick=event=>{
+      event.stopPropagation();focusObject(row.objectKey)}}
+    group.appendChild(item)});details.appendChild(group)});panel.appendChild(details)}}
+if(!gl){fail("此浏览器不支持 WebGL,无法显示 3D 空间。")}
+
+// ---- 着色器:控制线、受光实体、透明阴影、全景房间 ----
+function prog(vs,fs){const p=gl.createProgram();
+ for(const [t,src] of [[gl.VERTEX_SHADER,vs],[gl.FRAGMENT_SHADER,fs]]){
+  const s=gl.createShader(t);gl.shaderSource(s,src);gl.compileShader(s);
+  if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)){
+   const detail=gl.getShaderInfoLog(s)||"未知错误";
+   fail("3D 着色器编译失败: "+detail);throw new Error(detail)}
+  gl.attachShader(p,s)}
+ gl.linkProgram(p);
+ if(!gl.getProgramParameter(p,gl.LINK_STATUS)){
+  const detail=gl.getProgramInfoLog(p)||"未知错误";
+  fail("3D 着色器链接失败: "+detail);throw new Error(detail)}
+ return p}
+const pLine=prog(
+ `attribute vec3 pos;attribute vec3 col;uniform mat4 mvp;varying vec3 vc;
+  void main(){vc=col;gl_Position=mvp*vec4(pos,1.0);gl_PointSize=7.0;}`,
+ `precision mediump float;varying vec3 vc;uniform float alpha;
+  void main(){gl_FragColor=vec4(vc,alpha);}`);
+const pLit=prog(
+ `attribute vec3 pos;attribute vec3 nor;attribute vec3 col;attribute vec4 mat;
+  uniform mat4 mvp;varying vec3 wp;varying vec3 wn;varying vec3 vc;
+  varying vec4 vm;
+  void main(){wp=pos;wn=nor;vc=col;vm=mat;gl_Position=mvp*vec4(pos,1.0);}`,
+ `precision mediump float;varying vec3 wp;varying vec3 wn;varying vec3 vc;
+  varying vec4 vm;uniform vec3 eye;uniform vec3 lightDir;
+  uniform vec3 lightColor;uniform float ambient;uniform float keyLight;
+  uniform float alpha;uniform float realistic;uniform sampler2D panoTex;
+  uniform vec3 panoEye0;uniform float panoAvailable;
+  void main(){vec3 n=normalize(wn);vec3 l=normalize(lightDir);
+   float ndl=max(dot(n,l),0.0);
+   vec3 v=normalize(eye-wp);vec3 h=normalize(l+v);
+   float shine=mix(7.0,80.0,clamp(vm.y,0.0,1.0));
+   float spec=pow(max(dot(n,h),0.0),shine)*vm.x*realistic;
+   float rim=pow(1.0-max(dot(n,v),0.0),3.0)*0.09*realistic;
+   vec3 surface=vc;
+   if(panoAvailable>0.5&&vm.z>0.0){vec3 pd=normalize(wp-panoEye0);
+    float pu=atan(pd.x,pd.z)/6.2831853+0.5;
+    float pv=0.5-asin(clamp(pd.y,-1.0,1.0))/3.14159265;
+    vec3 pano=texture2D(panoTex,vec2(pu,pv)).rgb*1.15;
+    surface=mix(vc,pano,clamp(vm.z,0.0,1.0)*.42);}
+   vec3 hemi=mix(vec3(.60,.51,.42),vec3(1.10,1.05,.96),n.y*.5+.5);
+   float ao=mix(.68,1.0,clamp(wp.y*.9,0.0,1.0));
+   vec3 fillDir=normalize(vec3(-l.x,.22,-l.z));
+   float fill=max(dot(n,fillDir),0.0)*.24*realistic;
+   vec3 lit=surface*(ambient*hemi*ao+keyLight*ndl*lightColor+
+            fill*keyLight*vec3(.58,.66,.80))+
+            lightColor*spec+surface*rim;
+   lit+=(surface*.55+vec3(.45))*vm.w*(.35+.65*realistic);
+   gl_FragColor=vec4(clamp(lit,0.0,1.0),alpha);}`);
+const pAlpha=prog(
+ `attribute vec3 pos;attribute float opa;uniform mat4 mvp;varying float va;
+  void main(){va=opa;gl_Position=mvp*vec4(pos,1.0);}`,
+ `precision mediump float;varying float va;uniform vec3 color;
+  void main(){gl_FragColor=vec4(color,va);}`);
+const pPano=prog(
+ `attribute vec3 pos;uniform mat4 mvp;varying vec3 vw;
+  void main(){vw=pos;gl_Position=mvp*vec4(pos,1.0);}`,
+ `precision highp float;varying vec3 vw;uniform sampler2D tex;
+  uniform vec3 eye0;uniform float dim;
+  void main(){vec3 d=normalize(vw-eye0);
+   float u=atan(d.x,d.z)/6.2831853+0.5;
+   float v=0.5-asin(clamp(d.y,-1.0,1.0))/3.14159265;
+   vec3 c=texture2D(tex,vec2(u,v)).rgb;
+   gl_FragColor=vec4(c*dim,1.0);}`);
+
+function buffer(data){const b=gl.createBuffer();
+ gl.bindBuffer(gl.ARRAY_BUFFER,b);
+ gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(data),gl.STATIC_DRAW);return b}
+function bindAttr(p,name,buf,size,stride,off){
+ const l=gl.getAttribLocation(p,name);if(l<0)return;
+ gl.bindBuffer(gl.ARRAY_BUFFER,buf);gl.enableVertexAttribArray(l);
+ gl.vertexAttribPointer(l,size,gl.FLOAT,false,stride*4,off*4)}
+
+// 全景投影载体:真实尺寸的房间盒(内表面)。等距全景只在拍摄点
+// 成立——贴远球上,环视时地板被放大到失真,火柴人显得比木纹还小;
+// 贴真实房间盒上,地板/墙/顶都在真实距离,人的大小即定位刻度。
+let roomFaces=[];
+const CAPTURE=[0,1.55,0];   // 全景拍摄点:房间中心、站立视平线
+function buildRoomBox(fw,fd,h){
+ const oldBufs=roomFaces.map(f=>f&&f.buf);let fi=0;
+ const x=fw/2,z=fd/2;
+ // 复用旧缓冲(理由同 refill:删除会使已启用属性失效并中断整帧绘制)
+ const face=(a,b,c,d,center,inward)=>{
+  const buf=oldBufs[fi++]||gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER,buf);
+  gl.bufferData(gl.ARRAY_BUFFER,
+   new Float32Array([...a,...b,...c,...a,...c,...d]),gl.DYNAMIC_DRAW);
+  return {buf,count:6,center,inward}};
+ roomFaces=[
+  face([-x,0,-z],[x,0,-z],[x,0,z],[-x,0,z],[0,0,0],[0,1,0]),      // 地板
+  face([-x,h,-z],[-x,h,z],[x,h,z],[x,h,-z],[0,h,0],[0,-1,0]),     // 顶
+  face([-x,0,z],[x,0,z],[x,h,z],[-x,h,z],[0,h/2,z],[0,0,-1]),     // 北墙(窗)
+  face([x,0,-z],[-x,0,-z],[-x,h,-z],[x,h,-z],[0,h/2,-z],[0,0,1]), // 南墙
+  face([x,0,z],[x,0,-z],[x,h,-z],[x,h,z],[x,h/2,0],[-1,0,0]),     // 东墙
+  face([-x,0,-z],[-x,0,z],[-x,h,z],[-x,h,-z],[-x,h/2,0],[1,0,0]), // 西墙
+ ]}
+buildRoomBox(10,7,4.2);
+const panoTex=gl.createTexture();let panoReady=false;
+
+// 种子化随机:布景细节(书堆/褶皱/木色差)在预演逐帧重建时必须稳定,
+// 不能用运行时随机数,否则家具每帧抖动。
+function seedRng(key){let h=2166136261;const s=String(key);
+ for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619)}
+ return()=>{h=Math.imul(h^h>>>15,2246822507);h=Math.imul(h^h>>>13,3266489909);
+  h^=h>>>16;return(h>>>0)/4294967296}}
+
+// ---- 状态 ----
+let DATA=null,SHOT=null,SCENE=null;
+let orbit={yaw:0.6,pitch:0.85,dist:11,target:[0,1,0]},mode="orbit";
+let displayMode="realistic";
+// 真值为默认且唯一可导出状态。repair 只在页面内预览显式修复；
+// A* 绕行、相机推出和贴脸家具剖切绝不污染原 blocking/scene_model。
+let previewMode="truth";
+const show={pano:true,path:true,frus:true,axis:true,control:false};
+const editState={selectedKey:"",location:"",edits:new Map(),undo:[],redo:[],revision:0,
+                 saving:false};
+let lastFrame=null;
+// 布景(sceneGeo)只在换场景/换模式时重建;人物与控制层(geo)逐帧重建。
+let sceneGeo={lit:null,litCount:0,shadow:null,shadowCount:0,
+              lines:null,lineCount:0};
+let geo={lit:null,litCount:0,shadow:null,shadowCount:0,
+         lines:null,lineCount:0,pts:null,ptCount:0};
+
+function hex(c,fb=[0.85,0.68,0.35]){
+ if(Array.isArray(c)&&c.length>=3){const scale=c.some(v=>Number(v)>1)?255:1;
+  return c.slice(0,3).map(v=>Math.max(0,Math.min(1,(Number(v)||0)/scale)))}
+ if(typeof c!=="string")return fb;
+ const named={wood:"8b6747",metal:"8c9399",stone:"858079",fabric:"76685e",
+              glass:"6d9cac",paper:"b8aa8c",ceramic:"9b8e7c"};
+ const m=(named[c.toLowerCase()]||c.replace("#","")).trim();if(m.length!==6)return fb;
+ return [parseInt(m.slice(0,2),16)/255,parseInt(m.slice(2,4),16)/255,
+         parseInt(m.slice(4,6),16)/255]}
+
+const clamp=(value,min,max)=>Math.max(min,Math.min(max,Number(value)));
+// ---- 动态预演:时间轴状态与插值 ----
+const previz={on:false,t:0,speed:1,order:[],total:0,last:0,idx:-1};
+const PV={active:false,u:0};           // 当前帧插值状态(供几何/相机取用)
+const lerp3=(a,b,u)=>[a[0]+(b[0]-a[0])*u,a[1]+(b[1]-a[1])*u,a[2]+(b[2]-a[2])*u];
+const easeInOut=u=>u<0.5?2*u*u:1-Math.pow(-2*u+2,2)/2;
+function pvEntry(){return previz.idx>=0?previz.order[previz.idx]:null}
+function pvLocate(t){
+ for(let i=0;i<previz.order.length;i++){const e=previz.order[i];
+  if(t<e.start+e.wall||i===previz.order.length-1)return i}
+ return -1}
+const finite=(value,fallback)=>Number.isFinite(Number(value))?Number(value):fallback;
+function locationEntry(group){
+ const location=String((SCENE&&SCENE.location)||"");
+ return ((DATA&&DATA[group])||{})[location]}
+function sourceSceneModel(){
+ const normalized=locationEntry("scene_model_contracts"),
+       entry=normalized||locationEntry("scene_models");
+ const model=entry&&(entry.model||entry.scene_model||entry.data||entry);
+ if(model&&Array.isArray(model.objects))return model;
+ const embedded=SCENE&&(SCENE.scene_model||SCENE.model);
+ return embedded&&Array.isArray(embedded.objects)?embedded:{objects:[]}}
+function objectKey(obj,index=0){
+ return String(obj&&(
+  obj.object_id??obj.id??obj.name) || `scene-object-${index}`)}
+function previewObject(obj,index){
+ if(previewMode!=="repair"||editState.location!==String((SCENE&&SCENE.location)||""))
+  return obj;
+ const edit=editState.edits.get(objectKey(obj,index));
+ if(!edit)return obj;
+ return Object.assign({},obj,{
+  position_3d:Object.assign({},obj.position_3d||{},edit.position_3d||{}),
+  width_m:edit.width_m,height_m:edit.height_m,depth_m:edit.depth_m,
+  rotation_y_deg:edit.rotation_y_deg,mount_type:edit.mount_type,
+  support_id:edit.support_id,
+  __previewEdit:true})}
+function activeSceneModel(){
+ const model=sourceSceneModel();
+ if(previewMode!=="repair"||!editState.edits.size)return model;
+ return Object.assign({},model,{objects:(model.objects||[]).map(previewObject)})}
+function activeRenderContract(){
+ const entry=locationEntry("render_contracts");
+ return entry&&(entry.contract||entry.render_contract||entry.data||entry)||{}}
+function lookupContractObject(contract,obj){
+ const keys=[obj.object_id,obj.id,obj.name].filter(Boolean).map(String);
+ for(const group of [contract.objects,contract.materials,contract.object_materials]){
+  if(Array.isArray(group)){
+   const found=group.find(row=>row&&keys.includes(String(
+    row.object_id??row.id??row.object??row.name??"")));
+   if(found)return found}
+  else if(group&&typeof group==="object"){
+   for(const key of keys)if(group[key])return group[key]}}
+ return {}}
+function materialFor(obj){
+ const contract=activeRenderContract(),row=lookupContractObject(contract,obj);
+ const raw=(row.material&&typeof row.material==="object"?row.material:row)||{};
+ const own=(obj.material&&typeof obj.material==="object"?obj.material:{})||{};
+ const category=String(obj.category||obj.semantic_category||"furniture");
+ const defaults={
+  furniture:{color:"#72543d",roughness:.66,metallic:.04},
+  prop:{color:"#8b623d",roughness:.55,metallic:.12},
+  opening:{color:"#607b82",roughness:.34,metallic:.08},
+  light:{color:"#c69b52",roughness:.28,metallic:.48},
+  decor:{color:"#74685b",roughness:.7,metallic:.03}}[category]||
+  {color:"#70665b",roughness:.62,metallic:.04};
+ const color=hex(raw.base_color??raw.color??raw.albedo??own.base_color??
+                 own.color??obj.color??defaults.color,hex(defaults.color));
+ const roughness=clamp(raw.roughness??own.roughness??defaults.roughness,0,1);
+ const metallic=clamp(raw.metallic??raw.metalness??own.metallic??
+                      own.metalness??defaults.metallic,0,1);
+ const gloss=clamp(raw.gloss??raw.glossiness??own.gloss??(1-roughness),0,1);
+ const specular=clamp(raw.specular??own.specular??(.14+metallic*.58),0,1);
+ const emissive=clamp(raw.emissive??own.emissive??0,0,1);
+ return {color,roughness,metallic,gloss,specular,emissive,panoBlend:.68,
+         usedDefault:raw.verified!==true||raw.source==="category_render_default"||
+          raw.source==="visual_annotation_unverified"||
+          !(Object.keys(raw).length||Object.keys(own).length)}}
+function renderContractObject(obj){
+ return lookupContractObject(activeRenderContract(),obj)||{}}
+function prefabFor(obj){
+ const row=renderContractObject(obj),declared=row.render_prefab||obj.render_prefab;
+ if(declared&&declared.type)return declared;
+ const semantic=String(obj.semantic_type||"").split(".").pop(),
+       semanticTypes=new Set(["table","cabinet","lattice","doorway","door",
+        "curtain","column","chair","bed","lantern","brazier","vessel",
+        "paper","rug","plant","instrument","screen"]);
+ if(semanticTypes.has(semantic))return {type:semantic,source:"scene_model_v3",
+  confidence:{level:"high"}};
+ const text=String(obj.name||"").toLowerCase(),rules=[
+  ["lantern",["灯笼","宫灯","油灯","烛台","蜡烛"]],
+  ["brazier",["香炉","熏炉","火盆","炉"]],
+  ["vessel",["茶盏","茶杯","酒杯","水杯","小碗","瓷碗","杯","盏"]],
+  ["cabinet",["药柜","书架","书柜","卷柜","格柜","抽屉","柜"]],
+  ["paper",["宣纸","信笺","纸卷","书卷","卷册","书册","竹简","文书"]],
+  ["bed",["床榻","卧榻","床","榻"]],
+  ["chair",["椅","凳","坐墩"]],
+  ["lattice",["格心窗","格栅","隔扇","花窗","槛窗","支摘窗"]],
+  ["doorway",["门洞","门道","入口","出口"]],
+  ["door",["板门","木门","房门","车门","门扇"]],
+  ["curtain",["竹帘","布帘","纱帘","垂帘","帷幔","纱帐","帐幔"]],
+  ["column",["方柱","圆柱","檐柱","立柱","柱"]],
+  ["screen",["屏风","屏障","围屏"]],
+  ["table",["书案","画案","条案","矮案","琴案","案几","方几","茶几","桌","台几"]],
+  ["instrument",["古琴","瑶琴","琵琶","琴"]],
+  ["rug",["地毯","毛毯","地衣","草席","凉席","竹席","蒲团"]],
+  ["plant",["盆栽","盆景","绿植","翠竹","竹丛","兰草","花木"]]];
+ for(const [type,words] of rules)if(words.some(word=>text.includes(word)))
+  return {type,source:"semantic_name",confidence:{level:"high"}};
+ const fallback={opening:"architectural_frame",light:"lantern",
+  furniture:"generic_furniture",prop:"generic_prop",decor:"decor_panel"};
+ return {type:fallback[String(obj.category||obj.semantic_category||"")]||"generic_object",
+  source:"category_fallback",confidence:{level:"low"}}}
+function renderPlacementFor(obj){
+ if(obj&&obj.__previewEdit&&obj.position_3d)return obj.position_3d;
+ const row=renderContractObject(obj),render=row.render_transform||{},
+       position=render.position;
+ if(position&&[position.x,position.y,position.z].every(
+  value=>Number.isFinite(Number(value))))return position;
+ const transform=obj.transform||{};
+ return obj.position_3d||transform.position_3d||transform.position}
+function lightingFor(){
+ const contract=activeRenderContract();
+ const light=contract.lighting||contract.light||contract.directional_light||{};
+ const directionRaw=light.direction;
+ const direction=Array.isArray(directionRaw)?directionRaw:
+  directionRaw&&typeof directionRaw==="object"?
+   [finite(directionRaw.x,-.45),finite(directionRaw.y,.82),
+    finite(directionRaw.z,.34)]:
+   [finite(light.x,-.45),finite(light.y,.82),finite(light.z,.34)];
+ return {direction:V.norm(direction.map(Number)),
+  color:hex(light.color||contract.light_color||"#ffe4bc",[1,.9,.74]),
+  ambient:clamp(light.ambient??light.ambient_intensity??
+                contract.ambient_intensity??.30,.08,.8),
+  intensity:clamp(light.intensity??light.key_intensity??
+                  contract.key_intensity??.78,.15,1.5)}}
+let renderStats={objects:0,invalid:0,defaultMaterials:0,
+                 semanticPrefabs:0,fallbackPrefabs:0};
+function issueObjectKey(item,message){
+ const direct=item&&(item.object_id??item.object??item.name);
+ if(direct)return String(direct);
+ const text=String(message||"");
+ const objects=(sourceSceneModel().objects||[]);
+ const found=objects.find((obj,index)=>text.includes(String(obj.name||""))||
+  text.includes(String(obj.object_id||obj.id||"")));
+ return found?objectKey(found,objects.indexOf(found)):""}
+function lightingIsVerified(){
+ const contract=activeRenderContract(),light=contract&&(contract.lighting||
+  contract.light||contract.directional_light);
+ if(!light||typeof light!=="object")return false;
+ if(light.verified===true)return true;
+ const source=String(light.source||"").trim().toLowerCase(),
+       confidence=String((light.confidence||{}).level||"").toLowerCase();
+ return Boolean(light.verified!==false&&light.direction&&source&&
+  !["unverified","default","fallback","category_render_default"].includes(source)&&
+  confidence!=="low")}
+function updateQualityBadges(){
+ const box=document.getElementById("quality"),total=(sourceSceneModel().objects||[]).length,
+       geometry=renderStats.objects,
+       material=Math.max(0,renderStats.objects-renderStats.defaultMaterials),
+       items=[
+        [`几何 ${geometry}/${total}`,geometry===total&&total>0],
+        [`语义 ${renderStats.semanticPrefabs}/${renderStats.objects}`,
+         renderStats.semanticPrefabs===renderStats.objects&&renderStats.objects>0],
+        [`材质 ${material}/${renderStats.objects}`,
+         material===renderStats.objects&&renderStats.objects>0],
+        [lightingIsVerified()?"灯光 已验证":"灯光 未验证",lightingIsVerified()]];
+ box.textContent="";items.forEach(([textValue,ok])=>{const badge=document.createElement("span");
+  badge.className="quality-badge "+(ok?"ok":"warn");badge.textContent=textValue;
+  box.appendChild(badge)})}
+function updateSceneStatus(extra=[]){
+ const rows=[...extra].map(item=>typeof item==="object"?item:{message:String(item)}),
+       modelEntry=locationEntry("scene_model_contracts")||locationEntry("scene_models"),
+       renderEntry=locationEntry("render_contracts"),model=activeSceneModel();
+ const add=message=>rows.push({message});
+ if(!model.objects.length)add(
+  "本场没有可用的三维场景模型：仅显示全景房间与人物，请先生成 scene_model。");
+ if(modelEntry&&(modelEntry.error||modelEntry.message))
+  add("三维模型失败："+(modelEntry.error||modelEntry.message));
+ if(!renderEntry)add("本场没有材质渲染合同，已使用安全默认材质与灯光。");
+ else if(renderEntry.error||renderEntry.message)
+  add("写实渲染合同异常："+(renderEntry.error||renderEntry.message));
+ const contractWarnings=renderEntry&&Array.isArray(renderEntry.warnings)?
+  renderEntry.warnings.filter(item=>item&&item.message):[];
+ if(contractWarnings.length){
+  contractWarnings.forEach(item=>rows.push({...item,message:item.message,
+   objectKey:issueObjectKey(item,item.message)}))}
+ if(renderStats.invalid)add(`已跳过 ${renderStats.invalid} 件坐标或尺寸无效的物体。`);
+ if(renderStats.defaultMaterials&&renderEntry&&
+    !contractWarnings.some(item=>item.code==="unverified_material"))
+  add(`${renderStats.defaultMaterials} 件物体缺少材质，已使用分类默认值。`);
+ if(renderStats.fallbackPrefabs)
+  add(`${renderStats.fallbackPrefabs} 件未知物体仍使用低置信占位体；`+
+      "不会把占位形状当成真实物件提交给生成模型。");
+ const pano=((DATA&&DATA.panoramas)||{})[String((SCENE&&SCENE.location)||"")];
+ if(!pano)add("本场没有全景母版：已使用中性写实房壳作为背景。");
+ updateQualityBadges();warn(rows,Boolean(modelEntry&&modelEntry.error))}
+
+// ---- 通行导航:人物与机位绕开实体布景 ----
+// 只影响预演的运动表现;blocking 数据里的起终点、机位端点一律不改。
+// 直线插值本来就是查看器的自创补间,绕行是更接近真实走位的补间。
+let OBSTACLES=[];
+let NAV={key:null,actors:[],cam:null,room:{fw:10,fd:7,fh:4.2}};
+const SOLID_PREFABS=new Set(["table","cabinet","chair","bed","screen",
+ "column","lantern","brazier","plant","vessel","instrument",
+ "generic_furniture","generic_object","generic_prop"]);
+function obstacleFrom(x,y,z,width,height,depth,yaw,type){
+ if(y>.4)return null;                        // 台面道具不挡路
+ if(!SOLID_PREFABS.has(String(type)))return null; // 帘门窗毯可穿行
+ if(width*depth<.05)return null;             // 过小物件忽略
+ const rad=yaw*Math.PI/180;
+ return {x,z,hw:width/2,hd:depth/2,co:Math.cos(rad),si:Math.sin(rad),
+         y0:y,y1:y+height}}
+function obLocal(o,px,pz){const dx=px-o.x,dz=pz-o.z;
+ return [dx*o.co-dz*o.si,dx*o.si+dz*o.co]}
+function pointBlockedIn(obs,px,pz,r){
+ for(const o of obs){const [lx,lz]=obLocal(o,px,pz);
+  if(Math.abs(lx)<=o.hw+r&&Math.abs(lz)<=o.hd+r)return o}
+ return null}
+function segBlockedIn(obs,ax,az,bx,bz,r){
+ for(const o of obs){
+  const [lax,laz]=obLocal(o,ax,az),[lbx,lbz]=obLocal(o,bx,bz),
+        dx=lbx-lax,dz=lbz-laz,hw=o.hw+r,hd=o.hd+r,
+        tests=[[-dx,lax+hw],[dx,hw-lax],[-dz,laz+hd],[dz,hd-laz]];
+  let t0=0,t1=1,hit=true;
+  for(const [p,q] of tests){
+   if(Math.abs(p)<1e-9){if(q<0){hit=false;break}continue}
+   const t=q/p;
+   if(p<0){if(t>t1){hit=false;break}if(t>t0)t0=t}
+   else{if(t<t0){hit=false;break}if(t<t1)t1=t}}
+  if(hit&&t0<=t1)return o}
+ return null}
+function insideRoom(px,pz,margin){
+ const hx=NAV.room.fw/2-margin,hz=NAV.room.fd/2-margin;
+ return Math.abs(px)<=hx&&Math.abs(pz)<=hz}
+function clampRoom(p,margin){
+ const hx=NAV.room.fw/2-margin,hz=NAV.room.fd/2-margin;
+ return [Math.max(-hx,Math.min(hx,p[0])),
+         Math.max(.12,Math.min(NAV.room.fh-.15,p[1])),
+         Math.max(-hz,Math.min(hz,p[2]))]}
+// 可见图 A*:节点=起终点+外扩障碍角点;小规模场景一次算完并缓存。
+function route2d(obs,a,b,r){
+ if(pointBlockedIn(obs,a[0],a[1],r)||pointBlockedIn(obs,b[0],b[1],r))
+  return [a,b];       // 端点本身在障碍里是数据问题,不强行绕
+ if(!segBlockedIn(obs,a[0],a[1],b[0],b[1],r))return [a,b];
+ const corners=[a,b];
+ for(const o of obs){const m=r+.14;
+  for(const [sx,sz] of [[-1,-1],[1,-1],[1,1],[-1,1]]){
+   const lx=(o.hw+m)*sx,lz=(o.hd+m)*sz,
+         wx=o.x+lx*o.co+lz*o.si,wz=o.z-lx*o.si+lz*o.co;
+   if(!pointBlockedIn(obs,wx,wz,r-.02)&&insideRoom(wx,wz,.24))
+    corners.push([wx,wz])}}
+ const n=corners.length,dist=new Array(n).fill(1/0),
+       prev=new Array(n).fill(-1),done=new Array(n).fill(false),
+       d2=(i,j)=>Math.hypot(corners[i][0]-corners[j][0],
+                            corners[i][1]-corners[j][1]);
+ dist[0]=0;
+ for(;;){
+  let u=-1,best=1/0;
+  for(let i=0;i<n;i++)
+   if(!done[i]&&Number.isFinite(dist[i])&&dist[i]+d2(i,1)<best){
+    best=dist[i]+d2(i,1);u=i}
+  if(u<0||u===1)break;
+  done[u]=true;
+  for(let v=0;v<n;v++){
+   if(done[v])continue;
+   const nd=dist[u]+d2(u,v);
+   if(nd<dist[v]&&!segBlockedIn(obs,corners[u][0],corners[u][1],
+                                corners[v][0],corners[v][1],r-.01)){
+    dist[v]=nd;prev[v]=u}}}
+ if(!Number.isFinite(dist[1]))return [a,b];
+ const out=[];
+ for(let u=1;u!==-1;u=prev[u]){out.unshift(corners[u]);if(u===0)break}
+ return out.length>=2?out:[a,b]}
+function routePath(obs,a,b,r){
+ const pts2=route2d(obs,[a[0],a[2]],[b[0],b[2]],r),cum=[0];
+ let len=0;
+ for(let i=1;i<pts2.length;i++){
+  len+=Math.hypot(pts2[i][0]-pts2[i-1][0],pts2[i][1]-pts2[i-1][1]);
+  cum.push(len)}
+ const pts=pts2.map((q,i)=>{const f=len>0?cum[i]/len:0;
+  return [q[0],a[1]+(b[1]-a[1])*f,q[1]]});
+ return {pts,cum,len}}
+function measuredPath(points){
+ const clean=(points||[]).map(point=>P(point)).filter(point=>
+  point.every(value=>Number.isFinite(value))),cum=[0];
+ if(!clean.length)clean.push([0,0,0]);
+ let len=0;for(let i=1;i<clean.length;i++){
+  len+=V.len(V.sub(clean[i],clean[i-1]));cum.push(len)}
+ return {pts:clean,cum,len}}
+function contractRoutePath(owner,start,end){
+ // 真值模式只消费合同里的 route_3d；缺失时才连接原始起终点。
+ // 不调用 A*、不改端点，也不自创中间拐点。
+ const route=Array.isArray(owner&&owner.route_3d)?owner.route_3d:[];
+ const points=route.length?route.map(point=>P(point)):[];
+ const same=(a,b)=>V.len(V.sub(a,b))<1e-5;
+ if(!points.length||!same(points[0],start))points.unshift(start);
+ if(!same(points[points.length-1],end))points.push(end);
+ return measuredPath(points)}
+function pathPoint(path,f){
+ const pts=path.pts;
+ if(pts.length<2||path.len<=0)
+  return {p:pts[0].slice(),dir:null};
+ const t=Math.max(0,Math.min(1,f))*path.len;
+ let i=1;
+ while(i<path.cum.length-1&&path.cum[i]<t)i++;
+ const t0=path.cum[i-1],t1=path.cum[i],
+       u=(t-t0)/Math.max(1e-6,t1-t0),A=pts[i-1],B=pts[i];
+ return {p:[A[0]+(B[0]-A[0])*u,A[1]+(B[1]-A[1])*u,A[2]+(B[2]-A[2])*u],
+         dir:[B[0]-A[0],B[2]-A[2]]}}
+// 机位:钳在房内,并从家具体内推出(静止机位放进柜子属数据问题,
+// 查看器至少不让镜头黑在箱体里)。
+function resolveEye(p){
+ let [px,py,pz]=clampRoom(p,.22);
+ for(let guard=0;guard<3;guard++){
+  const o=pointBlockedIn(OBSTACLES,px,pz,.28);
+  if(!o||py>o.y1+.12)break;
+  const [lx,lz]=obLocal(o,px,pz),
+        pushX=(o.hw+.32)-Math.abs(lx),pushZ=(o.hd+.32)-Math.abs(lz);
+  if(pushX<=pushZ){const nl=(o.hw+.32)*(lx>=0?1:-1);
+   px=o.x+nl*o.co+lz*o.si;pz=o.z-nl*o.si+lz*o.co}
+  else{const nl=(o.hd+.32)*(lz>=0?1:-1);
+   px=o.x+lx*o.co+nl*o.si;pz=o.z-lx*o.si+nl*o.co}}
+ return [px,py,pz]}
+function ensureNav(){
+ const key=(SHOT?String(SHOT.shot_no):"-")+"@"+
+  String((SCENE&&SCENE.location)||"")+"#"+OBSTACLES.length+"#"+previewMode;
+ if(NAV.key===key)return;
+ NAV.key=key;NAV.actors=[];NAV.cam=null;
+ if(!SHOT)return;
+ (SHOT.actors||[]).forEach((a,i)=>{
+  const start=P(a.start_3d),end=P(a.end_3d||a.start_3d);
+  NAV.actors[i]=previewMode==="repair"?
+   routePath(OBSTACLES,start,end,.26):contractRoutePath(a,start,end)});
+ const cam=SHOT.camera||{},e0=P(cam.start_3d,1.55),
+       e1=P(cam.end_3d||cam.start_3d,1.55),
+       lowY=Math.min(e0[1],e1[1]),
+       camObs=OBSTACLES.filter(o=>o.y1>lowY-.15);
+ NAV.cam=previewMode==="repair"?routePath(camObs,e0,e1,.35):
+  contractRoutePath(cam,e0,e1)}
+
+// ---- 网格工具箱:静态布景与动态人物共用的几何生成器 ----
+function meshKit(){
+ const L=[],PT=[],LIT=[],SHADOW=[];
+ const push=(a,b,c)=>{L.push(a[0],a[1],a[2],c[0],c[1],c[2],
+                             b[0],b[1],b[2],c[0],c[1],c[2])};
+ const litVertex=(p,n,m)=>LIT.push(
+  p[0],p[1],p[2],n[0],n[1],n[2],m.color[0],m.color[1],m.color[2],
+  m.specular,m.gloss,finite(m.panoBlend,0),finite(m.emissive,0));
+ const tri=(a,b,c,m)=>{const n=V.norm(V.cross(V.sub(b,a),V.sub(c,a)));
+  litVertex(a,n,m);litVertex(b,n,m);litVertex(c,n,m)};
+ const face=(a,b,c,d,m)=>{tri(a,b,c,m);tri(a,c,d,m)};
+ const edgePairs=[[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],
+                  [0,4],[1,5],[2,6],[3,7]];
+ function addBox(center,width,height,depth,yawDeg,m,edges=false){
+  const x=center[0],y=center[1],z=center[2],yaw=yawDeg*Math.PI/180,
+        co=Math.cos(yaw),si=Math.sin(yaw),w=width/2,d=depth/2,
+        corner=(lx,yy,lz)=>[x+lx*co+lz*si,yy,z-lx*si+lz*co],
+        v=[corner(-w,y,-d),corner(w,y,-d),corner(w,y,d),corner(-w,y,d),
+           corner(-w,y+height,-d),corner(w,y+height,-d),
+           corner(w,y+height,d),corner(-w,y+height,d)];
+  face(v[0],v[1],v[2],v[3],m);face(v[4],v[7],v[6],v[5],m);
+  face(v[0],v[4],v[5],v[1],m);face(v[1],v[5],v[6],v[2],m);
+  face(v[2],v[6],v[7],v[3],m);face(v[3],v[7],v[4],v[0],m);
+  if(edges){const edge=m.color.map(c=>Math.min(1,c*1.35));
+   edgePairs.forEach(pair=>push(v[pair[0]],v[pair[1]],edge))}}
+ function addRound(center,width,height,depth,yawDeg,m,topScale=1,sides=18){
+  const [x,y,z]=center,yaw=yawDeg*Math.PI/180,co=Math.cos(yaw),si=Math.sin(yaw),
+        point=(radiusX,yy,radiusZ,t)=>{
+         const lx=Math.cos(t)*radiusX,lz=Math.sin(t)*radiusZ;
+         return [x+lx*co+lz*si,yy,z-lx*si+lz*co]},
+        bottom=[x,y,z],top=[x,y+height,z];
+  for(let i=0;i<sides;i++){
+   const t0=i/sides*Math.PI*2,t1=(i+1)/sides*Math.PI*2,
+         b0=point(width/2,y,depth/2,t0),b1=point(width/2,y,depth/2,t1),
+         t0p=point(width/2*topScale,y+height,depth/2*topScale,t0),
+         t1p=point(width/2*topScale,y+height,depth/2*topScale,t1);
+   face(b0,b1,t1p,t0p,m);tri(top,t0p,t1p,m);tri(bottom,b1,b0,m)}}
+ function shadowEllipse(x,z,rx,rz,offX,offZ,alpha,yawDeg=0){
+  const count=20,yaw=(yawDeg||0)*Math.PI/180,
+        co=Math.cos(yaw),si=Math.sin(yaw),c=[x+offX,.008,z+offZ],
+        at=t=>{const lx=rx*Math.cos(t),lz=rz*Math.sin(t);
+         return [c[0]+lx*co+lz*si,c[1],c[2]-lx*si+lz*co]};
+  for(let i=0;i<count;i++){
+   const p0=at(i/count*Math.PI*2),p1=at((i+1)/count*Math.PI*2);
+   SHADOW.push(c[0],c[1],c[2],alpha,p0[0],p0[1],p0[2],.015,
+               p1[0],p1[1],p1[2],.015)}}
+ // 复用缓冲对象只重填数据:已启用的顶点属性若指向被删除的缓冲,
+ // 整帧 drawArrays 会报 INVALID_OPERATION(含全景),故绝不删除缓冲。
+ const refill=(target,key,data)=>{
+  if(!target[key])target[key]=gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER,target[key]);
+  gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(data),gl.DYNAMIC_DRAW)};
+ function upload(target){
+  refill(target,"lit",LIT);target.litCount=LIT.length/13;
+  refill(target,"shadow",SHADOW);target.shadowCount=SHADOW.length/4;
+  refill(target,"lines",L);target.lineCount=L.length/6;
+  if("pts" in target){refill(target,"pts",PT);target.ptCount=PT.length/6}}
+ return {L,PT,LIT,SHADOW,push,litVertex,tri,face,addBox,addRound,
+         shadowEllipse,upload}}
+function addSelectionWire(kit,x,y,z,width,height,depth,yawDeg){
+ const yaw=yawDeg*Math.PI/180,co=Math.cos(yaw),si=Math.sin(yaw),
+       w=width/2,d=depth/2,col=[1,.72,.16],
+       point=(lx,yy,lz)=>[x+lx*co+lz*si,yy,z-lx*si+lz*co],
+       v=[point(-w,y,-d),point(w,y,-d),point(w,y,d),point(-w,y,d),
+          point(-w,y+height,-d),point(w,y+height,-d),
+          point(w,y+height,d),point(-w,y+height,d)],
+       pairs=[[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],
+              [0,4],[1,5],[2,6],[3,7]];
+ pairs.forEach(pair=>kit.push(v[pair[0]],v[pair[1]],col))}
+// ---- 语义预制件:按名称与类别把包围盒长成可辨认的国风陈设 ----
+function addScenePrefab(kit,prefab,name,x,y,z,width,height,depth,yaw,m,edges){
+ const {addBox,addRound,push}=kit,
+       type=String((prefab&&prefab.type)||"generic_object"),
+       label=String(name||""),
+       rng=seedRng(label+"@"+x.toFixed(2)+","+z.toFixed(2)),
+       radians=yaw*Math.PI/180,co=Math.cos(radians),si=Math.sin(radians),
+       local=(lx,ly,lz)=>[x+lx*co+lz*si,y+ly,z-lx*si+lz*co],
+       part=(lx,ly,lz,w,h,d,turn=0,mat=m)=>
+        addBox(local(lx,ly,lz),Math.max(.015,w),Math.max(.015,h),
+               Math.max(.015,d),yaw+turn,mat,edges),
+       round=(lx,ly,lz,w,h,d,scale=1,mat=m,sides=18)=>
+        addRound(local(lx,ly,lz),Math.max(.02,w),Math.max(.02,h),
+                 Math.max(.02,d),yaw,mat,scale,sides),
+       tone=f=>({...m,color:m.color.map(c=>Math.min(1,c*f))}),
+       vary=(mat,f)=>({...mat,color:mat.color.map(c=>Math.min(1,c*f))}),
+       dark=tone(.70),deep=tone(.55),light=tone(1.20),
+       paperMat={color:hex("#d6c8a6"),specular:.06,gloss:.12,
+                 panoBlend:.15,emissive:0},
+       metalMat={color:hex("#8a744b"),specular:.6,gloss:.72,
+                 panoBlend:.2,emissive:0},
+       stoneMat={color:hex("#7d7668"),specular:.08,gloss:.2,
+                 panoBlend:.2,emissive:0};
+ if(type==="table"){
+  const slab=clamp(height*.10,.05,.12),apron=clamp(height*.10,.04,.10),
+        leg=Math.max(.05,Math.min(width,depth)*.07),
+        an=label.includes("案"),inset=an?width*.16:leg*.9,
+        ix=Math.max(leg,width/2-inset),iz=Math.max(leg,depth/2-leg*.9);
+  part(0,height-slab,0,width,slab,depth,0,vary(light,.98+rng()*.06));
+  part(0,height-slab*1.45,0,width*.985,slab*.5,depth*.985,0,dark);
+  part(0,height-slab-apron,0,ix*2-leg,apron,depth*.86,0,tone(.86));
+  for(const lx of [-ix,ix])for(const lz of [-iz,iz])
+   part(lx,0,lz,leg,height-slab,leg,0,vary(dark,.94+rng()*.1));
+  for(const lx of [-ix,ix])
+   part(lx,height*.16,0,leg*.6,leg*.55,iz*2,0,deep);
+  if(!an)for(const lz of [-iz,iz])
+   part(0,height*.16,lz,ix*2,leg*.55,leg*.6,0,deep);
+  return}
+ if(type==="cabinet"){
+  const frame=Math.max(.04,Math.min(width,depth)*.09),
+        drawers=/抽屉|药/.test(label),
+        open=/架|书|卷/.test(label)&&!drawers;
+  part(0,0,depth/2-frame*.35,width,height,frame*.7,0,deep);
+  part(-width/2+frame/2,0,0,frame,height,depth);
+  part(width/2-frame/2,0,0,frame,height,depth);
+  part(0,0,0,width,frame,depth,0,dark);
+  part(0,height-frame,0,width,frame,depth,0,dark);
+  part(0,height-frame*.5,0,width*1.05,frame*.55,depth*1.06,0,dark);
+  part(0,0,0,width*1.04,frame*.5,depth*1.05,0,deep);
+  if(drawers){
+   const rows=clamp(Math.round(height/.30),3,7),
+         cols=clamp(Math.round(width/.28),2,5),
+         cw=(width-frame*2)/cols,ch=(height-frame*2)/rows;
+   for(let r=0;r<rows;r++)for(let c=0;c<cols;c++){
+    const lx=-width/2+frame+cw*(c+.5),ly=frame+ch*r;
+    part(lx,ly+ch*.07,-depth/2-.008,cw*.86,ch*.80,.03,0,
+         vary(m,.9+rng()*.2));
+    part(lx,ly+ch*.46,-depth/2-.026,cw*.16,ch*.13,.02,0,metalMat)}
+  }else if(open){
+   const shelves=clamp(Math.round(height/.42),2,5),
+         inner=width-frame*2,sh=(height-frame*2)/shelves,
+         inks=["#3d4a5c","#233026","#6e5335","#5c5c54","#54402e"];
+   for(let i=1;i<shelves;i++)
+    part(0,frame+sh*i,0,inner,frame*.5,depth*.92,0,light);
+   for(let s=0;s<shelves;s++){
+    let cx=-inner/2+.04;const ly=frame+sh*s+frame*.3;
+    while(cx<inner/2-.14){
+     const runW=.12+rng()*.2,runH=Math.min(sh*.72,.2+rng()*.13),
+           ink={color:hex(inks[(rng()*inks.length)|0]),specular:.08,
+                gloss:.2,panoBlend:.1,emissive:0};
+     if(rng()<.24)part(cx+runW/2,ly,0,runW*.9,.05+rng()*.03,
+      depth*.62,0,vary(paperMat,.9+rng()*.16));
+     else part(cx+runW/2,ly,0,runW,runH,depth*.6,rng()<.14?6:0,ink);
+     cx+=runW+.025}}
+  }else{
+   for(const s of [-1,1])part(s*width*.24,frame,-depth/2-.006,
+    width*.44,height-frame*2.6,.03,0,vary(m,.94+rng()*.1));
+   part(0,height*.46,-depth/2-.02,width*.07,height*.09,.018,0,metalMat)}
+  return}
+ if(type==="lattice"){
+  const frame=Math.max(.04,Math.min(width,height)*.06),front=-depth*.12;
+  part(0,-.02,0,width*1.05,.05,depth*1.3,0,dark);
+  part(0,0,front,width,frame,depth,0,dark);
+  part(0,height-frame,front,width,frame,depth,0,dark);
+  part(-width/2+frame/2,0,front,frame,height,depth,0,dark);
+  part(width/2-frame/2,0,front,frame,height,depth,0,dark);
+  // The panorama supplies the light/view beyond this measured opening.  An
+  // opaque luminous backing turned a large lattice window into a white wall.
+  // Render only its frame and bars so the room remains spatially readable.
+  const cols=clamp(Math.round(width/.15),4,14),
+        rows=clamp(Math.round(height/.34),2,6),bar=Math.max(.016,frame*.34);
+  for(let i=1;i<cols;i++)part(-width/2+width*i/cols,frame,front,
+   bar,height-frame*2,depth*.5,0,tone(.9));
+  for(let i=1;i<rows;i++)part(0,height*i/rows,front,width-frame*2,
+   bar,depth*.5,0,tone(.9));
+  return}
+ if(type==="door"||type==="doorway"||type==="architectural_frame"){
+  const frame=Math.max(.05,Math.min(width,height)*.07);
+  part(-width/2+frame/2,0,0,frame,height,depth,0,dark);
+  part(width/2-frame/2,0,0,frame,height,depth,0,dark);
+  part(0,height-frame,0,width,frame,depth,0,dark);
+  part(0,height-frame*.4,0,width*1.08,frame*.5,depth*1.15,0,deep);
+  part(0,0,0,width,frame*.8,depth*1.1,0,deep);
+  if(type==="door"){
+   const inner=width-frame*2,planks=clamp(Math.round(inner/.18),3,7),
+         pw=inner/planks;
+   for(let i=0;i<planks;i++)
+    part(-inner/2+pw*(i+.5),frame*.8,0,pw*.94,height-frame*1.9,
+         Math.max(.04,depth*.5),0,vary(m,.9+rng()*.16));
+   for(const fy of [.30,.62])part(0,height*fy,-depth*.30,inner*.94,
+    frame*.5,.025,0,dark);
+   round(-inner*.22,height*.46,-depth*.34,.07,.02,.07,1,metalMat,10);
+   round(-inner*.22,height*.42,-depth*.36,.05,.05,.02,1,metalMat,10)}
+  return}
+ if(type==="curtain"||type==="decor_panel"){
+  const folds=clamp(Math.round(width/.15),6,20),foldW=width/folds,
+        phase=rng()*6.28;
+  part(0,height-.045,0,width*1.08,.045,Math.max(.05,depth*.4),0,dark);
+  round(-width*.54,height-.05,0,.05,.05,.05,1,deep,8);
+  round(width*.54,height-.05,0,.05,.05,.05,1,deep,8);
+  for(let i=0;i<folds;i++){
+   const sway=Math.sin(i*1.9+phase),drop=height*(.955+rng()*.042);
+   part(-width/2+foldW*(i+.5),height-.05-drop,
+        sway*Math.max(.02,depth*.28),foldW*.88,drop,
+        Math.max(.02,depth*.4),sway*3,i%2?vary(m,1.05):vary(m,.82))}
+  return}
+ if(type==="column"){
+  const square=label.includes("方");
+  round(0,0,0,width*1.5,.07,depth*1.5,1.12,stoneMat,14);
+  round(0,.07,0,width*1.28,.09,depth*1.28,.82,vary(stoneMat,1.1),14);
+  if(square){part(0,.16,0,width,height-.34,depth);
+   part(0,height-.21,0,width*1.3,.09,depth*1.3,0,dark)}
+  else{round(0,.16,0,width,height-.34,depth,.93);
+   round(0,height-.21,0,width*1.06,.05,depth*1.06,1.18,dark)}
+  part(0,height-.13,0,width*1.45,.13,depth*1.45,0,vary(dark,1.05));
+  return}
+ if(type==="chair"){
+  const drum=/墩|鼓/.test(label),stool=/凳/.test(label);
+  if(drum){
+   round(0,0,0,width*.72,height*.16,depth*.72,1.3,dark,14);
+   round(0,height*.16,0,width*.94,height*.44,depth*.94,1.06,m,14);
+   round(0,height*.60,0,width*.99,height*.24,depth*.99,.74,
+         vary(m,.92),14);
+   round(0,height*.84,0,width*.74,height*.16,depth*.74,.98,light,14);
+   return}
+  const seatY=Math.max(height*.40,.24),slab=Math.max(.04,height*.06),
+        leg=Math.max(.035,Math.min(width,depth)*.085),
+        ix=width/2-leg*.7,iz=depth/2-leg*.7;
+  part(0,seatY,0,width,slab,depth,0,light);
+  part(0,seatY-slab*.9,0,width*.9,slab*.8,depth*.9,0,tone(.84));
+  for(const lx of [-ix,ix])for(const lz of [-iz,iz])
+   part(lx,0,lz,leg,seatY,leg,0,vary(dark,.94+rng()*.08));
+  part(0,seatY*.32,-iz,ix*2,leg*.5,leg*.55,0,deep);
+  for(const lx of [-ix,ix])part(lx,seatY*.45,0,leg*.5,leg*.55,iz*2,0,deep);
+  if(!stool){
+   const backH=Math.max(.12,height-seatY-slab);
+   for(const lx of [-ix,ix])part(lx,seatY+slab,iz,leg*.8,backH,leg*.8,0,dark);
+   part(0,height-leg*1.2,iz,width,leg*1.2,leg*.9,0,m);
+   part(0,seatY+slab+backH*.10,iz,width*.30,backH*.68,leg*.5,0,
+        vary(m,1.08))}
+  return}
+ if(type==="bed"){
+  const base=Math.max(.14,height*.26),mat=Math.max(.10,height*.16),
+        rail=Math.max(.05,height*.07),legH=Math.max(.09,height*.12);
+  part(0,legH,0,width,base,depth,0,dark);
+  for(const lx of [-width/2+.09,width/2-.09])
+   for(const lz of [-depth/2+.09,depth/2-.09])
+    part(lx,0,lz,.13,legH,.13,0,deep);
+  part(0,legH+base,0,width*.97,mat,depth*.97,0,
+       {color:hex("#a89274"),specular:.05,gloss:.1,panoBlend:.2,
+        emissive:0});
+  const top=legH+base+mat,backH=Math.max(.12,height-top);
+  part(0,top,depth/2-rail*.5,width,backH,rail,0,m);
+  for(const s of [-1,1])part(s*(width/2-rail*.5),top,0,rail,
+   backH*.78,depth*.94,0,tone(.9));
+  part(width*.30,top,depth*.10,width*.26,mat*.9,depth*.5,0,
+       {color:hex("#7e6a52"),specular:.05,gloss:.1,panoBlend:0,
+        emissive:0});
+  part(-width*.34,top,depth*.14,width*.2,mat*.6,depth*.3,0,
+       {color:hex("#9d8a6b"),specular:.05,gloss:.1,panoBlend:0,
+        emissive:0});
+  return}
+ if(type==="screen"){
+  const panels=clamp(Math.round(width/.55),2,6),panelW=width/panels,
+        frame=Math.max(.03,panelW*.07);
+  for(let i=0;i<panels;i++){
+   const lx=-width/2+panelW*(i+.5),turn=(i-(panels-1)/2)*7,
+         pd=Math.max(.03,depth*.5);
+   part(lx,0,0,panelW*.96,frame*1.6,pd,turn,dark);
+   part(lx,height-frame,0,panelW*.96,frame,pd,turn,dark);
+   part(lx-panelW*.44,frame,0,frame,height-frame*2,pd,turn,dark);
+   part(lx+panelW*.44,frame,0,frame,height-frame*2,pd,turn,dark);
+   part(lx,frame*1.6,0,panelW*.82,height-frame*3.2,pd*.4,turn,
+        vary(m,1.10+(i%2?0:.07)));
+   part(lx,0,0,panelW*.30,frame*.9,pd*2.6,turn,deep)}
+  return}
+ if(type==="lantern"){
+  const floorLamp=height>1.1,
+        bodyH=floorLamp?height*.30:height*.58,
+        bodyY=floorLamp?height*.60:height*.18,
+        bodyW=Math.max(width*(floorLamp?.9:.85),.1),
+        glow={color:hex("#f4d9a0"),specular:.1,gloss:.3,panoBlend:0,
+              emissive:.75},
+        tassel={color:hex("#a63b30"),specular:.1,gloss:.3,panoBlend:0,
+                emissive:0};
+  if(floorLamp){
+   round(0,0,0,width*.9,.05,depth*.9,1.1,deep,10);
+   round(0,.05,0,width*.16,bodyY-.05,depth*.16,.9,dark,8)}
+  else round(0,0,0,width*.7,bodyY,depth*.7,.8,dark,8);
+  round(0,bodyY-.03,0,bodyW*1.04,.045,bodyW*1.04,1,dark,6);
+  round(0,bodyY,0,bodyW,bodyH,bodyW,1,glow,6);
+  round(0,bodyY+bodyH,0,bodyW*1.05,.05,bodyW*1.05,.62,dark,6);
+  round(0,bodyY+bodyH+.05,0,width*.16,.07,depth*.16,.4,dark,6);
+  part(0,bodyY-.16,0,.016,.16,.016,0,tassel);
+  round(0,bodyY-.24,0,.05,.09,.05,.5,tassel,8);
+  return}
+ if(type==="brazier"){
+  const open=/火盆|炭/.test(label),bodyY=height*.30,bodyH=height*.42;
+  for(let i=0;i<3;i++){const a=i*2.094+.5,
+   lx=Math.cos(a)*width*.30,lz=Math.sin(a)*width*.30;
+   round(lx,0,lz,width*.13,bodyY+.02,width*.13,.72,dark,8)}
+  round(0,bodyY,0,width*.86,bodyH*.5,depth*.86,1.14,m,16);
+  round(0,bodyY+bodyH*.5,0,width*.98,bodyH*.5,depth*.98,.82,m,16);
+  for(const s of [-1,1])part(s*width*.5,bodyY+bodyH*.55,0,
+   width*.1,height*.16,width*.1,0,dark);
+  if(open)round(0,bodyY+bodyH*.9,0,width*.6,.04,depth*.6,.9,
+   {color:hex("#e07a3a"),specular:.1,gloss:.2,panoBlend:0,
+    emissive:.65},10);
+  else{round(0,bodyY+bodyH,0,width*.8,height*.14,depth*.8,.4,dark,16);
+   round(0,bodyY+bodyH+height*.14,0,width*.12,height*.07,depth*.12,.6,
+    metalMat,8)}
+  return}
+ if(type==="vessel"){
+  round(0,0,0,width*.46,Math.max(.015,height*.14),depth*.46,.9,dark,12);
+  round(0,Math.max(.015,height*.14),0,width*.7,
+        Math.max(.02,height*.86),depth*.7,1.3,
+        {...m,specular:Math.max(.3,m.specular),
+         gloss:Math.max(.5,m.gloss)},12);
+  return}
+ if(type==="paper"){
+  const thin=Math.max(.01,Math.min(.03,height*.3));
+  if(label.includes("竹简")){
+   const slats=clamp(Math.round(width/.05),6,12),sw=width/slats;
+   for(let i=0;i<slats;i++)part(-width/2+sw*(i+.5),0,0,sw*.8,thin,
+    depth,0,vary(m,.86+rng()*.2));
+   return}
+  for(let i=0;i<3;i++)part((rng()-.5)*width*.16,thin*i,
+   (rng()-.5)*depth*.2,width*(1-.08*i),thin,depth*(1-.06*i),
+   (rng()-.5)*10,vary(m,.94+rng()*.1));
+  if(label.includes("卷"))part(width*.36,thin*2,0,.09,.09,depth*.66,0,
+   vary(m,.8));
+  return}
+ if(type==="rug"){
+  if(/蒲团/.test(label)){
+   round(0,0,0,width,Math.max(.05,height),depth,.88,m,14);
+   round(0,Math.max(.05,height),0,width*.9,.015,depth*.9,1,light,14);
+   return}
+  part(0,0,0,width,.014,depth,0,m);
+  part(0,.014,0,width*.86,.006,depth*.82,0,vary(m,1.14));
+  const bw=Math.min(width,depth)*.05;
+  part(0,.012,-depth/2+bw/2,width,.008,bw,0,deep);
+  part(0,.012,depth/2-bw/2,width,.008,bw,0,deep);
+  part(-width/2+bw/2,.012,0,bw,.008,depth,0,deep);
+  part(width/2-bw/2,.012,0,bw,.008,depth,0,deep);
+  return}
+ if(type==="plant"){
+  const potH=Math.min(.32,height*.3),
+        leaf={color:hex("#55673f"),specular:.1,gloss:.25,panoBlend:.1,
+              emissive:0},
+        pot={...m,color:hex("#6f5340")};
+  round(0,0,0,width*.62,potH,depth*.62,1.22,pot,12);
+  round(0,potH,0,width*.55,.03,depth*.55,.9,deep,10);
+  if(/竹/.test(label)){
+   for(let i=0;i<3;i++){const lx=(rng()-.5)*width*.3,
+    lz=(rng()-.5)*depth*.3;
+    round(lx,potH,lz,.035,height-potH,.035,.85,
+     {...leaf,color:hex("#6b7c4a")},6);
+    for(let k=1;k<4;k++)part(lx+.05,potH+(height-potH)*k/4,lz,
+     .16+rng()*.1,.02,.05,rng()*90,leaf)}
+   return}
+  round(0,potH,0,width*.14,height*.30,depth*.14,.8,
+        {...pot,color:hex("#5a4632")},8);
+  for(let i=0;i<4;i++)
+   round((rng()-.5)*width*.4,potH+height*(.30+.15*i),
+    (rng()-.5)*depth*.4,width*(.72-.12*i),height*.22,
+    depth*(.72-.12*i),.5,vary(leaf,.85+rng()*.3),10);
+  return}
+ if(type==="instrument"){
+  const feet=Math.min(.05,height*.3),bodyH=Math.max(.025,height-feet),
+        lacquer={...m,specular:Math.max(.45,m.specular),
+                 gloss:Math.max(.7,m.gloss)};
+  for(const lz of [-depth*.28,depth*.28])
+   part(width*.30,0,lz,.05,feet,.06,0,dark);
+  part(-width*.44,0,0,.06,feet,depth*.8,0,dark);
+  part(-width*.05,feet,0,width*.9,bodyH,depth,0,lacquer);
+  part(width*.445,feet,0,width*.11,bodyH*.85,depth*.84,0,
+       vary(lacquer,.88));
+  part(-width*.43,feet+bodyH,0,.02,bodyH*.6,depth*.88,0,light);
+  for(let s=0;s<7;s++){const lz=-depth*.34+depth*.68*s/6;
+   push(local(-width*.43,feet+bodyH*1.5,lz),
+        local(width*.47,feet+bodyH*1.2,lz),[.85,.74,.5])}
+  return}
+ addBox([x,y,z],width,height,depth,yaw,m,edges)}
+
+// 无全景母版时的中性写实房壳:板条地面/裙墙/梁檩天花,布景不再悬浮黑底。
+// 地板与角柱进常驻布景;四墙与天花按"内表面朝向相机"逐面剖切,
+// 与全景房间盒同一判据——屋外俯瞰自动让开,进入机位六面齐全。
+function addFallbackRoom(kit,fw,fd,h){
+ const {addBox,addRound}=kit,rng=seedRng("room:"+fw+"x"+fd+"x"+h),
+       x=fw/2,z=fd/2,
+       wood=c=>({color:hex(c),specular:.09,gloss:.22,panoBlend:0,
+                 emissive:0});
+ addBox([0,-.075,0],fw+.1,.03,fd+.1,0,wood("#241a12"));
+ let px=-x;
+ while(px<x-.01){
+  const pw=Math.min(.5+rng()*.22,x-px),plank=wood("#6d4d33"),
+        f=.86+rng()*.24;
+  plank.color=plank.color.map(c=>Math.min(1,c*f));
+  addBox([px+pw/2,-.05,0],pw-.016,.05,fd,0,plank);px+=pw}
+ for(const cx of [-x+.32,x-.32])for(const cz of [-z+.32,z-.32])
+  addRound([cx,0,cz],.34,h-.3,.34,0,wood("#553d28"),.94,12)}
+
+let shellFaces=[];        // 房壳可剖切面:{geo:{lit,litCount},center,inward}
+function buildShellFaces(active,fw,fd,h){
+ const x=fw/2,z=fd/2,dadoH=.95,
+       wood=c=>({color:hex(c),specular:.09,gloss:.22,panoBlend:0,
+                 emissive:0}),
+       plaster={color:hex("#8d7d67"),specular:.04,gloss:.1,panoBlend:0,
+                emissive:0},
+       dado=wood("#4e3a28"),trim=wood("#3c2d1e");
+ const specs=[
+  {center:[0,h/2,z],inward:[0,0,-1],
+   build:kit=>wall(kit,0,z+.04,fw+.16,0)},
+  {center:[0,h/2,-z],inward:[0,0,1],
+   build:kit=>wall(kit,0,-z-.04,fw+.16,0)},
+  {center:[x,h/2,0],inward:[-1,0,0],
+   build:kit=>wall(kit,x+.04,0,fd+.16,90)},
+  {center:[-x,h/2,0],inward:[1,0,0],
+   build:kit=>wall(kit,-x-.04,0,fd+.16,90)},
+  {center:[0,h,0],inward:[0,-1,0],build:kit=>{
+   kit.addBox([0,h,0],fw+.2,.06,fd+.2,0,wood("#33261a"));
+   const beams=clamp(Math.round(fw/2.4),2,5);
+   for(let i=0;i<beams;i++)
+    kit.addBox([-x+fw*(i+.5)/beams,h-.30,0],.24,.30,fd,0,
+               wood("#42301f"));
+   kit.addBox([0,h-.52,0],fw,.22,.26,0,wood("#3a2a1b"))}},
+ ];
+ function wall(kit,wx,wz,len,turn){
+  kit.addBox([wx,0,wz],len,dadoH,.07,turn,dado);
+  kit.addBox([wx,dadoH,wz],len,h-dadoH,.07,turn,plaster);
+  kit.addBox([wx,dadoH-.025,wz],len,.05,.10,turn,trim)}
+ specs.forEach((spec,i)=>{
+  const slot=shellFaces[i]||(shellFaces[i]={geo:{lit:null,litCount:0,
+   shadow:null,shadowCount:0,lines:null,lineCount:0}});
+  const kit=meshKit();
+  if(active)spec.build(kit);
+  kit.upload(slot.geo);
+  slot.center=spec.center;slot.inward=spec.inward});
+ shellFaces.length=specs.length}
+
+// ``height_m`` 是当前姿态的垂直包络，而非人物真实身高。旧 blocking
+// 没有 stature_m 时，按各姿态的既有标准包络反推成人身高；这样旧集也
+// 不会把 1.22m 的“坐姿头顶高度”画成一个 1.22m 的缩小站立人。
+function actorStature(actor,pose,envelope,phase){
+ const key=phase==="end"?"end_stature_m":"start_stature_m",
+       direct=finite(actor&&(
+        actor[key]??actor.stature_m??actor.body_height_m??actor.full_height_m),0);
+ if(direct>=.8)return clamp(direct,.9,2.25);
+ const ratios={sitting:1.22/1.68,leaning_seated:1.05/1.68,
+  kneeling:1.12/1.68,crouching:.98/1.68,lying:.55/1.68};
+ const ratio=ratios[String(pose||"")];
+ return ratio?clamp(finite(envelope,1.68)/ratio,1.35,2.05):
+  clamp(finite(envelope,1.68),.9,2.25)}
+
+// 人物实体:真实身高控制体型，姿态包络控制头顶高度；坐、跪、蹲、卧
+// 改变关节和身体占地，不再整体缩放站立模型。
+function addActorSolid(kit,x,y,z,envelope,stature,col,yawDeg,pose){
+ const {addBox,addRound}=kit,yaw=(yawDeg||0)*Math.PI/180,
+       co=Math.cos(yaw),si=Math.sin(yaw),
+       local=(lx,ly,lz)=>[x+lx*co+lz*si,y+ly,z-lx*si+lz*co],
+       H=Math.max(.45,finite(envelope,1.68)),
+       S=Math.max(.9,finite(stature,H)),actorPose=String(pose||"standing"),
+       cloth={color:col.map(v=>v*.80),specular:.10,gloss:.18,
+              panoBlend:0,emissive:0},
+       clothDark={...cloth,color:col.map(v=>v*.58)},
+       sash={...cloth,color:col.map(v=>Math.min(1,v*1.3))},
+       skin={color:[.86,.70,.56],specular:.16,gloss:.3,panoBlend:0,
+             emissive:0},
+       hair={color:[.15,.12,.11],specular:.3,gloss:.5,panoBlend:0,
+             emissive:0};
+ const addHead=(baseY,forward=0)=>{
+  addRound(local(0,baseY,forward),.135*S,.115*S,.125*S,yawDeg,skin,.72,12);
+  addRound(local(0,baseY+.105*S,forward-.01*S),.115*S,.03*S,.105*S,
+           yawDeg,hair,.5,10);
+  addRound(local(0,baseY+.13*S,forward-.01*S),.05*S,.045*S,.05*S,
+           yawDeg,hair,.7,8);
+  addBox(local(0,baseY+.035*S,forward+.068*S),.02*S,.028*S,.02*S,
+         yawDeg,skin)};
+ if(actorPose==="lying"){
+  const bodyL=.72*S,bodyY=Math.max(.08,H*.22),headZ=-.48*S;
+  addBox(local(0,bodyY,0),.36*S,.22*S,bodyL,yawDeg,cloth);
+  addBox(local(0,bodyY-.035*S,.53*S),.28*S,.13*S,.42*S,yawDeg,clothDark);
+  for(const side of [-1,1])
+   addBox(local(side*.13*S,bodyY+.02*S,.03*S),.085*S,.10*S,.55*S,
+          yawDeg,clothDark);
+  addHead(Math.max(.06,H*.28),headZ);
+  return}
+ if(actorPose==="sitting"||actorPose==="leaning_seated"){
+  const lean=actorPose==="leaning_seated"?.12*S:0,
+        seatY=Math.min(.31*S,H*.43),torsoBase=seatY-.01*S,
+        headBase=Math.max(torsoBase+.29*S,H-.19*S);
+  // 大腿向前、胫部向下，完整占地仍来自 S；H 只决定坐姿头顶。
+  addRound(local(0,.08*S,.02*S),.36*S,Math.max(.18*S,seatY-.08*S),
+           .31*S,yawDeg,cloth,.62,12);
+  for(const side of [-1,1]){
+   addBox(local(side*.09*S,seatY-.055*S,.20*S),.13*S,.11*S,.42*S,
+          yawDeg,clothDark);
+   addBox(local(side*.09*S,.02*S,.38*S),.12*S,
+          Math.max(.12*S,seatY-.02*S),.12*S,yawDeg,clothDark);
+   addBox(local(side*.09*S,.01*S,.48*S),.13*S,.055*S,.23*S,
+          yawDeg,clothDark)}
+  addRound(local(0,torsoBase,lean*.55),.225*S,
+           Math.max(.27*S,headBase-torsoBase-.03*S),.19*S,
+           yawDeg,cloth,.86,12);
+  addRound(local(0,torsoBase-.015*S,0),.235*S,.035*S,.20*S,
+           yawDeg,sash,1,12);
+  for(const side of [-1,1])
+   addRound(local(side*.155*S,torsoBase-.04*S,lean*.7),.10*S,.30*S,
+            .09*S,yawDeg,clothDark,.55,10);
+  addRound(local(0,headBase-.04*S,lean),.075*S,.05*S,.07*S,
+           yawDeg,skin,.9,10);
+  addHead(headBase,lean);
+  return}
+ if(actorPose==="kneeling"||actorPose==="crouching"){
+  const crouch=actorPose==="crouching",hipY=crouch?.28*S:.22*S,
+        headBase=Math.max(hipY+.30*S,H-.19*S),forward=crouch?.10*S:.03*S;
+  addRound(local(0,.02*S,.08*S),.38*S,Math.max(.18*S,hipY),.34*S,
+           yawDeg,cloth,.58,12);
+  for(const side of [-1,1]){
+   addBox(local(side*.12*S,.015*S,.24*S),.14*S,.10*S,.42*S,
+          yawDeg,clothDark);
+   addBox(local(side*.12*S,.02*S,-.03*S),.13*S,.11*S,.30*S,
+          yawDeg,clothDark)}
+  addRound(local(0,hipY,forward*.5),.225*S,
+           Math.max(.25*S,headBase-hipY-.03*S),.19*S,
+           yawDeg,cloth,.86,12);
+  addRound(local(0,headBase-.04*S,forward),.075*S,.05*S,.07*S,
+           yawDeg,skin,.9,10);
+  addHead(headBase,forward);
+  return}
+ // 站姿保持旧造型，但体型尺度读真实身高而非姿态包络。
+ const bodyH=Math.max(H,S*.9);
+ addRound(local(0,.01,0),.40*S,.50*bodyH,.36*S,yawDeg,cloth,.52,12);
+ addRound(local(0,.50*bodyH,0),.225*S,.30*bodyH,.19*S,yawDeg,cloth,.86,12);
+ addRound(local(0,.485*bodyH,0),.235*S,.035*bodyH,.20*S,yawDeg,sash,1,12);
+ for(const side of [-1,1])
+  addRound(local(side*.155*S,.44*bodyH,0),.10*S,.34*bodyH,.09*S,
+           yawDeg,clothDark,.55,10);
+ addRound(local(0,.78*bodyH,0),.075*S,.05*S,.07*S,yawDeg,skin,.9,10);
+ addHead(.82*bodyH,0)}
+
+function stickman(kit,x,y,z,envelope,col,pose,stature,yawDeg){
+ const push=kit.push,H=Math.max(.45,finite(envelope,1.68)),
+       S=Math.max(.9,finite(stature,H)),actorPose=String(pose||"standing"),
+       yaw=(yawDeg||0)*Math.PI/180,co=Math.cos(yaw),si=Math.sin(yaw),
+       p=(lx,ly,lz)=>[x+lx*co+lz*si,y+ly,z-lx*si+lz*co];
+ let head,neck,shoulderL,shoulderR,hip,elbowL,elbowR,handL,handR,
+     kneeL,kneeR,footL,footR;
+ if(actorPose==="lying"){
+  head=p(0,H*.48,-.43*S);neck=p(0,H*.43,-.32*S);
+  shoulderL=p(-.115*S,H*.40,-.23*S);shoulderR=p(.115*S,H*.40,-.23*S);
+  hip=p(0,H*.34,.12*S);elbowL=p(-.17*S,H*.31,-.05*S);
+  elbowR=p(.17*S,H*.31,-.05*S);handL=p(-.19*S,H*.24,.12*S);
+  handR=p(.19*S,H*.24,.12*S);kneeL=p(-.05*S,H*.22,.32*S);
+  kneeR=p(.05*S,H*.22,.32*S);footL=p(-.08*S,H*.14,.51*S);
+  footR=p(.08*S,H*.14,.51*S)
+ }else if(actorPose==="sitting"||actorPose==="leaning_seated"){
+  const f=actorPose==="leaning_seated"?.12*S:0,seatY=Math.min(.31*S,H*.43);
+  head=p(0,H-.09*S,f);neck=p(0,H-.19*S,f*.8);
+  shoulderL=p(-.115*S,H-.25*S,f*.65);shoulderR=p(.115*S,H-.25*S,f*.65);
+  hip=p(0,seatY,0);elbowL=p(-.16*S,H-.39*S,f*.75);
+  elbowR=p(.16*S,H-.39*S,f*.75);handL=p(-.17*S,seatY+.05*S,.17*S);
+  handR=p(.17*S,seatY+.05*S,.17*S);kneeL=p(-.08*S,seatY*.88,.32*S);
+  kneeR=p(.08*S,seatY*.88,.32*S);footL=p(-.08*S,0,.45*S);
+  footR=p(.08*S,0,.45*S)
+ }else if(actorPose==="kneeling"||actorPose==="crouching"){
+  const f=actorPose==="crouching"?.10*S:.03*S,hipY=actorPose==="crouching"?.28*S:.22*S;
+  head=p(0,H-.09*S,f);neck=p(0,H-.19*S,f*.8);
+  shoulderL=p(-.115*S,H-.25*S,f*.6);shoulderR=p(.115*S,H-.25*S,f*.6);
+  hip=p(0,hipY,0);elbowL=p(-.16*S,H-.40*S,f);
+  elbowR=p(.16*S,H-.40*S,f);handL=p(-.17*S,hipY+.02*S,.18*S);
+  handR=p(.17*S,hipY+.02*S,.18*S);kneeL=p(-.11*S,.08*S,.25*S);
+  kneeR=p(.11*S,.08*S,.25*S);footL=p(-.10*S,.01*S,-.08*S);
+  footR=p(.10*S,.01*S,-.08*S)
+ }else{
+  head=p(0,.91*H,0);neck=p(0,.82*H,0);
+  shoulderL=p(-.115*S,.79*H,0);shoulderR=p(.115*S,.79*H,0);
+  hip=p(0,.50*H,0);elbowL=p(-.155*S,.62*H,0);
+  elbowR=p(.155*S,.62*H,0);handL=p(-.175*S,.42*H,0);
+  handR=p(.175*S,.42*H,0);kneeL=p(-.055*S,.285*H,0);
+  kneeR=p(.055*S,.285*H,0);footL=p(-.085*S,0,0);footR=p(.085*S,0,0)}
+ for(const [a,b] of [[neck,shoulderL],[neck,shoulderR],[neck,hip],
+  [shoulderL,elbowL],[elbowL,handL],[shoulderR,elbowR],[elbowR,handR],
+  [hip,kneeL],[kneeL,footL],[hip,kneeR],[kneeR,footR]])push(a,b,col);
+ const headR=.09*S;
+ for(let i=0;i<14;i++){const t0=i/14*Math.PI*2,t1=(i+1)/14*Math.PI*2;
+  push([head[0]+headR*Math.sin(t0),head[1]+headR*Math.cos(t0),head[2]],
+       [head[0]+headR*Math.sin(t1),head[1]+headR*Math.cos(t1),head[2]],col);
+  push([head[0],head[1]+headR*Math.cos(t0),head[2]+headR*Math.sin(t0)],
+       [head[0],head[1]+headR*Math.cos(t1),head[2]+headR*Math.sin(t1)],col)}}
+
+// 静态布景:只在换场景/换显示模式/全景就绪时重建。
+function buildSceneGeometry(){
+ const kit=meshKit(),{push,shadowEllipse}=kit;
+ const model=activeSceneModel(),modelRoom=model.room||{},
+       w=Object.assign({},modelRoom,(SCENE&&SCENE.world)||{}),
+       fw=finite(w.floor_width_m,10),fd=finite(w.floor_depth_m,7),
+       fh=finite(w.ceiling_height_m??w.wall_height_m,4.2),
+       structure=displayMode==="structure",light=lightingFor();
+ const shellActive=!structure&&!panoReady;
+ if(structure){const grid=[.22,.19,.16],gridMain=[.34,.29,.23];
+  for(let x=-fw/2;x<=fw/2+1e-6;x+=1)
+   push([x,.002,-fd/2],[x,.002,fd/2],Math.abs(x)<1e-6?gridMain:grid);
+  for(let z=-fd/2;z<=fd/2+1e-6;z+=1)
+   push([-fw/2,.002,z],[fw/2,.002,z],Math.abs(z)<1e-6?gridMain:grid)}
+ else if(shellActive)addFallbackRoom(kit,fw,fd,fh);
+ buildShellFaces(shellActive,fw,fd,fh);
+ renderStats={objects:0,invalid:0,defaultMaterials:0,
+              semanticPrefabs:0,fallbackPrefabs:0};
+ OBSTACLES=[];NAV.key=null;NAV.room={fw,fd,fh};
+ const ranges=[];
+ for(const [objIndex,obj] of (model.objects||[]).entries()){
+  if(!obj||typeof obj!=="object"){renderStats.invalid++;continue}
+  const transform=obj.transform||{},bounds=obj.bounds||{},
+        rawPos=renderPlacementFor(obj);
+  if(!rawPos||![rawPos.x,rawPos.y??0,rawPos.z].every(v=>Number.isFinite(Number(v)))){
+   renderStats.invalid++;continue}
+  const x=Number(rawPos.x),y=finite(rawPos.y,0),z=Number(rawPos.z),
+        width=Math.max(.08,finite(obj.width_m??obj.width??bounds.width_m??bounds.width,.6)),
+        height=Math.max(.08,finite(obj.height_m??obj.height??bounds.height_m??bounds.height,.8)),
+        depth=Math.max(.08,finite(obj.depth_m??obj.depth??bounds.depth_m??bounds.depth,
+                                  Math.min(width*.55,.8))),
+        yaw=finite(obj.rotation_y_deg??transform.rotation_y_deg??transform.yaw_deg,0),
+        material=materialFor(obj),prefab=prefabFor(obj),key=objectKey(obj,objIndex);
+  renderStats.objects++;if(material.usedDefault)renderStats.defaultMaterials++;
+  if(prefab.source==="category_fallback")renderStats.fallbackPrefabs++;
+  else renderStats.semanticPrefabs++;
+  const litStart=kit.LIT.length/13;
+  addScenePrefab(kit,prefab,obj.name||"",x,y,z,width,height,depth,yaw,
+                 material,structure);
+  if(key===editState.selectedKey)
+   addSelectionWire(kit,x,y,z,width,height,depth,yaw);
+  // 逐物件区段:镜头视角跳过贴脸遮挡物;通行障碍供人物/机位绕行。
+  const rad=yaw*Math.PI/180;
+  ranges.push({start:litStart,count:kit.LIT.length/13-litStart,key,obj,
+   width,height,depth,yaw,
+   ob:{x,z,hw:width/2,hd:depth/2,co:Math.cos(rad),si:Math.sin(rad),
+       y0:y,y1:y+height}});
+  const block=obstacleFrom(x,y,z,width,height,depth,yaw,prefab.type);
+  if(block)OBSTACLES.push(block);
+  // 台面道具(y 抬高)不投地面影,避免隔着桌板出现悬空黑斑。
+  if(!structure&&y<.4){const sy=Math.max(.24,Math.abs(light.direction[1])),
+    offX=-light.direction[0]/sy*Math.min(.55,height*.16),
+    offZ=-light.direction[2]/sy*Math.min(.55,height*.16);
+   shadowEllipse(x,z,width*.60,depth*.62,offX,offZ,.13,yaw);
+   shadowEllipse(x,z,width*.48,depth*.48,0,0,.22,yaw)}}
+ kit.upload(sceneGeo);
+ sceneGeo.ranges=ranges}
+
+// 动态层:人物/路线/机位/视锥,预演播放时逐帧重建。
+function contractFacingYaw(actor,position,u){
+ const start=actor.facing_start_yaw_deg??actor.facing_yaw_deg??
+  actor.rotation_y_deg??actor.facing_start,
+       end=actor.facing_end_yaw_deg??actor.facing_yaw_deg??
+  actor.rotation_y_deg??actor.facing_end;
+ if(Number.isFinite(Number(start))||Number.isFinite(Number(end))){
+  const a=finite(start,finite(end,0)),b=finite(end,a);return a+(b-a)*u}
+ const text=String((u>.5?actor.facing_end:actor.facing_start)||actor.facing||"");
+ const targetIndex=(SHOT&&SHOT.actors||[]).findIndex(other=>other!==actor&&
+  text.includes(String(other.name||other.display_label||"")));
+ if(targetIndex>=0){const nav=NAV.actors[targetIndex],target=nav?
+   pathPoint(nav,u).p:P(SHOT.actors[targetIndex].start_3d);
+  return Math.atan2(target[0]-position[0],target[2]-position[2])*180/Math.PI}
+ if(/东|右/.test(text))return 90;if(/西|左/.test(text))return -90;
+ if(/南|后/.test(text))return 180;if(/北|前/.test(text))return 0;
+ const degrees=text.match(/(-?\d+(?:\.\d+)?)\s*度/);
+ return degrees?Number(degrees[1]):0}
+function buildGeometry(silent){
+ const kit=meshKit(),{push,PT,shadowEllipse}=kit,
+       structure=displayMode==="structure";
+ if(!SHOT){kit.upload(geo);if(!silent)updateSceneStatus();return geo}
+ ensureNav();
+ const cam=SHOT.camera||{},acts=SHOT.actors||[];
+ const uMove=PV.active?easeInOut(PV.u):0;
+ const camEye=P(cam.start_3d,1.55);
+ if(show.control&&show.axis&&SHOT.axis&&SHOT.axis.a_3d&&SHOT.axis.b_3d){
+  const a=P(SHOT.axis.a_3d),b=P(SHOT.axis.b_3d),c=[.55,.42,.2];
+  for(let t=0;t<1;t+=.05){const p=V.add(a,V.scale(V.sub(b,a),t)),
+   q=V.add(a,V.scale(V.sub(b,a),Math.min(1,t+.028)));
+   push([p[0],.02,p[2]],[q[0],.02,q[2]],c)}}
+ acts.forEach((a,ai)=>{
+ const col=hex(a.color),s0=P(a.start_3d),e=P(a.end_3d),
+        startH=Math.max(.7,finite(a.start_height_m??a.height_m,1.7)),
+        endH=Math.max(.7,finite(a.end_height_m??a.height_m,startH)),
+        startPose=String(a.pose_start||"standing"),
+        endPose=String(a.pose_end||startPose),
+        startStature=actorStature(a,startPose,startH,"start"),
+        endStature=actorStature(a,endPose,endH,"end");
+  // 预演播放:人物沿绕行路径按弧长插值(缓入缓出),身高同步过渡;
+  // 路径由通行导航算出,起终点仍是 blocking 数据原值。
+  const nav=NAV.actors[ai],walking=nav&&nav.len>.05;
+  let s,dir=null;
+  if(walking){const pp=pathPoint(nav,uMove);s=pp.p;dir=pp.dir}
+  else s=PV.active?lerp3(s0,e,uMove):s0;
+  const h0=PV.active?startH+(endH-startH)*uMove:startH;
+  const stature0=PV.active?startStature+(endStature-startStature)*uMove:
+        startStature,pose0=PV.active&&uMove>=.5?endPose:startPose;
+  // 行走起伏:按已走弧长起落,静止与到点后归零。
+  const bob=(PV.active&&walking&&uMove>0&&uMove<1)?
+   Math.abs(Math.sin(uMove*nav.len*3.4))*.012*h0:0;
+  // 朝向:移动时朝当前路段方向,静止时面向机位(演员向镜头打开)。
+  const yawA=previewMode==="truth"?contractFacingYaw(a,s,uMove):
+   (dir&&Math.hypot(dir[0],dir[1])>.01?
+    Math.atan2(dir[0],dir[1])*180/Math.PI:
+    Math.atan2(camEye[0]-s[0],camEye[2]-s[2])*180/Math.PI);
+  if(structure)stickman(kit,s[0],s[1],s[2],h0,col,pose0,stature0,yawA);
+  else{addActorSolid(kit,s[0],s[1]+bob,s[2],h0,stature0,col,yawA,pose0);
+   shadowEllipse(s[0],s[2],.17*stature0,.13*stature0,.03,.02,.26)}
+  if(show.control)PT.push(s[0],s[1]+.9*h0,s[2],col[0],col[1],col[2]);
+  if(show.control&&show.path&&!PV.active&&(a.moving||V.len(V.sub(e,s0))>.05)){
+   const dim=V.scale(col,.62);
+   if(walking)for(let i=1;i<nav.pts.length;i++)
+    push([nav.pts[i-1][0],s0[1]+.05,nav.pts[i-1][2]],
+         [nav.pts[i][0],s0[1]+.05,nav.pts[i][2]],dim);
+   else push([s[0],s[1]+.05,s[2]],[e[0],e[1]+.05,e[2]],dim);
+   for(let i=0;i<12;i++){const t0=i/12*Math.PI*2,t1=(i+1)/12*Math.PI*2;
+    push([e[0]+.18*Math.cos(t0),e[1]+.03,e[2]+.18*Math.sin(t0)],
+         [e[0]+.18*Math.cos(t1),e[1]+.03,e[2]+.18*Math.sin(t1)],dim)}
+   stickman(kit,e[0],e[1],e[2],endH,dim,endPose,endStature,yawA)}});
+ if(show.control){
+  const cs0=P(cam.start_3d,1.55),
+        ce=P(cam.end_3d||cam.start_3d,1.55),
+        ts=P(cam.target_start_3d||cam.target_3d,1.2),
+        te=P(cam.target_end_3d||cam.target_3d||cam.target_start_3d,1.2),
+        csRaw=PV.active&&NAV.cam&&NAV.cam.len>.05?
+         pathPoint(NAV.cam,PV.u).p:(PV.active?lerp3(cs0,ce,PV.u):cs0),
+        cs=previewMode==="repair"?resolveEye(csRaw):csRaw,
+        tg=PV.active?lerp3(ts,te,PV.u):P(cam.target_3d||cam.target_start_3d,1.2),
+        camCol=[.85,.64,.26];
+  push([cs[0],0,cs[2]],[cs[0],cs[1],cs[2]],V.scale(camCol,.5));
+  if(show.frus){const fwd=V.norm(V.sub(tg,cs)),up0=[0,1,0],
+    right=V.norm(V.cross(fwd,up0)),up=V.cross(right,fwd),
+    hf=(finite(cam.horizontal_fov_degrees??cam.fov_degrees,46))*Math.PI/180,
+    vf=finite(cam.vertical_fov_degrees,hf*180/Math.PI*16/9)*Math.PI/180,
+    D=Math.max(1.2,V.len(V.sub(tg,cs)))*1.35,hw=Math.tan(hf/2)*D,
+    hh=Math.tan(vf/2)*D,ctr=V.add(cs,V.scale(fwd,D)),
+    c1=V.add(V.add(ctr,V.scale(right,hw)),V.scale(up,hh)),
+    c2=V.add(V.sub(ctr,V.scale(right,hw)),V.scale(up,hh)),
+    c3=V.sub(V.sub(ctr,V.scale(right,hw)),V.scale(up,hh)),
+    c4=V.sub(V.add(ctr,V.scale(right,hw)),V.scale(up,hh));
+   [c1,c2,c3,c4].forEach(c=>push(cs,c,V.scale(camCol,.55)));
+   push(c1,c2,camCol);push(c2,c3,camCol);push(c3,c4,camCol);push(c4,c1,camCol);
+   for(let t=0;t<1;t+=.08){const p=V.add(cs,V.scale(V.sub(tg,cs),t)),
+    q=V.add(cs,V.scale(V.sub(tg,cs),Math.min(1,t+.045)));
+    push(p,q,V.scale(camCol,.4))}}
+  PT.push(cs[0],cs[1],cs[2],camCol[0],camCol[1],camCol[2])}
+ kit.upload(geo);
+ if(!silent)updateSceneStatus();return geo}
+
+function shotCam(asp){
+ // 本镜相机:预演播放时按 PV.u 在起终机位/瞄准点之间插值——运镜的
+ // 真实感受(推近变大、环绕换面、俯冲视平线下坠)就来自这里。
+ // 机位走绕行路径且始终钳在房内、推出家具体外,镜头不再穿模。
+ ensureNav();
+ const cam=(SHOT&&SHOT.camera)||{},
+       e0=P(cam.start_3d,1.55),e1=P(cam.end_3d||cam.start_3d,1.55),
+       t0=P(cam.target_start_3d||cam.target_3d,1.2),
+       t1=P(cam.target_end_3d||cam.target_3d||cam.target_start_3d,1.2),
+       eRaw=PV.active&&NAV.cam&&NAV.cam.len>.05?
+        pathPoint(NAV.cam,PV.u).p:(PV.active?lerp3(e0,e1,PV.u):e0),
+       e=previewMode==="repair"?resolveEye(eRaw):eRaw,
+       t=PV.active?lerp3(t0,t1,PV.u):P(cam.target_3d||cam.target_start_3d,1.2),
+       vf=(Number(cam.vertical_fov_degrees)||
+           (Number(cam.fov_degrees)||46)*16/9)*Math.PI/180;
+ return {view:M4.look(e,t,[0,1,0]),
+         proj:M4.persp(Math.min(2.2,vf),asp,0.05,120),eye:e}}
+function camMatrices(){
+ const asp=cv.width/Math.max(1,cv.height);
+ if(mode==="shot"&&SHOT)return shotCam(asp);
+ const e=[orbit.target[0]+orbit.dist*Math.cos(orbit.pitch)*Math.sin(orbit.yaw),
+          orbit.target[1]+orbit.dist*Math.sin(orbit.pitch),
+          orbit.target[2]+orbit.dist*Math.cos(orbit.pitch)*Math.cos(orbit.yaw)];
+ return {view:M4.look(e,orbit.target,[0,1,0]),
+         proj:M4.persp(50*Math.PI/180,asp,0.05,120),eye:e}}
+
+function project(p,mvp,w,h){
+ const x=mvp[0]*p[0]+mvp[4]*p[1]+mvp[8]*p[2]+mvp[12],
+       y=mvp[1]*p[0]+mvp[5]*p[1]+mvp[9]*p[2]+mvp[13],
+       wc=mvp[3]*p[0]+mvp[7]*p[1]+mvp[11]*p[2]+mvp[15];
+ if(wc<=0.001)return null;
+ return [(x/wc*0.5+0.5)*w,(1-(y/wc*0.5+0.5))*h]}
+
+function drawLabels(mvp){
+ labels.innerHTML="";
+ if(!show.control||!SHOT)return;
+ const w=cv.clientWidth,h=cv.clientHeight;
+ const escapeHtml=value=>String(value??"").replace(/[&<>"']/g,ch=>({
+  "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));
+ const add=(p,txt,cls)=>{const s=project(p,mvp,w,h);if(!s)return;
+  if(s[0]<-80||s[0]>w+80||s[1]<-40||s[1]>h+40)return;
+  const d=document.createElement("div");d.className="tag"+(cls?" "+cls:"");
+  d.innerHTML=txt;d.style.left=s[0]+"px";d.style.top=(s[1]-6)+"px";
+  labels.appendChild(d)};
+ (SHOT.actors||[]).forEach(a=>{
+  const s=P(a.start_3d),h2=Number(a.start_height_m||a.height_m)||1.7;
+  const raw=String(a.facing||"");
+  const facing=raw.length>20?raw.slice(0,20)+"…":raw;
+  add([s[0],s[1]+h2+0.16,s[2]],
+      `<b>${escapeHtml(a.display_label||a.name||"人物")}</b>`+
+      (facing?` <span style="color:#9a8d7b">${escapeHtml(facing)}</span>`:""))});
+ const cam=SHOT.camera||{},cs=P(cam.start_3d,1.55);
+ add([cs[0],cs[1]+0.22,cs[2]],
+     `<b>机位</b> ${cam.lens_mm?cam.lens_mm+"mm ":""}`+
+     `${(Number(cam.fov_degrees)||0).toFixed(0)}°`,"cam");
+ for(const obj of activeSceneModel().objects||[]){
+ if(!obj||typeof obj!=="object")continue;
+  const transform=obj.transform||{},bounds=obj.bounds||{},
+        p=P(renderPlacementFor(obj)),
+        height=Math.max(.08,finite(obj.height_m??obj.height??
+                                   bounds.height_m??bounds.height,.8));
+  add([p[0],p[1]+height+.08,p[2]],
+      `<b>${escapeHtml(obj.name||obj.object_id||"场景物体")}</b>`,"obj")}}
+
+function renderScene(view,proj,eye,lens){
+ // 真值模式绝不隐藏家具。只有用户明确进入“修复预览”后，才允许
+ // 临时剖切吞没镜头的近物；该预览不能直接进入导出。
+ const mvp=M4.mul(proj,view);
+ const nearHidden=(previewMode==="repair"&&lens&&sceneGeo.ranges)?
+ sceneGeo.ranges.filter(rg=>{
+  const o=rg.ob,[lx,lz]=obLocal(o,eye[0],eye[2]);
+  return Math.abs(lx)<=o.hw+.42&&Math.abs(lz)<=o.hd+.42&&
+         eye[1]>=o.y0-.1&&eye[1]<=o.y1+.3}):[];
+ gl.clearColor(0.063,0.055,0.047,1);
+ gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+ gl.enable(gl.DEPTH_TEST);
+ gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);
+ if(show.pano&&panoReady&&roomFaces.length){
+  gl.useProgram(pPano);
+  gl.uniformMatrix4fv(gl.getUniformLocation(pPano,"mvp"),false,new Float32Array(mvp));
+  gl.uniform3fv(gl.getUniformLocation(pPano,"eye0"),new Float32Array(CAPTURE));
+   gl.uniform1f(gl.getUniformLocation(pPano,"dim"),
+    displayMode==="realistic"?(mode==="shot"?1.0:.9):.72);
+  gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,panoTex);
+  gl.uniform1i(gl.getUniformLocation(pPano,"tex"),0);
+  // 自动剖切:只画「内表面朝向相机」的面。屋外俯瞰时顶与近墙自动
+  // 让开(娃娃屋),进入机位(屋内)时六面齐全——同一判据自然覆盖两态。
+  for(const f of roomFaces){
+   const toEye=V.sub(eye,f.center);
+   if(V.dot(f.inward,toEye)<=0.02)continue;
+   bindAttr(pPano,"pos",f.buf,3,3,0);
+   gl.drawArrays(gl.TRIANGLES,0,f.count)}}
+ if(displayMode==="realistic"&&(sceneGeo.shadowCount||geo.shadowCount)){
+  gl.useProgram(pAlpha);
+  gl.uniformMatrix4fv(gl.getUniformLocation(pAlpha,"mvp"),false,new Float32Array(mvp));
+  gl.uniform3fv(gl.getUniformLocation(pAlpha,"color"),new Float32Array([.025,.02,.016]));
+  gl.depthMask(false);gl.depthFunc(gl.LEQUAL);
+  for(const g of [sceneGeo,geo])if(g.shadowCount){
+   bindAttr(pAlpha,"pos",g.shadow,3,4,0);bindAttr(pAlpha,"opa",g.shadow,1,4,3);
+   gl.drawArrays(gl.TRIANGLES,0,g.shadowCount)}
+  gl.depthMask(true);gl.depthFunc(gl.LESS)}
+ if(sceneGeo.litCount||geo.litCount){const light=lightingFor();
+  gl.useProgram(pLit);
+  gl.uniformMatrix4fv(gl.getUniformLocation(pLit,"mvp"),false,new Float32Array(mvp));
+  gl.uniform3fv(gl.getUniformLocation(pLit,"eye"),new Float32Array(eye));
+  gl.uniform3fv(gl.getUniformLocation(pLit,"lightDir"),new Float32Array(light.direction));
+  gl.uniform3fv(gl.getUniformLocation(pLit,"lightColor"),new Float32Array(light.color));
+  gl.uniform1f(gl.getUniformLocation(pLit,"ambient"),
+               displayMode==="realistic"?light.ambient:.52);
+  gl.uniform1f(gl.getUniformLocation(pLit,"keyLight"),
+               displayMode==="realistic"?light.intensity:.48);
+  gl.uniform1f(gl.getUniformLocation(pLit,"realistic"),
+               displayMode==="realistic"?1:0);
+  gl.uniform1f(gl.getUniformLocation(pLit,"alpha"),
+               displayMode==="realistic"?1:.58);
+  gl.activeTexture(gl.TEXTURE1);gl.bindTexture(gl.TEXTURE_2D,panoTex);
+  gl.uniform1i(gl.getUniformLocation(pLit,"panoTex"),1);
+  gl.uniform3fv(gl.getUniformLocation(pLit,"panoEye0"),new Float32Array(CAPTURE));
+  gl.uniform1f(gl.getUniformLocation(pLit,"panoAvailable"),
+               displayMode==="realistic"&&panoReady?1:0);
+  gl.enable(gl.POLYGON_OFFSET_FILL);gl.polygonOffset(1,1);
+  const litGeos=[sceneGeo];
+  for(const f of shellFaces)
+   if(f.geo.litCount&&V.dot(f.inward,V.sub(eye,f.center))>0.02)
+    litGeos.push(f.geo);
+  litGeos.push(geo);
+  for(const g of litGeos)if(g.litCount){
+   bindAttr(pLit,"pos",g.lit,3,13,0);bindAttr(pLit,"nor",g.lit,3,13,3);
+   bindAttr(pLit,"col",g.lit,3,13,6);bindAttr(pLit,"mat",g.lit,4,13,9);
+   if(g===sceneGeo&&nearHidden.length){
+    let cursor=0;
+    for(const rg of nearHidden.slice().sort((a,b)=>a.start-b.start)){
+     if(rg.start>cursor)
+      gl.drawArrays(gl.TRIANGLES,cursor,rg.start-cursor);
+     cursor=Math.max(cursor,rg.start+rg.count)}
+    if(cursor<g.litCount)
+     gl.drawArrays(gl.TRIANGLES,cursor,g.litCount-cursor)}
+   else gl.drawArrays(gl.TRIANGLES,0,g.litCount)}
+  gl.disable(gl.POLYGON_OFFSET_FILL)}
+ if(sceneGeo.lineCount||geo.lineCount){
+  gl.useProgram(pLine);
+  gl.uniformMatrix4fv(gl.getUniformLocation(pLine,"mvp"),false,new Float32Array(mvp));
+  gl.uniform1f(gl.getUniformLocation(pLine,"alpha"),0.95);
+  gl.depthFunc(gl.LEQUAL);
+  for(const g of [sceneGeo,geo])if(g.lineCount){
+   bindAttr(pLine,"pos",g.lines,3,6,0);bindAttr(pLine,"col",g.lines,3,6,3);
+   gl.drawArrays(gl.LINES,0,g.lineCount)}
+  gl.depthFunc(gl.LESS);
+  if(geo.ptCount){bindAttr(pLine,"pos",geo.pts,3,6,0);
+   bindAttr(pLine,"col",geo.pts,3,6,3);
+   gl.drawArrays(gl.POINTS,0,geo.ptCount)}}
+ return mvp}
+
+const pip=document.getElementById("pip");
+function pipRect(){
+ // 镜头视窗:右下角 9:16 竖幅小窗(CSS 像素),与成片画幅一致
+ const W=cv.clientWidth,H=cv.clientHeight;
+ let w=Math.min(210,Math.round(W*0.26)),h=Math.round(w*16/9);
+ if(h>H*0.52){h=Math.round(H*0.52);w=Math.round(h*9/16)}
+ return {left:W-w-12,top:H-h-12,w,h}}
+
+function draw(now){
+ if(!gl)return;
+ const d=Math.min(devicePixelRatio||1,2);
+ // 页面被隐藏(clientWidth=0)时不清空画布,保留最后一帧可读回。
+ if(cv.clientWidth>0&&cv.clientHeight>0&&
+    (cv.width!==Math.round(cv.clientWidth*d)||
+     cv.height!==Math.round(cv.clientHeight*d))){
+  cv.width=Math.round(cv.clientWidth*d);cv.height=Math.round(cv.clientHeight*d)}
+ pvTick(typeof now==="number"?now:performance.now());
+ gl.disable(gl.SCISSOR_TEST);
+ gl.viewport(0,0,cv.width,cv.height);
+ const main=camMatrices(),
+       mvp=renderScene(main.view,main.proj,main.eye,mode==="shot");
+ lastFrame={mvp,eye:main.eye};
+ // 双视窗:环视时叠加"镜头所见"画中画,运镜表达直接可见
+ const showPip=previz.on&&mode==="orbit"&&SHOT;
+ if(showPip){
+  const r=pipRect();
+  pip.style.display="block";pip.style.left=r.left+"px";pip.style.top=r.top+"px";
+  pip.style.width=r.w+"px";pip.style.height=r.h+"px";
+  const gx=Math.round(r.left*d),gw=Math.round(r.w*d),gh=Math.round(r.h*d),
+        gy=cv.height-Math.round(r.top*d)-gh;
+  gl.enable(gl.SCISSOR_TEST);gl.scissor(gx,gy,gw,gh);
+  gl.viewport(gx,gy,gw,gh);
+  const cam2=shotCam(gw/Math.max(1,gh));
+  renderScene(cam2.view,cam2.proj,cam2.eye,true);
+  gl.disable(gl.SCISSOR_TEST);
+  gl.viewport(0,0,cv.width,cv.height)}
+ else pip.style.display="none";
+ drawLabels(mvp);
+ const viewText=mode==="shot"
+  ? `本镜机位 · fov ${(Number((SHOT&&SHOT.camera||{}).fov_degrees)||0).toFixed(0)}°`
+  : `环视 · ${orbit.dist.toFixed(1)}m`;
+ hud.textContent=`${displayMode==="realistic"?"写实":"结构"} · `+
+  `${previewMode==="truth"?"真值":"修复预览"} · ${viewText}`;
+ requestAnimationFrame(draw)}
+
+// ---- 动态预演:播放引擎 ----
+const pvPlayBtn=document.getElementById("pvPlay"),
+      pvPrevBtn=document.getElementById("pvPrev"),
+      pvNextBtn=document.getElementById("pvNext"),
+      pvSpeedEl=document.getElementById("pvSpeed"),
+      pvScrubEl=document.getElementById("pvScrub"),
+      pvClockEl=document.getElementById("pvClock"),
+      pvInfoEl=document.getElementById("pvInfo"),
+      pvChecksBtn=document.getElementById("pvChecks"),
+      pvIssuesEl=document.getElementById("pvIssues"),
+      pvBadgeEl=document.getElementById("pvBadge");
+
+function pvInit(){
+ const acts=DATA.shot_actions||{},idx=(DATA.blocking||{}).shot_index||{};
+ const nos=Object.keys(idx).map(Number).filter(n=>!isNaN(n)).sort((a,b)=>a-b);
+ let t=0;previz.order=[];
+ nos.forEach(no=>{
+  const a=acts[String(no)]||{};
+  const dur=Math.max(0.5,Number(a.duration)||5);
+  // 升格镜按 2.2 倍墙钟时间播放,预演里直接感受慢放
+  const wall=dur*(a.movement==="升格"?2.2:1);
+  previz.order.push({no,start:t,dur,wall,
+   movement:a.movement||"",scale:a.scale||"",kind:a.kind||"",
+   speaker:a.speaker||"",dialogue:a.dialogue||"",
+   desc:a.description||a.action||""});
+  t+=wall});
+ previz.total=t;previz.idx=previz.order.length?0:-1;
+ pvUpdateUi(previz.order[0]||null,0);
+ const checks=(DATA.previz_checks||{}).issues||[];
+ pvChecksBtn.textContent=`连贯性 ${checks.length}`;
+ pvChecksBtn.classList.toggle("on",checks.length>0);
+ pvIssuesEl.innerHTML=checks.length
+  ? checks.map((item,i)=>`<div class="pv-issue" data-no="${item.shot_no}">`+
+     `<b>[镜${item.shot_no}]</b> ${String(item.detail||item.kind||"")
+      .replace(/[&<>]/g,ch=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[ch]))}</div>`).join("")
+  : `<div style="color:#9a8d7b">时间维度连贯性检查通过:无跨镜传送、路径碰撞、交叉相撞与相机穿模。</div>`;
+ pvIssuesEl.querySelectorAll(".pv-issue").forEach(row=>{
+  row.onclick=()=>pvSeekShot(Number(row.dataset.no))})}
+
+function pvUpdateUi(entry,u){
+ const t=previz.t;
+ if(!pvScrubbing)pvScrubEl.value=String(Math.round(
+  previz.total>0?t/previz.total*1000:0));
+ pvClockEl.textContent=`${t.toFixed(1)}s / ${previz.total.toFixed(1)}s`;
+ if(entry){
+  const line=`<b>镜${entry.no}</b> ${entry.scale||""}`+
+   `${entry.movement?"·"+entry.movement:""}`+
+   `${entry.kind?" · "+entry.kind:""} · `+
+   (entry.speaker?`${entry.speaker}:「${entry.dialogue}」`:entry.desc);
+  if(pvInfoEl.dataset.line!==line){pvInfoEl.dataset.line=line;
+   pvInfoEl.innerHTML=line}
+  if(previz.on&&entry.movement&&entry.movement!=="固定"){
+   pvBadgeEl.style.display="block";
+   pvBadgeEl.textContent=`运镜 · ${entry.movement}`+
+    (entry.movement==="升格"?"(慢放)":"")}
+  else pvBadgeEl.style.display="none"}
+ else pvBadgeEl.style.display="none"}
+
+function pvApply(t,playing){
+ if(!previz.order.length)return;
+ previz.t=Math.max(0,Math.min(previz.total,t));
+ const i=pvLocate(previz.t);previz.idx=i;
+ const entry=previz.order[i];
+ if(entry&&(!SHOT||Number(SHOT.shot_no)!==entry.no))selectShot(entry.no);
+ const u=entry?Math.max(0,Math.min(1,(previz.t-entry.start)/entry.wall)):0;
+ PV.u=u;PV.active=Boolean(playing||u>0.001);
+ buildGeometry(true);
+ pvUpdateUi(entry,u)}
+
+function pvTick(now){
+ if(!previz.on){previz.last=now;return}
+ const dt=Math.min(0.2,Math.max(0,(now-previz.last)/1000))*previz.speed;
+ previz.last=now;
+ pvApply(previz.t+dt,true);
+ if(previz.t>=previz.total-0.001)pvPause()}
+
+function pvStart(){
+ if(!previz.order.length)return;
+ if(previz.t>=previz.total-0.05)previz.t=0;
+ previz.on=true;previz.last=performance.now();
+ pvPlayBtn.textContent="⏸ 暂停";pvPlayBtn.classList.add("on")}
+function pvPause(){
+ previz.on=false;
+ pvPlayBtn.textContent="▶ 播放";pvPlayBtn.classList.remove("on")}
+function pvSeekShot(no){
+ const entry=previz.order.find(e=>e.no===Number(no));
+ if(entry)pvApply(entry.start+0.001,previz.on);
+ else selectShot(no)}
+
+let pvScrubbing=false;
+pvPlayBtn.onclick=()=>previz.on?pvPause():pvStart();
+pvPrevBtn.onclick=()=>{const i=Math.max(0,previz.idx-1);
+ if(previz.order[i])pvApply(previz.order[i].start+0.001,previz.on)};
+pvNextBtn.onclick=()=>{const i=Math.min(previz.order.length-1,previz.idx+1);
+ if(previz.order[i])pvApply(previz.order[i].start+0.001,previz.on)};
+pvSpeedEl.onchange=()=>{previz.speed=Number(pvSpeedEl.value)||1};
+pvScrubEl.addEventListener("input",()=>{pvScrubbing=true;
+ pvApply(Number(pvScrubEl.value)/1000*previz.total,previz.on)});
+pvScrubEl.addEventListener("change",()=>{pvScrubbing=false});
+pvChecksBtn.onclick=()=>pvIssuesEl.classList.toggle("show");
+
+// ---- 导演阐述:本集意图锚(AI 导演查偏基准) ----
+const STMT_KEYS=["intent","tone","pacing","key_shots","emotional_peaks","avoid"];
+const stmtPanel=document.getElementById("stmtPanel"),
+      stmtBtn=document.getElementById("stmtBtn"),
+      stmtStatus=document.getElementById("stmtStatus");
+stmtBtn.onclick=()=>stmtPanel.classList.toggle("show");
+function stmtMarkFilled(statement){
+ const filled=STMT_KEYS.some(k=>String((statement||{})[k]||"").trim());
+ stmtBtn.textContent=filled?"导演阐述 ●":"导演阐述";
+ stmtBtn.classList.toggle("on",filled)}
+async function loadStatement(){
+ try{
+  const r=await fetch("/api/director-statement?episode="+
+   encodeURIComponent(episode));
+  if(!r.ok)return;
+  const d=await r.json(),s=d.statement||{};
+  STMT_KEYS.forEach(k=>{
+   const el=document.getElementById("stmt_"+k);
+   if(el)el.value=String(s[k]||"")});
+  stmtMarkFilled(s)
+ }catch(e){/* 阐述读不到不阻断预演 */}}
+document.getElementById("stmtSave").onclick=async()=>{
+ const statement={};
+ STMT_KEYS.forEach(k=>{
+  const el=document.getElementById("stmt_"+k);
+  statement[k]=el?el.value.trim():""});
+ stmtStatus.textContent="保存中…";
+ try{
+  const r=await fetch("/api/director-statement",{method:"POST",
+   headers:{"Content-Type":"application/json"},
+   body:JSON.stringify({episode_id:Number(episode),statement})});
+  const d=await r.json();
+  if(!r.ok||d.error)throw new Error(d.error||r.status);
+  stmtStatus.textContent="已保存 v"+d.version;
+  stmtMarkFilled(statement)
+ }catch(e){stmtStatus.textContent="保存失败:"+e.message}};
+
+// ---- 交互 ----
+function unprojectPoint(x,y,z,inverse){
+ const w=inverse[3]*x+inverse[7]*y+inverse[11]*z+inverse[15];
+ if(Math.abs(w)<1e-8)return null;
+ return [(inverse[0]*x+inverse[4]*y+inverse[8]*z+inverse[12])/w,
+         (inverse[1]*x+inverse[5]*y+inverse[9]*z+inverse[13])/w,
+         (inverse[2]*x+inverse[6]*y+inverse[10]*z+inverse[14])/w]}
+function rayRangeDistance(origin,direction,range){
+ const o=range.ob,[ox,oz]=obLocal(o,origin[0],origin[2]),
+       dx=direction[0]*o.co-direction[2]*o.si,
+       dz=direction[0]*o.si+direction[2]*o.co,
+       localO=[ox,origin[1],oz],localD=[dx,direction[1],dz],
+       mins=[-o.hw,o.y0,-o.hd],maxs=[o.hw,o.y1,o.hd];
+ let near=0,far=Infinity;
+ for(let axis=0;axis<3;axis++){
+  if(Math.abs(localD[axis])<1e-8){
+   if(localO[axis]<mins[axis]||localO[axis]>maxs[axis])return Infinity;
+   continue}
+  let a=(mins[axis]-localO[axis])/localD[axis],
+      b=(maxs[axis]-localO[axis])/localD[axis];
+  if(a>b){const swap=a;a=b;b=swap}near=Math.max(near,a);far=Math.min(far,b);
+  if(near>far)return Infinity}
+ return far>=0?near:Infinity}
+function pickObject(clientX,clientY){
+ if(!lastFrame||!sceneGeo.ranges)return null;
+ const rect=cv.getBoundingClientRect(),x=(clientX-rect.left)/rect.width*2-1,
+       y=1-(clientY-rect.top)/rect.height*2,inv=M4.inv(lastFrame.mvp);
+ if(!inv)return null;
+ const near=unprojectPoint(x,y,-1,inv),far=unprojectPoint(x,y,1,inv);
+ if(!near||!far)return null;const direction=V.norm(V.sub(far,near));
+ let best=null,distance=Infinity;
+ for(const range of sceneGeo.ranges){const hit=rayRangeDistance(near,direction,range);
+  if(hit<distance){distance=hit;best=range}}
+ return best}
+function panOrbit(dx,dy){
+ const scale=orbit.dist*.0025,right=[Math.cos(orbit.yaw),0,-Math.sin(orbit.yaw)],
+       forward=[Math.sin(orbit.yaw),0,Math.cos(orbit.yaw)];
+ orbit.target=V.add(orbit.target,V.add(V.scale(right,-dx*scale),
+                                      V.scale(forward,dy*scale)))}
+function adjustZoom(factor){
+ if(mode!=="orbit")return;
+ orbit.dist=Math.max(2,Math.min(30,orbit.dist*factor))}
+function resetOrbit(){
+ orbit={yaw:.6,pitch:.85,dist:11,target:[0,1,0]};
+ if(SHOT){const target=P((SHOT.camera||{}).target_3d,1.2);
+  orbit.target=[target[0],1,target[2]]}}
+const pointers=new Map();let gesture=null;
+function gestureMetrics(){const values=[...pointers.values()];
+ if(values.length<2)return null;const a=values[0],b=values[1];
+ return {x:(a.x+b.x)/2,y:(a.y+b.y)/2,
+  distance:Math.hypot(a.x-b.x,a.y-b.y)}}
+cv.addEventListener("pointerdown",event=>{
+ pointers.set(event.pointerId,{x:event.clientX,y:event.clientY,startX:event.clientX,
+  startY:event.clientY,moved:false,button:event.button,pan:event.shiftKey||event.button===2});
+ cv.setPointerCapture(event.pointerId);cv.classList.add("drag");
+ gesture=pointers.size>=2?gestureMetrics():null});
+cv.addEventListener("pointermove",event=>{
+ const point=pointers.get(event.pointerId);if(!point)return;
+ const previous={x:point.x,y:point.y};point.x=event.clientX;point.y=event.clientY;
+ if(Math.hypot(point.x-point.startX,point.y-point.startY)>5)point.moved=true;
+ if(pointers.size>=2){const current=gestureMetrics();
+  if(gesture&&current&&mode==="orbit"){
+   adjustZoom(gesture.distance/Math.max(1,current.distance));
+   panOrbit(current.x-gesture.x,current.y-gesture.y)}
+  gesture=current;return}
+ if(mode!=="orbit")return;
+ if(point.pan)panOrbit(point.x-previous.x,point.y-previous.y);
+ else{orbit.yaw-=(point.x-previous.x)*.006;
+  orbit.pitch=Math.max(.05,Math.min(1.5,
+   orbit.pitch+(point.y-previous.y)*.005))}});
+function finishPointer(event){
+ const point=pointers.get(event.pointerId);pointers.delete(event.pointerId);
+ gesture=pointers.size>=2?gestureMetrics():null;
+ if(!pointers.size)cv.classList.remove("drag");
+ if(point&&!point.moved&&!point.pan&&event.button!==2){
+  const hit=pickObject(event.clientX,event.clientY);
+  if(hit)focusObject(hit.key)}}
+cv.addEventListener("pointerup",finishPointer);
+cv.addEventListener("pointercancel",finishPointer);
+cv.addEventListener("contextmenu",event=>event.preventDefault());
+cv.addEventListener("wheel",event=>{event.preventDefault();
+ adjustZoom(Math.exp(event.deltaY*.001))},{passive:false});
+document.getElementById("zoomIn").onclick=()=>adjustZoom(.82);
+document.getElementById("zoomOut").onclick=()=>adjustZoom(1.22);
+document.getElementById("resetView").onclick=resetOrbit;
+document.getElementById("footerToggle").onclick=()=>
+ document.body.classList.toggle("footer-collapsed");
+
+const EDIT_INPUTS={x:"editX",y:"editY",z:"editZ",width_m:"editW",
+ height_m:"editH",depth_m:"editD",rotation_y_deg:"editYaw",
+ mount_type:"editMount",support_id:"editSupport"};
+function sourceObjectByKey(key){const objects=sourceSceneModel().objects||[];
+ const index=objects.findIndex((obj,i)=>objectKey(obj,i)===String(key));
+ return index>=0?{obj:objects[index],index}:null}
+function editRecordFor(key){
+ const found=sourceObjectByKey(key);if(!found)return null;
+ const obj=found.obj,transform=obj.transform||{},bounds=obj.bounds||{},
+       pos=renderPlacementFor(obj)||{};
+ return {object_id:String(obj.object_id??obj.id??objectKey(obj,found.index)),
+  name:String(obj.name||""),position_3d:{x:finite(pos.x,0),y:finite(pos.y,0),z:finite(pos.z,0)},
+  width_m:Math.max(.01,finite(obj.width_m??obj.width??bounds.width_m??bounds.width,.6)),
+  height_m:Math.max(.01,finite(obj.height_m??obj.height??bounds.height_m??bounds.height,.8)),
+  depth_m:Math.max(.01,finite(obj.depth_m??obj.depth??bounds.depth_m??bounds.depth,.6)),
+  rotation_y_deg:finite(obj.rotation_y_deg??transform.rotation_y_deg??transform.yaw_deg,0),
+  mount_type:String(obj.mount_type??obj.mount??""),
+  support_id:String(obj.support_id??obj.support??"")}}
+function selectedEdit(){
+ return editState.edits.get(editState.selectedKey)||editRecordFor(editState.selectedKey)}
+function fillInspector(){
+ const found=sourceObjectByKey(editState.selectedKey),panel=document.getElementById("inspector");
+ panel.classList.toggle("show",Boolean(found));if(!found)return;
+ const value=selectedEdit();document.getElementById("inspectorTitle").textContent=
+  found.obj.name||found.obj.object_id||"场景物体";
+ const values={x:value.position_3d.x,y:value.position_3d.y,z:value.position_3d.z,
+  width_m:value.width_m,height_m:value.height_m,depth_m:value.depth_m,
+  rotation_y_deg:value.rotation_y_deg,mount_type:value.mount_type,
+  support_id:value.support_id};
+ for(const [key,id] of Object.entries(EDIT_INPUTS)){
+  const input=document.getElementById(id);input.value=values[key]??"";
+  input.disabled=previewMode!=="repair"}
+ document.getElementById("inspectorHint").textContent=previewMode==="repair"?
+  "修复预览正在使用本地改动；保存成功后才成为新真值。":"真值模式只读；进入“修复预览”后才可编辑。";
+ syncEditButtons()}
+function focusObject(key){
+ const found=sourceObjectByKey(key);if(!found)return;
+ const location=String((SCENE&&SCENE.location)||"");
+ if(editState.edits.size&&editState.location&&editState.location!==location){
+  warn("另一场景仍有未保存修复，请返回该场景保存后再编辑。",true);return}
+ editState.location=location;
+ editState.selectedKey=String(key);const pos=renderPlacementFor(found.obj)||{};
+ orbit.target=[finite(pos.x,0),Math.max(.5,finite(pos.y,0)+
+  finite(found.obj.height_m??found.obj.height,.8)/2),finite(pos.z,0)];
+ setMode("orbit");fillInspector();buildSceneGeometry();buildGeometry()}
+function syncEditButtons(){
+ document.getElementById("undoEdit").disabled=!editState.undo.length||editState.saving;
+ document.getElementById("redoEdit").disabled=!editState.redo.length||editState.saving;
+ document.getElementById("saveEdits").disabled=previewMode!=="repair"||
+  !editState.edits.size||editState.saving}
+function applyHistory(entry,forward){
+ const value=forward?entry.after:entry.before;
+ if(value)editState.edits.set(entry.key,structuredClone(value));
+ else editState.edits.delete(entry.key);
+ fillInspector();buildSceneGeometry();buildGeometry();syncPreviewBadge()}
+function readInspectorEdit(){
+ const current=selectedEdit();if(!current)return null;
+ const number=id=>Number(document.getElementById(id).value);
+ return Object.assign({},current,{position_3d:{x:number("editX"),y:number("editY"),
+  z:number("editZ")},width_m:Math.max(.01,number("editW")),
+  height_m:Math.max(.01,number("editH")),depth_m:Math.max(.01,number("editD")),
+  rotation_y_deg:number("editYaw"),mount_type:document.getElementById("editMount").value,
+  support_id:document.getElementById("editSupport").value.trim()})}
+Object.values(EDIT_INPUTS).forEach(id=>document.getElementById(id).addEventListener("input",event=>{
+ if(previewMode!=="repair"||!editState.selectedKey)return;
+ const before=editState.edits.has(editState.selectedKey)?
+  structuredClone(editState.edits.get(editState.selectedKey)):null,
+       after=readInspectorEdit();
+ if(!after||[after.position_3d.x,after.position_3d.y,after.position_3d.z,
+  after.width_m,after.height_m,after.depth_m,after.rotation_y_deg].some(
+   value=>!Number.isFinite(value)))return;
+ editState.edits.set(editState.selectedKey,after);
+ const prior=editState.undo[editState.undo.length-1];
+ if(prior&&prior.key===editState.selectedKey&&prior.field===event.target.id)
+  prior.after=structuredClone(after);
+ else editState.undo.push({key:editState.selectedKey,field:event.target.id,
+  before,after:structuredClone(after)});
+ editState.redo=[];syncEditButtons();syncPreviewBadge();buildSceneGeometry();buildGeometry()}));
+document.getElementById("undoEdit").onclick=()=>{const entry=editState.undo.pop();
+ if(!entry)return;editState.redo.push(entry);applyHistory(entry,false)};
+document.getElementById("redoEdit").onclick=()=>{const entry=editState.redo.pop();
+ if(!entry)return;editState.undo.push(entry);applyHistory(entry,true)};
+document.getElementById("inspectorClose").onclick=()=>{
+ editState.selectedKey="";document.getElementById("inspector").classList.remove("show");
+ buildSceneGeometry();buildGeometry()};
+
+function setMode(m){mode=m;
+ document.getElementById("orbit").classList.toggle("on",m==="orbit");
+ document.getElementById("enter").classList.toggle("on",m==="shot")}
+document.getElementById("orbit").onclick=()=>setMode("orbit");
+document.getElementById("enter").onclick=()=>setMode("shot");
+function syncDisplayControls(){
+ document.getElementById("modeReal").classList.toggle("on",displayMode==="realistic");
+ document.getElementById("modeStructure").classList.toggle("on",displayMode==="structure");
+ const control=document.getElementById("tControl");
+ control.classList.toggle("on",show.control);
+ control.setAttribute("aria-pressed",String(show.control));
+ labels.style.display=show.control?"":"none";
+ for(const [id,key] of [["tPath","path"],["tFrus","frus"],["tAxis","axis"]]){
+  const item=document.getElementById(id);item.disabled=!show.control;
+  item.classList.toggle("on",show.control&&show[key])}}
+function syncPreviewBadge(){
+ const badge=document.getElementById("previewBadge"),repair=previewMode==="repair";
+ badge.style.display=repair?"block":"none";
+ badge.textContent=repair?`修复预览 · ${editState.edits.size} 项未保存 · 不进入导出`:"";
+ const truth=document.getElementById("truthMode"),preview=document.getElementById("repairMode");
+ truth.classList.toggle("on",!repair);preview.classList.toggle("on",repair);
+ truth.setAttribute("aria-pressed",String(!repair));preview.setAttribute("aria-pressed",String(repair));
+ document.getElementById("exportPng").disabled=repair;syncEditButtons();fillInspector()}
+function setPreviewMode(next){
+ previewMode=next==="repair"?"repair":"truth";NAV.key=null;
+ syncPreviewBadge();buildSceneGeometry();buildGeometry()}
+document.getElementById("truthMode").onclick=()=>setPreviewMode("truth");
+document.getElementById("repairMode").onclick=()=>setPreviewMode("repair");
+function setDisplayMode(next){
+ displayMode=next==="structure"?"structure":"realistic";
+ // 结构一键进入可读控制图；写实一键恢复干净导演视图。
+ if(displayMode==="structure"){
+  show.control=true;show.frus=true;show.axis=true}
+ else show.control=false;
+ syncDisplayControls();buildSceneGeometry();buildGeometry()}
+document.getElementById("modeReal").onclick=()=>setDisplayMode("realistic");
+document.getElementById("modeStructure").onclick=()=>setDisplayMode("structure");
+[["tPano","pano"],["tPath","path"],["tFrus","frus"],["tAxis","axis"]]
+ .forEach(([id,key])=>{const b=document.getElementById(id);
+  b.onclick=()=>{show[key]=!show[key];b.classList.toggle("on",show[key]);
+   buildGeometry()}});
+document.getElementById("tControl").onclick=()=>{
+ show.control=!show.control;syncDisplayControls();buildGeometry()};
+function sceneRevisionEntry(){
+ const location=String((SCENE&&SCENE.location)||""),map=DATA&&DATA.scene_model_revisions||{},
+       entry=map[location]||{},model=sourceSceneModel();
+ return {revision:Number(entry.revision??model.revision??editState.revision??0),
+  physical_scene_id:entry.physical_scene_id??model.physical_scene_id??""}}
+function replaceSceneModel(model){
+ const location=String((SCENE&&SCENE.location)||"");
+ DATA.scene_model_contracts=DATA.scene_model_contracts||{};
+ DATA.scene_model_contracts[location]=model;
+ if(SCENE&&SCENE.location===location)SCENE.scene_model=model}
+function applySavedEditsToModel(model){
+ const edits=editState.edits;
+ return Object.assign({},model,{objects:(model.objects||[]).map((obj,index)=>{
+  const edit=edits.get(objectKey(obj,index));if(!edit)return obj;
+  return Object.assign({},obj,{position_3d:Object.assign({},edit.position_3d),
+   width_m:edit.width_m,height_m:edit.height_m,depth_m:edit.depth_m,
+   rotation_y_deg:edit.rotation_y_deg,mount_type:edit.mount_type,
+   support_id:edit.support_id})})})}
+async function sceneEditRequest(payload){
+ const url="/api/scene3d?episode="+encodeURIComponent(episode),options={
+  method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify(payload)};
+ let response=await fetch(url,options);
+ if(response.status===404||response.status===405){
+  response=await fetch(url,{method:"PATCH",headers:options.headers,
+   body:JSON.stringify({scene_location:payload.scene_location,
+    revision:payload.expected_revision,edits:payload.updates})})}
+ const textValue=await response.text();let data={};
+ try{data=textValue?JSON.parse(textValue):{}}catch(error){data={error:textValue}}
+ if(!response.ok){const conflict=response.status===409?
+   `版本冲突：当前 v${data.actual??"?"}，本页基于 v${data.expected??payload.expected_revision}`:
+   (data.error||data.message||String(response.status));
+  const failure=new Error(conflict);failure.status=response.status;throw failure}
+ return data}
+document.getElementById("saveEdits").onclick=async()=>{
+ if(previewMode!=="repair"||!editState.edits.size||editState.saving)return;
+ const location=String((SCENE&&SCENE.location)||""),revision=sceneRevisionEntry(),
+       status=document.getElementById("saveStatus"),updates=[...editState.edits.values()].map(edit=>({
+        object_id:edit.object_id,position_3d:edit.position_3d,width_m:edit.width_m,
+        height_m:edit.height_m,depth_m:edit.depth_m,rotation_y_deg:edit.rotation_y_deg,
+        support_id:edit.support_id||null,mount_type:edit.mount_type||null})),
+       payload={episode_id:Number(episode),scene_location:location,
+        physical_scene_id:revision.physical_scene_id,
+        expected_revision:revision.revision,updates};
+ editState.saving=true;status.textContent="保存中…";syncEditButtons();
+ try{const data=await sceneEditRequest(payload),base=sourceSceneModel(),
+   saved=data.model||data.scene_model||applySavedEditsToModel(base);
+  replaceSceneModel(saved);editState.revision=Number(data.revision??revision.revision+1);
+  DATA.scene_model_revisions=DATA.scene_model_revisions||{};
+  DATA.scene_model_revisions[location]=Object.assign({},
+   DATA.scene_model_revisions[location]||{},data,{revision:editState.revision,
+    physical_scene_id:data.physical_scene_id??revision.physical_scene_id});
+  if(data.render_contract){DATA.render_contracts=DATA.render_contracts||{};
+   DATA.render_contracts[location]=data.render_contract}
+  editState.edits.clear();editState.undo=[];editState.redo=[];editState.location="";
+  status.textContent=`已保存 v${editState.revision}`;setPreviewMode("truth")
+ }catch(error){status.textContent="保存失败："+error.message;warn(
+  [{message:"场景修复保存失败："+error.message,objectKey:editState.selectedKey}],true)
+ }finally{editState.saving=false;syncEditButtons()}};
+document.getElementById("analyzeAppearance").onclick=async()=>{
+ const button=document.getElementById("analyzeAppearance"),
+       status=document.getElementById("appearanceStatus"),
+       location=String((SCENE&&SCENE.location)||""),
+       revision=sceneRevisionEntry(),shotNo=Number(SHOT&&SHOT.shot_no);
+ if(!location||button.disabled)return;
+ button.disabled=true;button.textContent="正在识别…";
+ status.textContent="读取全景可见材质与主光，不会改物体位置和尺寸";
+ try{
+  const response=await fetch("/api/scene3d/appearance?episode="+
+   encodeURIComponent(episode),{method:"POST",headers:{"Content-Type":"application/json"},
+   body:JSON.stringify({episode_id:Number(episode),scene_location:location,
+    physical_scene_id:revision.physical_scene_id||location})});
+  const textValue=await response.text();let data={};
+  try{data=textValue?JSON.parse(textValue):{}}catch(error){data={error:textValue}}
+  if(!response.ok)throw new Error(data.error||data.message||String(response.status));
+  DATA=data;selectShot(shotNo);const summary=data.appearance_refresh||{};
+  status.textContent=`已更新 v${summary.revision??"?"} · 材质 `+
+   `${summary.verified_materials??0}/${summary.objects??0} · `+
+   `灯光${summary.lighting_verified?"已验证":"仍需人工复核"}`;
+ }catch(error){status.textContent="识别失败："+error.message;
+  warn([{code:"appearance_refresh_failed",message:"材质/灯光识别失败："+error.message}],true)
+ }finally{button.disabled=false;button.textContent="AI识别材质/灯光"}};
+async function exportCleanPng(){
+ const previousControl=show.control;
+ const button=document.getElementById("exportPng"),saved={
+  displayMode,path:show.path,frus:show.frus,axis:show.axis};
+ let exportError="";
+ if(previewMode!=="truth"){
+  warn("修复预览未保存，不能进入导出。请先保存修复或切回真值。",true);return}
+ button.disabled=true;button.textContent="正在导出…";
+ try{
+  displayMode="realistic";show.control=false;show.path=false;show.frus=false;
+  show.axis=false;syncDisplayControls();buildSceneGeometry();buildGeometry();
+  // WebGL 使用 preserveDrawingBuffer；仍等待至少一帧，确保新几何已绘制。
+  await new Promise(resolve=>requestAnimationFrame(()=>resolve()));
+  const blob=await new Promise((resolve,reject)=>cv.toBlob(
+   value=>value?resolve(value):reject(new Error("浏览器没有生成 PNG 数据")),
+   "image/png"));
+  const url=URL.createObjectURL(blob),link=document.createElement("a"),
+        shotNo=String((SHOT&&SHOT.shot_no)||"current").replace(/[^0-9A-Za-z_-]/g,"_"),
+        episodeNo=String((DATA&&DATA.episode_number)||episode||"episode")
+         .replace(/[^0-9A-Za-z_-]/g,"_");
+  link.href=url;link.download=`AIFOS_ep${episodeNo}_shot${shotNo}_photoreal.png`;
+  document.body.appendChild(link);link.click();link.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),1000)
+ }catch(error){
+  exportError="导出效果图失败："+
+   (error&&error.message?error.message:String(error))
+ }finally{
+  displayMode=saved.displayMode;show.control=previousControl;show.path=saved.path;
+  show.frus=saved.frus;show.axis=saved.axis;syncDisplayControls();
+  buildSceneGeometry();buildGeometry();
+  button.disabled=false;button.textContent="导出效果图";
+  if(exportError)warn(exportError,true)}}
+document.getElementById("exportPng").onclick=exportCleanPng;
+syncDisplayControls();
+syncPreviewBadge();
+
+function selectShot(no){
+ const previousLocation=String((SCENE&&SCENE.location)||"");
+ const idx=(DATA.blocking||{}).shot_index||{};
+ SHOT=idx[String(no)]||null;
+ SCENE=((DATA.blocking||{}).scenes||[]).find(
+   s=>Number(s.scene_no)===Number(SHOT&&SHOT.scene_no))||
+   ((DATA.blocking||{}).scenes||[])[0]||null;
+ const nextLocation=String((SCENE&&SCENE.location)||"");
+ if(previousLocation&&previousLocation!==nextLocation){
+  editState.selectedKey="";document.getElementById("inspector").classList.remove("show");
+  if(editState.edits.size&&editState.location===previousLocation)setPreviewMode("truth")}
+ const w=Object.assign({},activeSceneModel().room||{},(SCENE&&SCENE.world)||{});
+ buildRoomBox(Number(w.floor_width_m)||10,Number(w.floor_depth_m)||7,
+              Number(w.ceiling_height_m)||4.2);
+ loadPano(SCENE&&SCENE.location);
+ buildSceneGeometry();
+ buildGeometry();
+ document.querySelectorAll("#shots button").forEach(b=>
+  b.classList.toggle("on",b.dataset.no===String(no)));
+ const act=(DATA.shot_actions||{})[String(no)]||{};
+ document.getElementById("meta").textContent =
+  `${DATA.project_title} 第${DATA.episode_number}集 · 镜${no}` +
+  (act.camera?` · ${act.camera}`:"") + (act.action?` — ${act.action}`:"");
+ if(SHOT){const cam=SHOT.camera||{},t=P(cam.target_3d,1.2);
+  orbit.target=[t[0],1.0,t[2]]}}
+
+let panoLoc=null;
+function loadPano(location){
+ if(!location||location===panoLoc)return;
+ const info=(DATA.panoramas||{})[location];
+ panoReady=false;panoLoc=location;
+ if(!info){updateSceneStatus();return}
+ const img=new Image();
+ img.onload=()=>{gl.bindTexture(gl.TEXTURE_2D,panoTex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,0);  // 采样公式已含垂直方向,再翻转=天地颠倒
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGB,gl.RGB,gl.UNSIGNED_BYTE,img);
+  // WebGL1 非 2 的幂纹理禁用 REPEAT,否则采样恒黑(整间房变纯黑)。
+  const pot=v=>(v&(v-1))===0,potOk=pot(img.width)&&pot(img.height);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,
+                   potOk?gl.REPEAT:gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+  panoReady=true;buildSceneGeometry();updateSceneStatus()};
+ img.onerror=()=>{panoReady=false;buildSceneGeometry();
+  updateSceneStatus(["全景母版加载失败："+(info.url||"地址为空")])};
+ img.src=info.url+(info.version?("?v="+info.version):"")}
+
+const qs=new URLSearchParams(location.search);
+const episode=qs.get("episode");
+const requestedShot=Number(qs.get("shot"));
+if(!episode){fail("缺少 episode 参数。请从剧集页面进入,或用 /scene3d?episode=<id>")}
+else{
+ fetch("/api/scene3d?episode="+encodeURIComponent(episode))
+  .then(r=>r.ok?r.json():r.text().then(t=>{throw new Error(t||r.status)}))
+  .then(d=>{
+   DATA=d;
+   if(!d.blocking){fail(d.message||"本集尚未生成空间调度(blocking)");return}
+   const idx=d.blocking.shot_index||{};
+   const nos=Object.keys(idx).map(Number).filter(n=>!isNaN(n)).sort((a,b)=>a-b);
+   if(!nos.length){fail("空间调度里没有镜头数据");return}
+   const box=document.getElementById("shots");
+   nos.forEach(n=>{const b=document.createElement("button");
+    b.textContent="镜"+n;b.dataset.no=String(n);
+    b.onclick=()=>pvSeekShot(n);box.appendChild(b)});
+   selectShot(nos.includes(requestedShot)?requestedShot:nos[0]);
+   pvInit();
+   loadStatement();
+   draw()})
+  .catch(e=>fail("加载失败: "+e.message))}
+</script>
+</body>
+</html>

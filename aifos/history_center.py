@@ -1,0 +1,701 @@
+"""生产历史中心：持久记录每次运行，并恢复服务重启遗留的幽灵任务。"""
+
+import json
+import re
+from pathlib import Path
+
+from .asset_center import AssetCenter, IMAGE_KINDS
+from .db import now
+from .errors import AifosError
+
+
+DERIVED_VISUAL_STATE_KINDS = {
+    "character",
+    "scene",
+    "character_identity",
+    "style_anchor",
+}
+
+STABLE_EPISODE_STATUSES = {
+    "done", "failed", "qc_failed", "created",
+    "awaiting_script", "awaiting_cast", "awaiting_confirm", "queued_script",
+    "paused",
+}
+ACTIVE_RUN_STATUSES = {"running", "cancelling"}
+
+
+def _loads(value, fallback):
+    try:
+        return json.loads(value or "")
+    except (TypeError, ValueError):
+        return fallback
+
+
+class HistoryCenter:
+    """SQLite-backed production run history.
+
+    JobRegistry is intentionally in-memory; this center is the durable record
+    shown to operators after reloads and server restarts.
+    """
+
+    def __init__(self, db, artifacts_root=None):
+        self.db = db
+        self.artifacts_root = (
+            Path(artifacts_root).resolve() if artifacts_root else None)
+
+    def _archive_episode_runtime_state(self, project_id, episode_id,
+                                       episode_number):
+        """移走会污染同编号新作品的活动清单，生成文件本身仍原地保留。"""
+        if self.artifacts_root is None:
+            return {"count": 0, "archive_dir": ""}
+        episode_dir = (
+            self.artifacts_root / f"p{int(project_id):03d}"
+            / f"e{int(episode_number):03d}")
+        if not episode_dir.is_dir():
+            return {"count": 0, "archive_dir": ""}
+        names = (
+            "render_plan.json",
+            "summary.json",
+            "qc_report.json",
+            "video_qc_report.json",
+            "relations.json",
+            "delivery_verify.json",
+        )
+        existing = [episode_dir / name for name in names
+                    if (episode_dir / name).is_file()]
+        if not existing:
+            return {"count": 0, "archive_dir": ""}
+        archive_dir = (
+            episode_dir / ".history"
+            / f"deleted-episode-{int(episode_id)}-{int(now() * 1000)}")
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        for path in existing:
+            path.replace(archive_dir / path.name)
+        return {
+            "count": len(existing),
+            "archive_dir": str(archive_dir),
+        }
+
+    def create_run(self, project_title, episode_number, action="produce",
+                   force=False, request=None, source="web"):
+        episode = self.db.query_one(
+            "SELECT e.id FROM episodes e JOIN projects p ON p.id=e.project_id "
+            "WHERE p.title=? AND e.number=?",
+            (project_title, int(episode_number)))
+        ts = now()
+        cur = self.db.execute(
+            "INSERT INTO production_runs(episode_id, project_title, "
+            "episode_number, action, source, status, force, request, "
+            "started_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (episode["id"] if episode else None, project_title,
+             int(episode_number), action, source, "running", bool(force),
+             json.dumps(request or {}, ensure_ascii=False), ts, ts))
+        return cur.lastrowid
+
+    def _bind_episode(self, run_id):
+        run = self.db.query_one(
+            "SELECT * FROM production_runs WHERE id=?", (run_id,))
+        if run is None or run["episode_id"] is not None:
+            return run
+        episode = self.db.query_one(
+            "SELECT e.id FROM episodes e JOIN projects p ON p.id=e.project_id "
+            "WHERE p.title=? AND e.number=?",
+            (run["project_title"], run["episode_number"]))
+        if episode is not None:
+            self.db.execute(
+                "UPDATE production_runs SET episode_id=?, updated_at=? "
+                "WHERE id=?", (episode["id"], now(), run_id))
+        return self.db.query_one(
+            "SELECT * FROM production_runs WHERE id=?", (run_id,))
+
+    def mark_cancelling(self, run_id):
+        if run_id:
+            self.db.execute(
+                "UPDATE production_runs SET status='cancelling', "
+                "updated_at=? WHERE id=? AND status='running'",
+                (now(), run_id))
+
+    def finish_run(self, run_id, summary=None, error=""):
+        run = self._bind_episode(run_id)
+        if run is None:
+            return None
+        summary = summary if isinstance(summary, dict) else {
+            "result": summary}
+        stages = summary.get("stages") or []
+        result_status = str(summary.get("status") or "")
+        if error:
+            status = "failed"
+        elif result_status in {"failed", "qc_failed"}:
+            status = "failed"
+        elif result_status in {"awaiting_script", "awaiting_cast",
+                               "awaiting_confirm", "queued_script", "paused"}:
+            status = "paused"
+        elif result_status == "created":
+            status = "stopped"
+        else:
+            status = "completed"
+        providers = set()
+        for stage in stages:
+            providers.update(stage.get("providers") or [])
+        task_rows = []
+        if run["episode_id"] is not None:
+            task_rows = self.db.query(
+                "SELECT stage, provider, cost FROM tasks "
+                "WHERE run_id=? ORDER BY id", (run_id,))
+            for task in task_rows:
+                providers.update(p.strip() for p in
+                                 (task["provider"] or "").split(",")
+                                 if p.strip())
+        if stages:
+            cost = sum(float(stage.get("cost") or 0) for stage in stages)
+            last_stage = str(stages[-1].get("stage") or "")
+        else:
+            task_cost = sum(float(task["cost"] or 0) for task in task_rows)
+            cost = max(float(summary.get("cost") or 0), task_cost)
+            last_stage = str(
+                summary.get("stage")
+                or (task_rows[-1]["stage"] if task_rows else ""))
+        stage_count = len(stages) or len(task_rows)
+        ts = now()
+        self.db.execute(
+            "UPDATE production_runs SET status=?, result_status=?, cost=?, "
+            "providers=?, stage_count=?, last_stage=?, error=?, summary=?, "
+            "finished_at=?, updated_at=? WHERE id=?",
+            (status, result_status, round(cost, 4),
+             ",".join(sorted(providers)), stage_count, last_stage,
+             str(error or summary.get("error") or "")[:2000],
+             json.dumps(summary, ensure_ascii=False)[:200000], ts, ts,
+             run_id))
+        return self.get(run_id)
+
+    def _landing_status(self, episode_id):
+        gate = self.db.query_one(
+            "SELECT COUNT(*) AS n FROM tasks WHERE episode_id=? "
+            "AND stage='preflight' AND status='done'", (episode_id,))
+        downstream = self.db.query_one(
+            "SELECT COUNT(*) AS n FROM tasks WHERE episode_id=? "
+            "AND stage IN ('storyboard','blocking','images','text_assets',"
+            "'frames','preflight','videos','voices','edit','qc','package',"
+            "'archive') AND status IN "
+            "('running','done','stopped','failed','interrupted')",
+            (episode_id,))
+        cast = self.db.query_one(
+            "SELECT COUNT(*) AS n FROM tasks WHERE episode_id=? "
+            "AND stage='cast' AND status IN "
+            "('running','done','stopped','failed','interrupted')",
+            (episode_id,))
+        script = self.db.query_one(
+            "SELECT id FROM documents WHERE episode_id=? AND kind='script' "
+            "LIMIT 1", (episode_id,))
+        if gate and gate["n"]:
+            return "awaiting_confirm"
+        if downstream and downstream["n"]:
+            return "paused"
+        if cast and cast["n"]:
+            return "awaiting_cast"
+        if script is not None:
+            return "awaiting_script"
+        return "created"
+
+    def recover_episode(self, episode_id, reason="生成进程已结束，恢复历史状态"):
+        episode = self.db.query_one(
+            "SELECT * FROM episodes WHERE id=?", (episode_id,))
+        if episode is None:
+            return None
+        landing = self._landing_status(episode_id)
+        ts = now()
+        self.db.execute(
+            "UPDATE tasks SET status='interrupted', "
+            "error=CASE WHEN error='' THEN ? ELSE error END, updated_at=? "
+            "WHERE episode_id=? AND status IN "
+            "('running','queued','cancelling')",
+            (reason, ts, episode_id))
+        self.db.execute(
+            "UPDATE episodes SET status=?, updated_at=? WHERE id=?",
+            (landing, ts, episode_id))
+        self.db.execute(
+            "UPDATE production_runs SET status='interrupted', "
+            "result_status=?, error=CASE WHEN error='' THEN ? ELSE error END, "
+            "finished_at=COALESCE(finished_at, ?), updated_at=? "
+            "WHERE episode_id=? AND status IN ('running','cancelling')",
+            (landing, reason, ts, ts, episode_id))
+        return landing
+
+    def _settle_episode_if_idle(self, episode_id):
+        if episode_id is None:
+            return "interrupted"
+        episode = self.db.query_one(
+            "SELECT status FROM episodes WHERE id=?", (episode_id,))
+        if episode is None:
+            return "interrupted"
+        active = self.db.query_one(
+            "SELECT COUNT(*) AS n FROM production_runs WHERE episode_id=? "
+            "AND status IN ('running','cancelling')", (episode_id,))
+        if active and active["n"]:
+            return str(episode["status"] or "")
+        if str(episode["status"] or "") in STABLE_EPISODE_STATUSES:
+            return str(episode["status"] or "")
+        landing = self._landing_status(episode_id)
+        self.db.execute(
+            "UPDATE episodes SET status=?, updated_at=? WHERE id=?",
+            (landing, now(), episode_id))
+        return landing
+
+    def recover_run(self, run_id, reason="任务 owner 已失联，运行已中断"):
+        """Land one lease-proven stale run without touching sibling runs."""
+        run = self._bind_episode(run_id)
+        if run is None or str(run["status"]) not in ACTIVE_RUN_STATUSES:
+            return None
+        ts = now()
+        self.db.execute(
+            "UPDATE tasks SET status='interrupted', "
+            "error=CASE WHEN error='' THEN ? ELSE error END, updated_at=? "
+            "WHERE run_id=? AND status IN "
+            "('running','queued','cancelling')", (reason, ts, run_id))
+        self.db.execute(
+            "UPDATE production_runs SET status='interrupted', "
+            "error=CASE WHEN error='' THEN ? ELSE error END, "
+            "finished_at=COALESCE(finished_at, ?), updated_at=? "
+            "WHERE id=? AND status IN ('running','cancelling')",
+            (reason, ts, ts, run_id))
+        landing = self._settle_episode_if_idle(run["episode_id"])
+        self.db.execute(
+            "UPDATE production_runs SET result_status=? WHERE id=?",
+            (landing, run_id))
+        return self.get(run_id)
+
+    def cancel_run(self, run_id, reason="用户取消排队任务"):
+        """Cancel a never-started durable run and its queued task facts."""
+        run = self._bind_episode(run_id)
+        if run is None or str(run["status"]) not in ACTIVE_RUN_STATUSES:
+            return None
+        ts = now()
+        self.db.execute(
+            "UPDATE tasks SET status='cancelled', "
+            "error=CASE WHEN error='' THEN ? ELSE error END, updated_at=? "
+            "WHERE run_id=? AND status IN "
+            "('running','queued','cancelling')", (reason, ts, run_id))
+        self.db.execute(
+            "UPDATE production_runs SET status='cancelled', "
+            "result_status='cancelled', "
+            "error=CASE WHEN error='' THEN ? ELSE error END, "
+            "finished_at=COALESCE(finished_at, ?), updated_at=? "
+            "WHERE id=? AND status IN ('running','cancelling')",
+            (reason, ts, ts, run_id))
+        self._settle_episode_if_idle(run["episode_id"])
+        return self.get(run_id)
+
+    def recover_stale(self, *, protected_run_ids=(), stale_before):
+        """Recover legacy active facts not protected by a live job lease."""
+        protected = {int(value) for value in protected_run_ids
+                     if value is not None}
+        recovered_runs = []
+        for row in self.db.query(
+                "SELECT id FROM production_runs WHERE status IN "
+                "('running','cancelling') AND updated_at<=? ORDER BY id",
+                (float(stale_before),)):
+            if int(row["id"]) in protected:
+                continue
+            if self.recover_run(
+                    row["id"], "任务租约已过期，运行已安全中断"):
+                recovered_runs.append(int(row["id"]))
+
+        recovered_episodes = []
+        legacy = self.db.query(
+            "SELECT e.id FROM episodes e WHERE e.status NOT IN "
+            "('done','failed','qc_failed','created','awaiting_script',"
+            "'awaiting_cast','awaiting_confirm','queued_script','paused') "
+            "AND EXISTS (SELECT 1 FROM tasks t WHERE t.episode_id=e.id "
+            "AND t.run_id IS NULL AND t.status IN "
+            "('running','queued','cancelling') "
+            "AND t.updated_at<=?) AND NOT EXISTS (SELECT 1 FROM "
+            "production_runs r WHERE r.episode_id=e.id AND r.status IN "
+            "('running','cancelling'))", (float(stale_before),))
+        for episode in legacy:
+            self.recover_episode(
+                episode["id"], "旧版任务超过租约窗口，已安全恢复")
+            recovered_episodes.append(int(episode["id"]))
+        return {"runs": recovered_runs, "episodes": recovered_episodes}
+
+    def bootstrap(self, *, protected_run_ids=(), stale_before=None):
+        """Bind/backfill history and recover only lease-proven stale facts."""
+        self._bind_unbound_runs()
+        recovered = {"runs": [], "episodes": []}
+        if stale_before is not None:
+            recovered = self.recover_stale(
+                protected_run_ids=protected_run_ids,
+                stale_before=stale_before)
+        self._backfill_legacy()
+        return recovered
+
+    def _bind_unbound_runs(self):
+        for row in self.db.query(
+                "SELECT id FROM production_runs WHERE episode_id IS NULL"):
+            self._bind_episode(row["id"])
+
+    def _backfill_legacy(self):
+        episodes = self.db.query(
+            "SELECT e.*, p.title AS project_title FROM episodes e "
+            "JOIN projects p ON p.id=e.project_id WHERE NOT EXISTS "
+            "(SELECT 1 FROM production_runs r WHERE r.episode_id=e.id) "
+            "ORDER BY e.id")
+        for episode in episodes:
+            tasks = [dict(row) for row in self.db.query(
+                "SELECT id, stage, name, status, provider, cost, error, "
+                "created_at, updated_at FROM tasks WHERE episode_id=? "
+                "ORDER BY id", (episode["id"],))]
+            providers = set()
+            for task in tasks:
+                providers.update(p.strip() for p in
+                                 (task["provider"] or "").split(",")
+                                 if p.strip())
+            interrupted = any(t["status"] in {"running", "interrupted"}
+                              for t in tasks)
+            status = ("interrupted" if interrupted else
+                      "completed" if episode["status"] == "done" else
+                      "failed" if episode["status"] in {"failed", "qc_failed"}
+                      else "paused" if episode["status"] in {
+                          "awaiting_script", "awaiting_cast",
+                          "awaiting_confirm", "queued_script", "paused"} else
+                      "stopped")
+            started = min((t["created_at"] for t in tasks),
+                          default=episode["created_at"])
+            finished = max((t["updated_at"] for t in tasks),
+                           default=episode["updated_at"])
+            summary = {
+                "legacy": True,
+                "status": episode["status"],
+                "stages": tasks,
+            }
+            self.db.execute(
+                "INSERT INTO production_runs(episode_id, project_title, "
+                "episode_number, action, source, status, result_status, "
+                "cost, providers, stage_count, last_stage, summary, "
+                "started_at, finished_at, updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (episode["id"], episode["project_title"], episode["number"],
+                 "legacy_import", "migration", status, episode["status"],
+                 episode["cost"], ",".join(sorted(providers)), len(tasks),
+                 tasks[-1]["stage"] if tasks else "",
+                 json.dumps(summary, ensure_ascii=False), started, finished,
+                 now()))
+
+    def _payload(self, row, include_summary=False):
+        if row is None:
+            return None
+        item = dict(row)
+        item["force"] = bool(item["force"])
+        item["providers"] = [p for p in item["providers"].split(",") if p]
+        item["duration_seconds"] = round(
+            max(0, (item["finished_at"] or now()) - item["started_at"]), 1)
+        item["request"] = _loads(item.pop("request", "{}"), {})
+        raw_summary = item.pop("summary", "{}")
+        if include_summary:
+            item["summary"] = _loads(raw_summary, {})
+        return item
+
+    def list(self, limit=200, status=None, action=None, query=""):
+        limit = max(1, min(int(limit), 500))
+        where, params = [], []
+        if status:
+            where.append("r.status=?")
+            params.append(status)
+        if action:
+            where.append("r.action=?")
+            params.append(action)
+        if query:
+            where.append("(r.project_title LIKE ? OR "
+                         "CAST(r.episode_number AS TEXT) LIKE ?)")
+            needle = f"%{query}%"
+            params.extend((needle, needle))
+        clause = " WHERE " + " AND ".join(where) if where else ""
+        rows = self.db.query(
+            "SELECT r.*, COALESCE(p.title, r.project_title) AS current_project "
+            "FROM production_runs r LEFT JOIN episodes e ON e.id=r.episode_id "
+            "LEFT JOIN projects p ON p.id=e.project_id" + clause +
+            " ORDER BY r.started_at DESC, r.id DESC LIMIT ?",
+            (*params, limit))
+        items = [self._payload(row) for row in rows]
+        counts = {row["status"]: row["n"] for row in self.db.query(
+            "SELECT status, COUNT(*) AS n FROM production_runs "
+            "GROUP BY status")}
+        total = sum(counts.values())
+        cost = self.db.query_one(
+            "SELECT COALESCE(SUM(cost),0) AS total FROM production_runs")
+        return {
+            "items": items,
+            "stats": {
+                "total": total,
+                "completed": counts.get("completed", 0),
+                "paused": counts.get("paused", 0),
+                "failed": counts.get("failed", 0),
+                "interrupted": counts.get("interrupted", 0),
+                "running": counts.get("running", 0) +
+                           counts.get("cancelling", 0),
+                "total_cost": round(cost["total"], 2),
+            },
+            "filters": {
+                "statuses": sorted(counts),
+                "actions": [row["action"] for row in self.db.query(
+                    "SELECT DISTINCT action FROM production_runs "
+                    "ORDER BY action")],
+            },
+        }
+
+    def get(self, run_id):
+        row = self.db.query_one(
+            "SELECT r.*, COALESCE(p.title, r.project_title) AS current_project "
+            "FROM production_runs r LEFT JOIN episodes e ON e.id=r.episode_id "
+            "LEFT JOIN projects p ON p.id=e.project_id WHERE r.id=?",
+            (int(run_id),))
+        item = self._payload(row, include_summary=True)
+        if item is None:
+            return None
+        if item["episode_id"] is not None:
+            tasks = self.db.query(
+                "SELECT id, run_id, stage, name, status, provider, cost, "
+                "error, created_at, updated_at FROM tasks "
+                "WHERE run_id=? OR (run_id IS NULL AND episode_id=? AND "
+                "created_at>=? AND created_at<=?) ORDER BY id",
+                (item["id"], item["episode_id"], item["started_at"] - 0.001,
+                 (item["finished_at"] or now()) + 0.001))
+            item["tasks"] = [dict(task) for task in tasks]
+        else:
+            item["tasks"] = []
+        # Web background jobs are a separate durable fact stream from stage
+        # accounting tasks.  Expose both without mixing job rows into cost or
+        # stage_count, and include shot/output links for traceability.
+        from .job_center import JobCenter
+        item["jobs"] = JobCenter(self.db).list(
+            run_id=item["id"], limit=50, include_links=True)
+        return item
+
+    def delete_work(self, run_id, delete_assets=False):
+        """删除某次历史所对应的整集作品，并可选软删除关联图片。
+
+        删除对象是 ``《项目》第 N 集``，因此该集的全部运行记录会一起
+        删除；项目壳与物理产物文件始终保留。多集项目中的人物/场景等
+        公共母资产不会因为删除其中一集而被误删。
+        """
+        run = self.db.query_one(
+            "SELECT r.*, e.project_id, p.title AS current_project "
+            "FROM production_runs r LEFT JOIN episodes e ON e.id=r.episode_id "
+            "LEFT JOIN projects p ON p.id=e.project_id WHERE r.id=?",
+            (int(run_id),))
+        if run is None:
+            return None
+
+        # 极早期未绑定到剧集的迁移记录只能删除历史本身。
+        if run["episode_id"] is None or run["project_id"] is None:
+            task_count = self.db.query_one(
+                "SELECT COUNT(*) AS n FROM tasks WHERE run_id=?",
+                (int(run_id),))["n"]
+            self.db.execute("DELETE FROM tasks WHERE run_id=?", (int(run_id),))
+            self.db.execute(
+                "DELETE FROM production_runs WHERE id=?", (int(run_id),))
+            return {
+                "project": run["project_title"],
+                "episode_number": run["episode_number"],
+                "episode_deleted": False,
+                "history_only": True,
+                "runs_deleted": 1,
+                "tasks_deleted": task_count,
+                "assets_requested": bool(delete_assets),
+                "assets_soft_deleted": 0,
+                "asset_files_preserved": True,
+                "project_retained": True,
+            }
+
+        return self._delete_episode_target(
+            int(run["episode_id"]), int(run["project_id"]),
+            int(run["episode_number"]),
+            run["current_project"] or run["project_title"],
+            delete_assets=delete_assets)
+
+    def delete_episode_work(self, episode_id, delete_assets=False):
+        """从生产总览直接删除整集作品，不要求该集已有历史运行。"""
+        episode = self.db.query_one(
+            "SELECT e.id, e.project_id, e.number, p.title AS project_title "
+            "FROM episodes e JOIN projects p ON p.id=e.project_id "
+            "WHERE e.id=?", (int(episode_id),))
+        if episode is None:
+            return None
+        return self._delete_episode_target(
+            int(episode["id"]), int(episode["project_id"]),
+            int(episode["number"]), episode["project_title"],
+            delete_assets=delete_assets)
+
+    def project_shell_summary(self, title):
+        """删除剧名前的体检:还剩几集、几张图、几条历史,好让用户看清后果。"""
+        project = self.db.query_one(
+            "SELECT * FROM projects WHERE title=?", (str(title or "").strip(),))
+        if project is None:
+            return None
+        center = AssetCenter(self.db)
+        episodes = [dict(row) for row in self.db.query(
+            "SELECT number, title, status FROM episodes WHERE project_id=? "
+            "ORDER BY number", (project["id"],))]
+        images = [row for row in center.active_list(project["id"])
+                  if row["kind"] in IMAGE_KINDS]
+        runs = self.db.query_one(
+            "SELECT COUNT(*) AS n FROM production_runs WHERE project_title=?",
+            (project["title"],))["n"]
+        return {
+            "project": project["title"],
+            "project_id": project["id"],
+            "episodes": episodes,
+            "episode_count": len(episodes),
+            "image_asset_count": len(images),
+            "asset_row_count": self.db.query_one(
+                "SELECT COUNT(*) AS n FROM assets WHERE project_id=?",
+                (project["id"],))["n"],
+            "run_count": runs,
+            "deletable": not episodes,
+            "artifacts_dir": (
+                str(self.artifacts_root / f"p{project['id']:03d}")
+                if self.artifacts_root is not None else ""),
+        }
+
+    def delete_project(self, title, delete_assets=False):
+        """删除只剩空壳的剧名(资产中心作品下拉里的残留项)。
+
+        删除整集作品时项目壳会被刻意保留(承载跨集母资产与软删版本链),
+        作品全删光后这个壳就成了下拉框里的死名字。这里只清空壳:
+        **还有剧集记录的项目一律拒绝**,请先在历史记录里删除那些作品。
+        壳里还挂着图片资产时必须显式确认;磁盘上的产物文件一律不动,
+        artifacts 目录原样保留,可人工找回。
+        """
+        summary = self.project_shell_summary(title)
+        if summary is None:
+            raise AifosError(f"作品不存在: {title}")
+        if summary["episode_count"]:
+            numbers = "、".join(
+                f"第{item['number']}集" for item in summary["episodes"][:8])
+            raise AifosError(
+                f"《{summary['project']}》还有 {summary['episode_count']} 集作品记录"
+                f"({numbers}{'…' if summary['episode_count'] > 8 else ''}),"
+                "不能直接删剧名;请先在历史记录或生产总览里删除这些作品,"
+                "再回来删剧名")
+        if summary["image_asset_count"] and not delete_assets:
+            raise AifosError(
+                f"《{summary['project']}》名下还有 {summary['image_asset_count']} 张图片资产;"
+                "确认要连同资产记录一起删除后再操作(磁盘上的原图不会删)")
+        project_id = summary["project_id"]
+        batch_ids = [row["id"] for row in self.db.query(
+            "SELECT id FROM series_batches WHERE project_id=?", (project_id,))]
+        for batch_id in batch_ids:
+            self.db.execute(
+                "DELETE FROM series_batch_items WHERE batch_id=?", (batch_id,))
+        self.db.execute(
+            "DELETE FROM series_batches WHERE project_id=?", (project_id,))
+        assets_removed = summary["asset_row_count"]
+        self.db.execute("DELETE FROM assets WHERE project_id=?", (project_id,))
+        # 未绑定剧集的早期历史行只认项目名,壳没了它们也失去归属。
+        runs_removed = self.db.query_one(
+            "SELECT COUNT(*) AS n FROM production_runs "
+            "WHERE project_title=? AND episode_id IS NULL",
+            (summary["project"],))["n"]
+        self.db.execute(
+            "DELETE FROM production_runs "
+            "WHERE project_title=? AND episode_id IS NULL",
+            (summary["project"],))
+        self.db.execute("DELETE FROM projects WHERE id=?", (project_id,))
+        return {
+            "deleted_project": summary["project"],
+            "assets_removed": assets_removed,
+            "image_assets_removed": summary["image_asset_count"],
+            "series_batches_removed": len(batch_ids),
+            "runs_removed": runs_removed,
+            "asset_files_preserved": True,
+            "artifacts_dir": summary["artifacts_dir"],
+        }
+
+    def _delete_episode_target(self, episode_id, project_id,
+                               episode_number, project_title,
+                               delete_assets=False):
+        """执行整集清理；所有入口共用这一套资产保护和统计规则。"""
+        prefix = f"e{episode_number:03d}"
+        counts = {
+            "runs": self.db.query_one(
+                "SELECT COUNT(*) AS n FROM production_runs WHERE episode_id=?",
+                (episode_id,))["n"],
+            "tasks": self.db.query_one(
+                "SELECT COUNT(*) AS n FROM tasks WHERE episode_id=?",
+                (episode_id,))["n"],
+            "documents": self.db.query_one(
+                "SELECT COUNT(*) AS n FROM documents WHERE episode_id=?",
+                (episode_id,))["n"],
+        }
+        episode_count = self.db.query_one(
+            "SELECT COUNT(*) AS n FROM episodes WHERE project_id=?",
+            (project_id,))["n"]
+
+        assets_deleted = 0
+        if delete_assets:
+            center = AssetCenter(self.db)
+            deletable_kinds = set(IMAGE_KINDS) | DERIVED_VISUAL_STATE_KINDS
+            for asset in center.active_list(project_id):
+                if asset["kind"] not in deletable_kinds:
+                    continue
+                meta = center.meta(asset)
+                source_id = meta.get("source_episode_id")
+                source_number = meta.get(
+                    "source_episode_number", meta.get("episode_number"))
+                episode_scoped = bool(
+                    re.match(rf"^{re.escape(prefix)}(?:_|$)", asset["name"])
+                    or str(source_id or "") == str(episode_id)
+                    or str(source_number or "") == str(episode_number))
+                # 单集项目中的所有可见图片都属于这一作品；多集项目只删
+                # 明确绑定本集的图片，保住跨集人物/场景/服装母资产。
+                if episode_count == 1 or episode_scoped:
+                    deleted = center.soft_delete(
+                        project_id, asset["kind"], asset["name"], meta={
+                            "reason": "deleted_with_history_work",
+                            "deleted_episode_id": episode_id,
+                            "deleted_episode_number": episode_number,
+                        })
+                    assets_deleted += int(deleted is not None)
+
+        archived_state = self._archive_episode_runtime_state(
+            project_id, episode_id, episode_number)
+
+        batch_ids = [row["batch_id"] for row in self.db.query(
+            "SELECT DISTINCT batch_id FROM series_batch_items WHERE episode_id=?",
+            (episode_id,))]
+        self.db.execute(
+            "DELETE FROM series_batch_items WHERE episode_id=?", (episode_id,))
+        for batch_id in batch_ids:
+            remaining = self.db.query_one(
+                "SELECT COUNT(*) AS n FROM series_batch_items WHERE batch_id=?",
+                (batch_id,))["n"]
+            if remaining:
+                self.db.execute(
+                    "UPDATE series_batches SET total=?, updated_at=? WHERE id=?",
+                    (remaining, now(), batch_id))
+            else:
+                self.db.execute(
+                    "DELETE FROM series_batches WHERE id=?", (batch_id,))
+
+        # 所有外键子表先删，最后删除剧集；项目保留以承载用户选择保留的
+        # 资产，以及软删除图片的可追溯版本链。
+        self.db.execute("DELETE FROM archive WHERE episode_id=?", (episode_id,))
+        self.db.execute("DELETE FROM tasks WHERE episode_id=?", (episode_id,))
+        self.db.execute("DELETE FROM documents WHERE episode_id=?", (episode_id,))
+        self.db.execute(
+            "DELETE FROM production_runs WHERE episode_id=?", (episode_id,))
+        self.db.execute("DELETE FROM episodes WHERE id=?", (episode_id,))
+        return {
+            "project": project_title,
+            "episode_number": episode_number,
+            "episode_deleted": True,
+            "history_only": False,
+            "runs_deleted": counts["runs"],
+            "tasks_deleted": counts["tasks"],
+            "documents_deleted": counts["documents"],
+            "assets_requested": bool(delete_assets),
+            "assets_soft_deleted": assets_deleted,
+            "asset_files_preserved": True,
+            "runtime_state_archived": archived_state["count"],
+            "runtime_state_archive_dir": archived_state["archive_dir"],
+            "project_retained": True,
+        }

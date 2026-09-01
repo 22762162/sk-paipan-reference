@@ -1,0 +1,300 @@
+"""创作选片策略不得被内容质检重新变成生产闸门。"""
+
+from dataclasses import FrozenInstanceError
+
+import pytest
+
+from aifos.selection_mode import (
+    CANDIDATES_PER_SHOT,
+    MAX_CANDIDATE_ROUNDS,
+    MAX_AUTO_REPAIR_BATCHES,
+    REPAIR_CANDIDATES_PER_BATCH,
+    CandidateResultVersion,
+    FailureClass,
+    build_candidate_result_versions,
+    build_candidate_set_version,
+    build_selection_policy,
+    downstream_ready,
+    evaluate_candidate_promotion,
+    is_stale_candidate_result,
+    selection_policy_from_config,
+    should_start_repair_batch,
+    should_retry_failure,
+)
+
+
+def _version(**updates):
+    facts = {
+        "episode_id": "p015/e001",
+        "shot_no": 5,
+        "contract_revision": 2,
+        "candidate_revision": 3,
+        "prompt": {"subject": "主角查看书页", "style": "本剧锁定风格"},
+        "reference_manifest": {
+            "identity": ["character.png"],
+            "geometry": ["scene-top.png"],
+        },
+    }
+    facts.update(updates)
+    return build_candidate_set_version(**facts)
+
+
+def test_selection_mode_keeps_content_qc_nonblocking_and_auto_repairs():
+    policy = build_selection_policy(True)
+
+    assert policy.selection_mode_enabled is True
+    assert policy.image_content_qc_enabled is True
+    assert policy.video_content_qc_enabled is True
+    assert policy.content_qc_blocking is False
+    assert policy.content_qc_auto_retry is True
+    assert policy.prompt_review_enabled is True
+    assert policy.director_contract_review_enabled is True
+    assert policy.technical_integrity_checks_enabled is True
+    assert policy.candidates_per_shot == CANDIDATES_PER_SHOT == 1
+    assert policy.initial_candidates_per_shot == CANDIDATES_PER_SHOT == 1
+    assert policy.repair_candidates_per_batch == \
+        REPAIR_CANDIDATES_PER_BATCH == 1
+    assert policy.max_candidate_rounds == MAX_CANDIDATE_ROUNDS == 10
+    assert policy.max_auto_repair_batches == MAX_AUTO_REPAIR_BATCHES == 9
+    assert policy.candidate_ai_ranking_enabled is True
+    assert policy.auto_select_best is True
+    assert policy.manual_selection_override_allowed is True
+    assert policy.ranking_failure_fallback == "first_technically_usable"
+    assert policy.ranking_failure_marks_risk is True
+    assert policy.repair_auto_select_best is True
+    assert policy.failed_after_repair_auto_select_best is True
+    assert policy.failed_after_repair_marks_risk is True
+    assert policy.zero_usable_status == "technical_incomplete"
+    assert policy.failure_blocks_pipeline is False
+    assert policy.failure_blocks_other_shots is False
+    assert policy.failure_blocks_downstream_stage is False
+    assert policy.downstream_requires_selection is False
+
+
+def test_content_qc_remains_observational_when_selection_mode_is_off():
+    policy = build_selection_policy(
+        False,
+        image_content_qc_requested=True,
+        video_content_qc_requested=False,
+    )
+
+    assert policy.image_content_qc_enabled is True
+    assert policy.video_content_qc_enabled is False
+    assert policy.content_qc_blocking is False
+    assert policy.content_qc_auto_retry is True
+
+
+def test_final_settings_keys_feed_nonblocking_qc_and_ten_round_policy():
+    policy = selection_policy_from_config({
+        "defaults": {
+            "selection_mode": True,
+            "image_content_qc": True,
+            "video_content_qc": True,
+            "shot_candidate_count": 1,
+            "shot_repair_candidate_count": 1,
+            "shot_max_candidate_rounds": 10,
+            "shot_auto_repair_batches": 9,
+        },
+    })
+
+    assert policy.selection_mode_enabled is True
+    assert policy.image_content_qc_enabled is True
+    assert policy.video_content_qc_enabled is True
+    assert policy.content_qc_blocking is False
+    assert policy.candidates_per_shot == 1
+    assert policy.repair_candidates_per_batch == 1
+    assert policy.max_candidate_rounds == 10
+    assert policy.max_auto_repair_batches == 9
+
+
+def test_legacy_image_qc_is_only_used_when_new_key_is_absent():
+    legacy = selection_policy_from_config({
+        "defaults": {"selection_mode": False, "image_qc": False},
+    })
+    new_key_wins = selection_policy_from_config({
+        "defaults": {"selection_mode": False, "image_qc": False,
+                     "image_content_qc": True},
+    })
+
+    assert legacy.image_content_qc_enabled is False
+    assert new_key_wins.image_content_qc_enabled is True
+
+
+def test_empty_legacy_workspace_uses_new_selection_mode_default():
+    policy = selection_policy_from_config({})
+    assert policy.selection_mode_enabled is True
+    assert policy.image_content_qc_enabled is True
+    assert policy.video_content_qc_enabled is True
+    assert policy.max_candidate_rounds == 10
+
+
+def test_candidate_count_setting_rejects_any_value_other_than_one():
+    with pytest.raises(ValueError, match="只允许固定为1"):
+        selection_policy_from_config({
+            "defaults": {"shot_candidate_count": 3},
+        })
+
+
+@pytest.mark.parametrize("failure", [
+    FailureClass.NETWORK,
+    FailureClass.API,
+    FailureClass.TIMEOUT,
+    FailureClass.RATE_LIMIT,
+    FailureClass.TECHNICAL_INTEGRITY,
+])
+def test_only_technical_failures_retry_while_attempts_remain(failure):
+    assert should_retry_failure(failure, attempts_remaining=1) is True
+    assert should_retry_failure(failure, attempts_remaining=0) is False
+
+
+def test_content_or_unknown_failure_never_triggers_automatic_retry():
+    assert should_retry_failure(
+        FailureClass.CONTENT, attempts_remaining=2) is False
+    assert should_retry_failure("bad_composition", attempts_remaining=2) is False
+
+
+@pytest.mark.parametrize("failure", [
+    FailureClass.CONTENT,
+    FailureClass.CONTRACT,
+    FailureClass.TECHNICAL_INTEGRITY,
+])
+def test_problem_shot_gets_up_to_nine_nonblocking_repair_batches(failure):
+    policy = build_selection_policy(True)
+
+    assert should_start_repair_batch(
+        failure, completed_repair_batches=0, policy=policy) is True
+    assert should_start_repair_batch(
+        failure, completed_repair_batches=8, policy=policy) is True
+    assert should_start_repair_batch(
+        failure, completed_repair_batches=9, policy=policy) is False
+    assert policy.repair_candidates_per_batch == 1
+    assert policy.max_candidate_rounds == 10
+    assert policy.failed_after_repair_auto_select_best is True
+    assert policy.failed_after_repair_marks_risk is True
+    assert policy.failure_blocks_pipeline is False
+    assert policy.failure_blocks_other_shots is False
+    assert policy.failure_blocks_downstream_stage is False
+
+
+def test_total_round_policy_is_capped_at_ten_including_first_round():
+    policy = selection_policy_from_config({
+        "defaults": {"shot_max_candidate_rounds": 10},
+    })
+    assert policy.max_candidate_rounds == 10
+    assert policy.max_auto_repair_batches == 9
+
+    with pytest.raises(ValueError, match="不能超过10"):
+        selection_policy_from_config({
+            "defaults": {"shot_max_candidate_rounds": 11},
+        })
+
+
+def test_legacy_repair_batch_setting_never_creates_eleventh_round():
+    legacy = selection_policy_from_config({
+        "defaults": {"shot_auto_repair_batches": 99},
+    })
+    assert legacy.max_candidate_rounds == 10
+    assert legacy.max_auto_repair_batches == 9
+
+    shorter = selection_policy_from_config({
+        "defaults": {"shot_auto_repair_batches": 2},
+    })
+    assert shorter.max_candidate_rounds == 3
+    assert shorter.max_auto_repair_batches == 2
+
+
+def test_repair_candidate_count_is_fixed_to_one():
+    with pytest.raises(ValueError, match="固定为1"):
+        selection_policy_from_config({
+            "defaults": {"shot_repair_candidate_count": 3},
+        })
+
+
+def test_candidate_version_is_deterministic_and_ignores_mapping_order():
+    first = _version(reference_manifest={
+        "identity": ["character.png"],
+        "geometry": ["scene-top.png"],
+    })
+    second = _version(reference_manifest={
+        "geometry": ["scene-top.png"],
+        "identity": ["character.png"],
+    })
+
+    assert first == second
+    assert first.token.startswith("cset-v1:")
+
+
+@pytest.mark.parametrize("change", [
+    {"contract_revision": 3},
+    {"candidate_revision": 4},
+    {"prompt": {"subject": "主角合上书页"}},
+    {"reference_manifest": {"identity": ["new-character.png"]}},
+])
+def test_any_generation_fact_change_creates_a_new_candidate_version(change):
+    assert _version(**change).token != _version().token
+
+
+def test_exactly_one_candidate_credential_is_created_for_new_round():
+    version = _version()
+    results = build_candidate_result_versions(version)
+
+    assert len(results) == 1
+    assert tuple(result.candidate_index for result in results) == (1,)
+    assert {result.candidate_set_token for result in results} == {version.token}
+
+
+def test_manual_or_ai_selection_of_current_version_unlocks_downstream():
+    version = _version()
+    candidate = build_candidate_result_versions(version)[0]
+
+    assert downstream_ready(candidate, version, selection_source="manual") is True
+    assert downstream_ready(candidate, version, selection_source="ai") is True
+    assert downstream_ready(None, version, selection_source="manual") is False
+    assert downstream_ready(candidate, version) is False
+
+
+def test_stale_result_can_never_overwrite_current_formal_asset():
+    old_version = _version(candidate_revision=2)
+    current_version = _version(candidate_revision=3)
+    late_result = build_candidate_result_versions(old_version)[0]
+
+    assert is_stale_candidate_result(late_result, current_version) is True
+    decision = evaluate_candidate_promotion(
+        late_result, current_version, selection_source="ai")
+    assert decision.allowed is False
+    assert decision.stale is True
+    assert "禁止覆盖" in decision.reason
+    assert downstream_ready(
+        late_result, current_version, selection_source="ai") is False
+
+
+def test_invalid_candidate_index_or_missing_selection_cannot_promote():
+    version = _version()
+    invalid = CandidateResultVersion(version.token, candidate_index=5)
+
+    assert evaluate_candidate_promotion(
+        invalid, version, selection_source="manual").allowed is False
+    valid = build_candidate_result_versions(version)[0]
+    assert evaluate_candidate_promotion(
+        valid, version, selection_source="").allowed is False
+
+
+def test_policy_and_version_objects_are_immutable():
+    policy = build_selection_policy(True)
+    version = _version()
+
+    with pytest.raises(FrozenInstanceError):
+        policy.candidates_per_shot = 3
+    with pytest.raises(FrozenInstanceError):
+        version.token = "cset-v1:changed"
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("episode_id", ""),
+    ("shot_no", 0),
+    ("contract_revision", "1.5"),
+    ("candidate_revision", True),
+])
+def test_version_rejects_ambiguous_or_invalid_identity_fields(field, value):
+    with pytest.raises(ValueError):
+        _version(**{field: value})

@@ -1,0 +1,463 @@
+"""全景 → 真实三维场景:落地点射线求交是精确解,不是深度估计。
+
+此前全景只被当贴图用——看着像那间屋,但平台并不知道「书案在哪、多大、
+人能不能站进去」。人物位置只能靠文字,物理逻辑(遮挡/接触/可达/碰撞)
+无从校验。
+"""
+import math
+import unittest
+
+from aifos.scene_model import (DEFAULT_CAPTURE_HEIGHT_M, actor_placement_issues,
+                               build_object, build_scene_model,
+                               camera_placement_issues,
+                               direction_from_equirect,
+                               equirect_from_direction, find_object,
+                               floor_point, height_at, overlap_issues,
+                               repair_actor_furniture_collisions,
+                               repair_camera_furniture_collisions)
+
+
+ROOM = {"floor_width_m": 10.0, "floor_depth_m": 7.0}
+
+
+class ProjectionTest(unittest.TestCase):
+    def test_center_maps_to_plus_z(self):
+        """u=0.5 必须对应 +Z——与 pano_slice / scene3d 着色器同一约定。"""
+        dx, dy, dz = direction_from_equirect(0.5, 0.5)
+        self.assertAlmostEqual(dx, 0.0, places=6)
+        self.assertAlmostEqual(dy, 0.0, places=6)
+        self.assertAlmostEqual(dz, 1.0, places=6)
+
+    def test_quarter_right_maps_to_plus_x(self):
+        dx, _dy, dz = direction_from_equirect(0.75, 0.5)
+        self.assertAlmostEqual(dx, 1.0, places=6)
+        self.assertAlmostEqual(dz, 0.0, places=6)
+
+    def test_roundtrip_is_stable(self):
+        for u, v in ((0.1, 0.3), (0.5, 0.5), (0.9, 0.72), (0.33, 0.61)):
+            d = direction_from_equirect(u, v)
+            back = equirect_from_direction(*d)
+            self.assertAlmostEqual(back[0], u, places=5)
+            self.assertAlmostEqual(back[1], v, places=5)
+
+
+class FloorRayTest(unittest.TestCase):
+    def test_straight_down_lands_at_capture_footprint(self):
+        self.assertEqual(floor_point(0.5, 1.0), (0.0, 0.0))
+
+    def test_known_geometry_is_exact_not_estimated(self):
+        """已知点回推:先由目标点算出它在全景里的像素,再解回来必须重合。"""
+        for target in ((2.4, -0.3), (-1.2, 2.8), (3.0, 3.0)):
+            dx = target[0] - 0.0
+            dz = target[1] - 0.0
+            dy = -DEFAULT_CAPTURE_HEIGHT_M
+            u, v = equirect_from_direction(dx, dy, dz)
+            got = floor_point(u, v)
+            self.assertIsNotNone(got)
+            self.assertAlmostEqual(got[0], target[0], places=2)
+            self.assertAlmostEqual(got[1], target[1], places=2)
+
+    def test_horizon_and_upward_have_no_floor_hit(self):
+        self.assertIsNone(floor_point(0.5, 0.5))     # 正好水平
+        self.assertIsNone(floor_point(0.5, 0.2))     # 朝上
+
+    def test_far_grazing_ray_is_rejected_not_absurd(self):
+        """接近水平的视线会把交点推到无穷远,必须拒绝而不是给荒谬坐标。"""
+        self.assertIsNone(floor_point(0.5, 0.5 + 1e-4))
+
+
+class HeightTest(unittest.TestCase):
+    def test_height_of_known_object(self):
+        """1.2m 高、距拍摄点 3m 的物体顶点回推,应解回 1.2m。"""
+        x, z, h = 0.0, 3.0, 1.2
+        u, v = equirect_from_direction(x, h - DEFAULT_CAPTURE_HEIGHT_M, z)
+        self.assertAlmostEqual(height_at(u, v, x, z), h, places=2)
+
+    def test_object_taller_than_camera(self):
+        x, z, h = 2.0, 0.0, 2.6
+        u, v = equirect_from_direction(x, h - DEFAULT_CAPTURE_HEIGHT_M, z)
+        self.assertAlmostEqual(height_at(u, v, x, z), h, places=2)
+
+
+class BuildObjectTest(unittest.TestCase):
+    def _annot(self, x, z, **extra):
+        u, v = equirect_from_direction(x, -DEFAULT_CAPTURE_HEIGHT_M, z)
+        a = {"name": "书案", "category": "furniture", "base_u": u, "base_v": v}
+        a.update(extra)
+        return a
+
+    def test_position_is_solved_from_base_pixel(self):
+        obj = build_object(self._annot(1.5, 2.0), room=ROOM)
+        self.assertAlmostEqual(obj["position_3d"]["x"], 1.5, places=1)
+        self.assertAlmostEqual(obj["position_3d"]["z"], 2.0, places=1)
+        self.assertTrue(obj["inside_room"])
+
+    def test_missing_base_yields_nothing(self):
+        self.assertIsNone(build_object({"name": "书案"}))
+        self.assertIsNone(build_object({"base_u": 0.5, "base_v": 0.9}))
+
+    def test_out_of_room_is_flagged_and_clamped(self):
+        obj = build_object(self._annot(20.0, 0.0), room=ROOM)
+        self.assertFalse(obj["inside_room"])
+        self.assertLessEqual(abs(obj["position_3d"]["x"]), 5.0)
+
+
+class SceneModelTest(unittest.TestCase):
+    def _annot(self, name, x, z, **extra):
+        u, v = equirect_from_direction(x, -DEFAULT_CAPTURE_HEIGHT_M, z)
+        a = {"name": name, "category": "furniture", "base_u": u, "base_v": v}
+        a.update(extra)
+        return a
+
+    def test_builds_objects_and_keeps_capture_point(self):
+        model = build_scene_model(
+            [self._annot("书案", 0.0, 0.6), self._annot("书架", -3.0, 2.0)],
+            location="书阁内·暖金古室", room=ROOM)
+        self.assertEqual(len(model["objects"]), 2)
+        self.assertEqual(model["capture"]["y"], DEFAULT_CAPTURE_HEIGHT_M)
+        self.assertIsNotNone(find_object(model, "书案"))
+
+    def test_unparseable_annotation_is_reported_not_silently_dropped(self):
+        model = build_scene_model([{"name": "香炉"}], room=ROOM)
+        self.assertEqual(model["objects"], [])
+        self.assertTrue(any(i["field"] == "annotation"
+                            for i in model["issues"]))
+
+    def test_overlapping_objects_are_flagged(self):
+        model = build_scene_model(
+            [self._annot("书案", 1.0, 1.0), self._annot("香案", 1.05, 1.0)],
+            room=ROOM)
+        self.assertTrue(any(i["field"] == "overlap" for i in model["issues"]))
+
+    def test_centimetre_bed_and_door_are_replaced_and_reported(self):
+        """远处像素跨度不能把床/门压成厘米级后继续冒充真实尺度。"""
+        model = build_scene_model([
+            self._annot("床", 0.0, 2.0, width_u=0.001, depth_m=2.1),
+            self._annot(
+                "客房入户门", 2.0, 2.0, category="opening",
+                width_u=0.001, depth_m=0.05),
+        ], location="酒店客房", room=ROOM)
+
+        bed = find_object(model, "床")
+        door = find_object(model, "客房入户门")
+        self.assertEqual(bed["width_m"], 1.5)
+        self.assertEqual(door["width_m"], 0.9)
+        self.assertEqual(
+            bed["geometry_sources"]["width"], "category_default")
+        self.assertEqual(
+            door["geometry_sources"]["width"], "category_default")
+        scale_issues = [
+            issue for issue in model["issues"]
+            if issue.get("code") == "semantic_object_scale_fallback"]
+        self.assertEqual(
+            {issue.get("object") for issue in scale_issues},
+            {"床", "客房入户门"})
+        self.assertTrue(all(
+            "不再作为真实尺度" in issue["message"]
+            for issue in scale_issues))
+
+    def test_valid_bed_dimensions_remain_panorama_measured(self):
+        distance = 2.0
+        target_width = 1.8
+        width_u = math.atan(target_width / (2.0 * distance)) / math.pi
+        model = build_scene_model([
+            self._annot(
+                "双人床", 0.0, distance, width_u=width_u, depth_m=2.1),
+        ], location="卧室", room=ROOM)
+
+        bed = find_object(model, "双人床")
+        self.assertAlmostEqual(bed["width_m"], target_width, places=2)
+        self.assertEqual(
+            bed["geometry_sources"]["width"], "panorama_angular_span")
+        self.assertFalse(bed["scale_adjusted"])
+        self.assertFalse(any(
+            issue.get("code") == "semantic_object_scale_fallback"
+            for issue in model["issues"]))
+
+    def test_personal_car_cabin_rejects_generic_room_box(self):
+        generic_room = {
+            "floor_width_m": 10.0,
+            "floor_depth_m": 7.0,
+            "wall_height_m": 4.2,
+        }
+        model = build_scene_model(
+            [], location="轿车内·高速公路", room=generic_room)
+
+        self.assertEqual(model["room"], {
+            "floor_width_m": 1.85,
+            "floor_depth_m": 4.4,
+            "wall_height_m": 1.55,
+        })
+        self.assertEqual(model["source_room"], generic_room)
+        room_issues = [
+            issue for issue in model["issues"]
+            if issue.get("code") == "semantic_room_scale_fallback"]
+        self.assertEqual(len(room_issues), 3)
+        self.assertTrue(all(
+            "禁止把通用房间盒当作真实车厢" in issue["message"]
+            for issue in room_issues))
+
+    def test_normal_room_and_non_personal_vehicle_are_not_reclassified(self):
+        bedroom = build_scene_model([], location="酒店客房", room=ROOM)
+        train = build_scene_model([], location="火车内", room=ROOM)
+
+        self.assertEqual(bedroom["room"], ROOM)
+        self.assertEqual(train["room"], ROOM)
+        self.assertEqual(bedroom["room_scale_adjustments"], [])
+        self.assertEqual(train["room_scale_adjustments"], [])
+
+
+class ActorPlacementTest(unittest.TestCase):
+    """真实三维场景的兑现点:人物位置从此可被物理校验。"""
+
+    def _model(self):
+        u, v = equirect_from_direction(0.0, -DEFAULT_CAPTURE_HEIGHT_M, 0.6)
+        return build_scene_model(
+            [{"name": "书案", "category": "furniture",
+              "base_u": u, "base_v": v, "width_u": 0.12}], room=ROOM)
+
+    def test_actor_standing_inside_furniture_is_flagged(self):
+        issues = actor_placement_issues(
+            self._model(),
+            [{"name": "沈眉", "start_3d": {"x": 0.0, "y": 0, "z": 0.6}}])
+        self.assertTrue(any(i["field"] == "actor_furniture" for i in issues))
+
+    def test_actor_with_clearance_is_fine(self):
+        issues = actor_placement_issues(
+            self._model(),
+            [{"name": "沈眉", "start_3d": {"x": 3.5, "y": 0, "z": -2.0}}])
+        self.assertFalse(any(i["field"] == "actor_furniture" for i in issues))
+
+    def test_actor_outside_room_is_a_block(self):
+        issues = actor_placement_issues(
+            self._model(),
+            [{"name": "沈眉", "start_3d": {"x": 12.0, "y": 0, "z": 0.0}}])
+        self.assertTrue(any(i["severity"] == "block"
+                            and i["field"] == "actor_bounds" for i in issues))
+
+    def test_measured_furniture_collision_is_repaired_deterministically(self):
+        model = self._model()
+        model["objects"][0]["geometry_sources"].update({
+            "depth": "visual_annotation",
+            "rotation": "visual_annotation",
+        })
+        actor = {
+            "name": "沈眉",
+            "start_3d": {"x": 0.0, "y": 0, "z": 0.6},
+            "end_3d": {"x": 0.0, "y": 0, "z": 0.6},
+            "route_3d": [
+                {"x": 0.0, "y": 0, "z": 0.6, "phase": "fixed"},
+            ],
+        }
+
+        adjustments = repair_actor_furniture_collisions(model, [actor])
+
+        self.assertTrue(adjustments)
+        self.assertEqual(actor["start_3d"], actor["end_3d"])
+        self.assertEqual(
+            (actor["start_3d"]["x"], actor["start_3d"]["z"]),
+            (actor["route_3d"][0]["x"], actor["route_3d"][0]["z"]))
+        self.assertFalse(any(
+            issue["severity"] == "block"
+            for issue in actor_placement_issues(model, [actor])))
+
+
+class CameraPlacementRepairTest(unittest.TestCase):
+    def _model(self):
+        u, v = equirect_from_direction(0.0, -DEFAULT_CAPTURE_HEIGHT_M, 0.6)
+        model = build_scene_model(
+            [{"name": "书案", "category": "furniture",
+              "base_u": u, "base_v": v, "width_u": 0.12,
+              "depth_m": 1.2, "rotation_y_deg": 0}], room=ROOM)
+        model["objects"][0]["geometry_sources"].update({
+            "depth": "visual_annotation",
+            "rotation": "visual_annotation",
+        })
+        return model
+
+    def test_measured_furniture_camera_collision_is_repaired(self):
+        model = self._model()
+        camera = {
+            "start_3d": {"x": 0.0, "y": 0.5, "z": 0.6},
+            "end_3d": {"x": 0.0, "y": 0.5, "z": 0.6},
+            "target_start_3d": {"x": 0.0, "y": 1.25, "z": -0.3},
+            "target_end_3d": {"x": 0.0, "y": 1.25, "z": -0.3},
+            "target_3d": {"x": 0.0, "y": 1.25, "z": -0.3},
+            "route_3d": [
+                {"x": 0.0, "y": 0.5, "z": 0.6, "phase": "fixed"},
+            ],
+            "director_camera": {},
+        }
+
+        adjustments = repair_camera_furniture_collisions(model, camera)
+
+        self.assertTrue(adjustments)
+        self.assertEqual(camera["start_3d"], camera["end_3d"])
+        self.assertEqual(
+            (camera["start_3d"]["x"], camera["start_3d"]["y"],
+             camera["start_3d"]["z"]),
+            (camera["route_3d"][0]["x"], camera["route_3d"][0]["y"],
+             camera["route_3d"][0]["z"]))
+        self.assertFalse(any(
+            issue["severity"] == "block"
+            for issue in camera_placement_issues(model, camera)))
+        self.assertIn("orientation_start", camera)
+        self.assertIn("orientation_end", camera)
+
+    def test_adjacent_furniture_uses_global_safe_edge_without_ping_pong(self):
+        def measured(name, x, z, width, depth, height, rotation=0.0):
+            return {
+                "name": name,
+                "category": "furniture",
+                "position_3d": {"x": x, "y": 0.0, "z": z},
+                "width_m": width,
+                "depth_m": depth,
+                "height_m": height,
+                "rotation_y_deg": rotation,
+                "scale_adjusted": False,
+                "geometry_sources": {
+                    "depth": "visual_annotation",
+                    "rotation": "visual_annotation",
+                },
+            }
+
+        # Regression geometry from 游戏入侵 E01 shot 18: the nearest edge of
+        # the chair enters the sofa, so a per-object solver oscillates and
+        # eventually leaves the camera inside the chair.
+        model = {
+            "room": {
+                "floor_width_m": 10.0,
+                "floor_depth_m": 7.0,
+                "wall_height_m": 4.2,
+            },
+            "objects": [
+                measured(
+                    "办公转椅", -0.706, -0.28,
+                    0.835, 0.65, 1.25, -180.0),
+                measured(
+                    "布艺沙发", 0.029, 0.039,
+                    0.614, 1.0, 1.518),
+            ],
+        }
+        camera = {
+            "start_3d": {"x": -1.5, "y": 1.34, "z": -0.8},
+            "end_3d": {"x": -0.5, "y": 1.34, "z": -0.31},
+            "target_start_3d": {"x": 1.22, "y": 0.71, "z": 0.37},
+            "target_end_3d": {"x": 1.22, "y": 0.71, "z": 0.37},
+            "target_3d": {"x": 1.22, "y": 0.71, "z": 0.37},
+            "route_3d": [
+                {"x": -1.5, "y": 1.34, "z": -0.8,
+                 "phase": "start"},
+                {"x": -0.5, "y": 1.34, "z": -0.31,
+                 "phase": "end"},
+            ],
+            "director_camera": {},
+        }
+
+        adjustments = repair_camera_furniture_collisions(model, camera)
+
+        end_adjustment = next(
+            row for row in adjustments if row["field"] == "end_3d")
+        self.assertEqual(camera["end_3d"]["y"], 1.34)
+        self.assertLess(camera["end_3d"]["z"], -0.7)
+        self.assertEqual(
+            tuple(camera["end_3d"][axis] for axis in ("x", "y", "z")),
+            tuple(camera["route_3d"][1][axis]
+                  for axis in ("x", "y", "z")))
+        self.assertEqual(
+            end_adjustment["objects"], ["办公转椅", "布艺沙发"])
+        self.assertFalse(any(
+            issue["severity"] == "block"
+            for issue in camera_placement_issues(model, camera)))
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class LayoutClauseTest(unittest.TestCase):
+    """把三维场景写成提示词条款——用户实测的穿帮就出在这里缺位:
+    【场景】只有一句地名,物体一个坐标都没有,模型每张图重新想象家具
+    在哪,「后面纱帐经常变」是必然结果。"""
+
+    def _model(self):
+        def annot(name, x, z, cat="furniture", **kw):
+            u, v = equirect_from_direction(x, -DEFAULT_CAPTURE_HEIGHT_M, z)
+            return {"name": name, "category": cat,
+                    "base_u": u, "base_v": v, **kw}
+        return build_scene_model(
+            [annot("书案", 0.0, 0.9, width_u=0.1),
+             annot("纱帐", 0.0, 3.4, "decor"),
+             annot("书架", -4.8, 0.0)], room=ROOM)
+
+    def _camera(self, x=0.0, z=-2.8):
+        return {"position_3d": {"x": x, "y": 1.43, "z": z},
+                "target_3d": {"x": 0.0, "y": 1.43, "z": 0.0}}
+
+    def test_every_object_gets_a_fixed_coordinate(self):
+        from aifos.scene_model import scene_layout_clause
+        text = scene_layout_clause(self._model(), self._camera())
+        for name in ("书案", "纱帐", "书架"):
+            self.assertIn(name, text)
+        self.assertIn("固定在", text)
+        self.assertIn("不得挪动", text)
+
+    def test_positions_are_translated_to_screen_side_and_depth(self):
+        """模型执行不了世界坐标,要的是「画面哪一侧、第几层」。"""
+        from aifos.scene_model import scene_layout_clause
+        text = scene_layout_clause(self._model(), self._camera())
+        self.assertIn("距本镜机位", text)
+        self.assertTrue(any(w in text for w in ("画面正中", "画面左", "画面右")))
+        self.assertTrue(any(w in text for w in ("前景", "近景层", "中景层",
+                                                "背景层")))
+
+    def test_no_camera_still_gives_world_coordinates(self):
+        from aifos.scene_model import scene_layout_clause
+        text = scene_layout_clause(self._model())
+        self.assertIn("固定在", text)
+        self.assertNotIn("距本镜机位", text)
+
+    def test_empty_model_emits_nothing(self):
+        from aifos.scene_model import scene_layout_clause
+        self.assertEqual(scene_layout_clause({"objects": []}), "")
+        self.assertEqual(scene_layout_clause(None), "")
+
+    def test_far_side_objects_are_marked_possibly_out_of_frame(self):
+        """取景裁掉的可以不画,但必须说清是「可能出画」而不是「改到别处」。"""
+        from aifos.scene_model import scene_layout_clause
+        text = scene_layout_clause(self._model(), self._camera(z=-2.8))
+        self.assertIn("被本镜取景裁掉的可以不画", text)
+
+
+class OcclusionTest(unittest.TestCase):
+    """遮挡穿帮:声明「在 X 后面」,几何上却在 X 前面。"""
+
+    def _model(self):
+        u, v = equirect_from_direction(0.0, -DEFAULT_CAPTURE_HEIGHT_M, 3.4)
+        return build_scene_model(
+            [{"name": "纱帐", "category": "decor", "base_u": u, "base_v": v}],
+            room=ROOM)
+
+    def test_actor_declared_behind_but_geometrically_in_front(self):
+        from aifos.scene_model import occlusion_issues
+        camera = {"position_3d": {"x": 0.0, "y": 1.43, "z": -3.0}}
+        actor = {"name": "沈眉", "facing": "站在纱帐后面",
+                 "start_3d": {"x": 0.0, "y": 0.0, "z": -1.0}}
+        issues = occlusion_issues(self._model(), camera, [actor])
+        self.assertTrue(issues)
+        self.assertIn("穿帮", issues[0]["message"])
+
+    def test_actor_genuinely_behind_is_fine(self):
+        from aifos.scene_model import occlusion_issues
+        camera = {"position_3d": {"x": 0.0, "y": 1.43, "z": -3.0}}
+        actor = {"name": "沈眉", "facing": "站在纱帐后面",
+                 "start_3d": {"x": 0.0, "y": 0.0, "z": 3.9}}
+        self.assertEqual(
+            occlusion_issues(self._model(), camera, [actor]), [])
+
+    def test_no_declared_relation_means_no_check(self):
+        from aifos.scene_model import occlusion_issues
+        camera = {"position_3d": {"x": 0.0, "y": 1.43, "z": -3.0}}
+        actor = {"name": "沈眉", "start_3d": {"x": 0.0, "y": 0.0, "z": -1.0}}
+        self.assertEqual(
+            occlusion_issues(self._model(), camera, [actor]), [])
